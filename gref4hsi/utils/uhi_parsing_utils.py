@@ -376,7 +376,7 @@ def read_nav_from_dvl_imu_alti(dvl_filename, imu_filename, alti_filename, alti_f
     # .astype(np.int64) casts datetime to timestamp of unix_time in ns. division by 1e9 converts to sec.
     try: dvl_contents['TimestampMeasured'] = pd.to_datetime(dvl_contents['log_time'], format='%Y-%m-%dT%H-%M-%S.%fZ').astype(np.int64) // 10**9
     except: dvl_contents['TimestampMeasured'] = pd.to_datetime(dvl_contents['log_time'], format=' %Y-%m-%dT%H-%M-%S.%fZ').astype(np.int64) // 10**9
-    # 
+
     """Cell defining all nav data of relevance"""
     nav = NAV()
     nav.roll = TimeData(time = imu_contents['TimestampMeasured'], 
