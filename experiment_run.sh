@@ -15,5 +15,13 @@ python3 gref4hsi/tests/test_main_dbe.py --data_dir="/home/leo/Documents/NTNU/Mas
 
 
 # Liu testing
+# svea3 (missing alt. data)
 python gref4hsi/tests/test_main_dbe.py --data_dir="C:\Users\Erik Liu\OneDrive - NTNU\PhD\Courses\UHI post processing\havard_repo\from_Leo_usb\Svea3_Day1\Gref_Transect_2a\Gref_10mm_DVL_minimal_inter" --resolution=0.01 --interpolation=True --alti_data="dvl" --raster_transform="minimal_rectangle";
- 
+
+# svea2 (dont have hsi data)
+python gref4hsi/tests/test_main_dbe.py --data_dir="C:\Users\Erik Liu\OneDrive - NTNU\PhD\Courses\UHI post processing\havard_repo\from_Leo_usb\Fieldtest_Svea_2\Gref_10mm_alti_north_east_inter" --resolution=0.01 --interpolation=True --alti_data="dvl" --raster_transform="minimal_rectangle";
+
+# svea2_Day1 
+python gref4hsi/tests/test_main_dbe.py --data_dir="E:\mjosa\Svea2_Day_1\Gref_Transect_2\Gref_10mm_DVL_minimal_inter" --resolution=0.01 --interpolation=True --alti_data="dvl" --raster_transform="minimal_rectangle";
+# decrease res to make run faster
+python gref4hsi/tests/test_main_dbe.py --data_dir="E:\mjosa\Svea2_Day_1\Gref_Transect_2\Gref_10mm_DVL_minimal_inter" --resolution=10 --interpolation=True --alti_data="dvl" --raster_transform="minimal_rectangle"

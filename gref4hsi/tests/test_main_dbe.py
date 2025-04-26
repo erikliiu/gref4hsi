@@ -119,12 +119,13 @@ def main(args):
 
 
 if __name__ == "__main__":
-    print("Current working directory:", os.getcwd())
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data_dir",
         type=str,
         default="C:/Users/Erik Liu/OneDrive - NTNU/PhD/Courses/UHI post processing/havard_repo/from_Leo_usb/Svea3_Day1/Gref_Transect_2a/Gref_10mm_DVL_minimal_inter/",
+        # default above use this path only if a data_dir is not given before
     )
     parser.add_argument("--resolution", type=float, default=0.01)
     parser.add_argument("--interpolation", type=bool, default=True)
