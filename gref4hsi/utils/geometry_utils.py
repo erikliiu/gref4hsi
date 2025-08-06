@@ -506,6 +506,30 @@ class CameraGeometry:
         return phi_s, theta_s
 
     def compute_view_directions_local_tangent_plane(self):
+        """
+        All of this happens in two steps:
+
+        1. **Everything up to the mesh intersection is in ECEF**
+           - Your vehicle/IMU gives you position + orientation in ECEF.
+           - You use those to “shoot” each HSI pixel-ray into the mesh, calculate where it hits (still in ECEF).
+
+        2. **Then you switch into a local NED frame at each hit point**
+           - NED = North-East-Down plane tangent to the Earth at the seabed hit.
+           - You take the vector from seabed → camera (in ECEF) and rotate it into that local NED.
+           - In NED you can decompose into “look-up” angles:
+             - **θᵥ** = elevation above the local horizon
+             - **φᵥ** = azimuth around that point
+
+        So:
+        - You started in **ECEF** (global Earth-centered).
+        - You computed intersections and normals in **ECEF**.
+        - **Then** for each hit you built a tiny NED frame at that point and asked “what’s the angle in NED?”
+
+        We hadn’t needed NED for the raw altimeter DEM—there we stayed in a simple linearized NED around your survey origin—but now, for `compute_view_directions_local_tangent_plane`, we use NED to get physically meaningful view/sun angles at each seabed pixel.
+
+
+        """
+
         """Takes the intersection points and HSI camera positions and computes the angles from seabed to HSI with respect to the local tangent plane to the ellipsoid."""
         n = self.rayDirectionsGlobal.shape[0]
         m = self.rayDirectionsGlobal.shape[1]
