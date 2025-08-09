@@ -40,4 +40,32 @@ python gref4hsi/tests/test_main_dbe.py --data_dir="E:\mjosa\Svea2_Day_1\Gref_Tra
 #   --dem_resolution=0.2
 
 
+
+# running my code
+
 python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\221" --csv_nav_path="E:\mjosa_new\navigation_data\105049\nav_data_105049_dr.csv" --resolution=0.01 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=510
+
+
+# changed csv to the one for the whole survey with corrections for indovual trnasects (this one worked)
+python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\221" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=0.01 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+
+
+
+python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\221_test" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=1 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\057" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=1 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+
+
+# 057 with all parts
+python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\057_group\057_all" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=1 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+
+# 1 to part 3
+python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\057_group\057_5" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=1 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+
+
+# for 221
+python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\221_redo_with_new_track" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=5 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508

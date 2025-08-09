@@ -28,9 +28,9 @@ class HyperspectralLite:
     def __init__(self, h5_filename, h5_tree_dict):
         with h5py.File(h5_filename, "r", libver="latest") as self.f:
             for attribute_name, h5_hierarchy_item_path in h5_tree_dict.items():
-                print(attribute_name)
+                # print(attribute_name)
                 # Allow there to not be any attribute
-                print("Hei Liu her, er i class 'HyperspectralLite'")
+                # print("Hei Liu her, er i class 'HyperspectralLite'")
 
                 try:
                     h5_item = self.f[h5_hierarchy_item_path][()]
@@ -325,7 +325,7 @@ def set_camera_model(
     param_dict["tz"] = t_hsi_body[2]
 
     # Define where to write calibrated data
-    file_name_xml = "HSI_" + str(binning_spatial) + "spatial_binning.xml"
+    file_name_xml = "HSI_" + str(binning_spatial) + "b.xml"
     CAMERA_CALIB_XML_DIR = config["Absolute Paths"]["calib_folder"]
     xml_cal_write_path = CAMERA_CALIB_XML_DIR + file_name_xml
 
@@ -616,7 +616,7 @@ def write_nav_data_to_h5(nav, time_offset, config, H5_FILE_PATH):
     nav_dict_h5_data = {
         "eul_ZYX": eul_zyx[~invalid_rows],
         "position_ecef": position_ecef[~invalid_rows],
-        "nav_timestamp": hsi_synced_nav_timestamp_rov[~invalid_rows],
+        "f": hsi_synced_nav_timestamp_rov[~invalid_rows],
     }
     # This creates another dictionary with the actual data arrays, but excluding the bad rows (~invalid_rows means "NOT invalid rows").
 
@@ -742,6 +742,33 @@ def altimeter_data_to_point_cloud(nav, config_uhi, lat0, lon0, h0, true_time_hsi
     # Select the points from an appropriate time interval
     crit_1 = nav.altitude.time < true_time_hsi.max()
     crit_2 = nav.altitude.time > true_time_hsi.min()
+
+    # print(
+    #     f"Altitude data time range: {nav.altitude.time.min():.1f} to {nav.altitude.time.max():.1f}"
+    # )
+    # print(
+    #     f"HSI data time range: {true_time_hsi.min():.1f} to {true_time_hsi.max():.1f}"
+    # )
+
+    # helpers
+    to_utc = lambda ts: datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    fmt = "%Y-%m-%d %H:%M:%S"
+
+    alt_start = to_utc(nav.altitude.time.min())
+    alt_end = to_utc(nav.altitude.time.max())
+    hsi_start = to_utc(true_time_hsi.min())
+    hsi_end = to_utc(true_time_hsi.max())
+
+    print(
+        f"Altitude data time range: {alt_start.strftime(fmt)} UTC to {alt_end.strftime(fmt)} UTC"
+    )
+    print(
+        f"HSI data time range:      {hsi_start.strftime(fmt)} UTC to {hsi_end.strftime(fmt)} UTC"
+    )
+
+    print(
+        f"Points within time range: {np.sum((crit_1) & (crit_2))} out of {len(nav.altitude.time)}"
+    )
 
     points_altimeter_transect = altimeter_point_cloud[(crit_1) & (crit_2)]
 
@@ -1377,6 +1404,8 @@ def uhi_eely(config, config_uhi):
             h0=alt0,
         )
 
+        print(f"Point cloud size for H5 file {h5_index}: {point_cloud_altimeter.shape}")
+
         if h5_index == 0:
             point_cloud_altimeter_total = point_cloud_altimeter
         else:
@@ -1384,7 +1413,20 @@ def uhi_eely(config, config_uhi):
                 point_cloud_altimeter_total, point_cloud_altimeter, axis=0
             )
 
-        print(f"Processed: {H5_FILE_PATH}")
+        print(
+            f"--------------------------Processed: {H5_FILE_PATH}-------------------------- \n"
+        )
+
+    print(f"Total point cloud size: {point_cloud_altimeter_total.shape}")
+
+    # Check if we have any points before creating DEM
+    if point_cloud_altimeter_total.size == 0:
+        print("WARNING: No altimeter points found! Skipping DEM creation.")
+        print("This could be due to:")
+        print("1. No time overlap between navigation and hyperspectral data")
+        print("2. Time offset might be incorrect")
+        print("3. Altitude data might be missing or invalid")
+        return
 
     # Use the total point cloud to make a DEM
     if config_uhi.agisoft_process:
@@ -1392,6 +1434,7 @@ def uhi_eely(config, config_uhi):
         pass
 
     # Create DEM from point cloud
+    print(f"Creating DEM from {point_cloud_altimeter_total.shape[0]} points...")
     point_cloud_to_dem(
         point_cloud_altimeter_total,
         config,

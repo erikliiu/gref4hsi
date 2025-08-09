@@ -6,8 +6,6 @@ import argparse
 import numpy as np
 import pandas as pd
 
-# Above can be avoided by pip install --editable .
-
 from gref4hsi.utils import parsing_utils, uhi_parsing_utils
 from gref4hsi.scripts import georeference, orthorectification
 from gref4hsi.utils import visualize
@@ -15,11 +13,6 @@ from gref4hsi.utils.config_utils import (
     prepend_data_dir_to_relative_paths,
     customize_config,
 )
-
-# Debug: Check what's in the uhi_parsing_utils module
-print("uhi_parsing_utils module path:", uhi_parsing_utils.__file__)
-print("Available functions in uhi_parsing_utils:", [attr for attr in dir(uhi_parsing_utils) if not attr.startswith('_')])
-print("Has uhi_eely?", hasattr(uhi_parsing_utils, 'uhi_eely'))
 
 
 def load_csv_navigation(csv_path):
@@ -139,10 +132,11 @@ def main(args):
     config_uhi_preprocess = SettingsPreprocess(
         dtype_datacube=np.float32,
         # TODO: Update these matrices based on your EELY vehicle geometry
-        # rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]),
-        rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]),
+        # rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), # leos
+        rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]]),
         translation_body_to_hsi=np.array([2.5, 0, 0]),
-        rotation_matrix_alt_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]),
+        # rotation_matrix_alt_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), # leos
+        rotation_matrix_alt_to_body=np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]]),
         translation_alt_to_body=np.array([0, 0, 0]),
         time_offset_sec=args.time_offset_sec,
         lon_lat_alt_origin=np.array([10.7122345, 60.8011575, 0]),
@@ -167,7 +161,7 @@ def main(args):
     if your CSV data is already processed and synchronized.
     """
 
-    print("Running uhi_eely() - processing CSV navigation data")
+    print("\n \n Running uhi_eely() - processing CSV navigation data")
     uhi_parsing_utils.uhi_eely(config=config, config_uhi=config_uhi_preprocess)
 
     """
@@ -182,14 +176,16 @@ def main(args):
     config = configparser.ConfigParser()
     config.read(config_file_mission)
 
-    # Step 3: Export model - creates 3D mesh from altitude/depth data
-    # DECISION: Do you want to create DEM from your CSV altitude data?
-    if args.create_dem_from_csv:
-        print("Creating DEM from CSV altitude data")
-        parsing_utils.export_model(config_file_mission)
-    else:
-        print("Skipping DEM creation - expecting external DEM file")
-        # TODO: Point config to your existing DEM file if you have one
+    # # Step 3: Export model - creates 3D mesh from altitude/depth data
+    # # DECISION: Do you want to create DEM from your CSV altitude data?
+    # if args.create_dem_from_csv:
+    #     print("Creating DEM from CSV altitude data \n")
+    #     parsing_utils.export_model(config_file_mission)
+    # else:
+    #     print("Skipping DEM creation - expecting external DEM file \n")
+    #     # TODO: Point config to your existing DEM file if you have one
+
+    parsing_utils.export_model(config_file_mission)
 
     # Step 4: Georeference - projects hyperspectral pixels to 3D coordinates
     # This step should work regardless of data source
