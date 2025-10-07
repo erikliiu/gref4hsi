@@ -6,7 +6,13 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from gref4hsi.utils import parsing_utils, uhi_parsing_utils
+# Force reload of modules to get latest changes
+import importlib
+import gref4hsi.utils.uhi_parsing_utils as uhi_parsing_utils
+
+importlib.reload(uhi_parsing_utils)
+
+from gref4hsi.utils import parsing_utils
 from gref4hsi.scripts import georeference, orthorectification
 from gref4hsi.utils import visualize
 from gref4hsi.utils.config_utils import (
@@ -131,12 +137,13 @@ def main(args):
 
     config_uhi_preprocess = SettingsPreprocess(
         dtype_datacube=np.float32,
-        # TODO: Update these matrices based on your EELY vehicle geometry
-        # rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), # leos
-        rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]]),
+        # Rotation matrices for DOWNWARD-LOOKING sensors (both HSI and altimeter)
+        # This matches test_main_dbe.py configuration for nadir-looking setup
+        # rz = -π/2: 90° rotation to align camera frame with body frame
+        rotation_matrix_hsi_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]),
         translation_body_to_hsi=np.array([2.5, 0, 0]),
-        # rotation_matrix_alt_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), # leos
-        rotation_matrix_alt_to_body=np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]]),
+        # Altimeter has same orientation as HSI (both pointing down)
+        rotation_matrix_alt_to_body=np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]),
         translation_alt_to_body=np.array([0, 0, 0]),
         time_offset_sec=args.time_offset_sec,
         lon_lat_alt_origin=np.array([10.7122345, 60.8011575, 0]),
@@ -189,10 +196,27 @@ def main(args):
 
     # Step 4: Georeference - projects hyperspectral pixels to 3D coordinates
     # This step should work regardless of data source
-    georeference.main(config_file_mission)
+    try:
+        georeference.main(config_file_mission)
+        print("\n✅ Georeferencing completed successfully!")
+    except Exception as e:
+        print(f"\n❌ Georeferencing failed with error: {e}")
+        print(
+            "Stopping pipeline - cannot proceed to orthorectification without valid georeferencing."
+        )
+        print("\nTroubleshooting tips:")
+        print("  1. Check if DEM covers all HSI field of view areas")
+        print("  2. Verify time_offset_sec is correct")
+        print("  3. Check rotation matrices are correct for your sensor mounting")
+        print(
+            "  4. Consider processing H5 files separately if they cover different areas"
+        )
+        raise SystemExit(1)
 
     # Step 5: Orthorectification - creates final hyperspectral maps
+    print("\n################ Starting Orthorectification ################")
     orthorectification.main(config_file_mission)
+    print("\n✅ Pipeline completed successfully!")
 
 
 if __name__ == "__main__":

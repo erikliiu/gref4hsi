@@ -740,8 +740,9 @@ def altimeter_data_to_point_cloud(nav, config_uhi, lat0, lon0, h0, true_time_hsi
     altimeter_point_cloud = alt_vec_ned[0:3, :].T
 
     # Select the points from an appropriate time interval
-    crit_1 = nav.altitude.time < true_time_hsi.max()
-    crit_2 = nav.altitude.time > true_time_hsi.min()
+    # Files are continuous transects, so use exact time ranges without overlap
+    crit_1 = nav.altitude.time <= true_time_hsi.max()
+    crit_2 = nav.altitude.time >= true_time_hsi.min()
 
     # print(
     #     f"Altitude data time range: {nav.altitude.time.min():.1f} to {nav.altitude.time.max():.1f}"
@@ -1405,6 +1406,19 @@ def uhi_eely(config, config_uhi):
         )
 
         print(f"Point cloud size for H5 file {h5_index}: {point_cloud_altimeter.shape}")
+
+        # Show spatial extent of this file's DEM contribution
+        if point_cloud_altimeter.shape[0] > 0:
+            print(f"  DEM extent for this file:")
+            print(
+                f"    North: {point_cloud_altimeter[:, 0].min():.1f} to {point_cloud_altimeter[:, 0].max():.1f} m"
+            )
+            print(
+                f"    East:  {point_cloud_altimeter[:, 1].min():.1f} to {point_cloud_altimeter[:, 1].max():.1f} m"
+            )
+            print(
+                f"    Down:  {point_cloud_altimeter[:, 2].min():.1f} to {point_cloud_altimeter[:, 2].max():.1f} m"
+            )
 
         if h5_index == 0:
             point_cloud_altimeter_total = point_cloud_altimeter

@@ -370,22 +370,85 @@ class CameraGeometry:
             # Identify the missing intersections:
             missing_rays = np.array(list(set(range(n_rays)) - set(rays)))
 
-            # And ray trace them individually in VTK
-            for ray in missing_rays:
-                # Retry failed intersections with slow pyvista version
-                point, cell = mesh.ray_trace(
-                    start[ray, :], start[ray, :] + dir[ray, :], first_point=True
-                )
-                cells = np.concatenate((cells, cell), axis=0)
-                points = np.concatenate((points, point.reshape((1, 3))), axis=0)
-                rays = np.concatenate((rays, np.array([ray])), axis=0)
+            # Check if retry would take too long or is pointless
+            MAX_RETRY_RAYS = 10000  # Don't retry more than this (>10k failures = DEM problem, not accuracy)
+            
+            if len(missing_rays) > MAX_RETRY_RAYS:
+                print(f"\n⚠️  CRITICAL: {len(missing_rays)} rays failed Trimesh intersection ({len(missing_rays)/n_rays*100:.1f}%)")
+                print(f"   This indicates DEM doesn't cover the HSI field of view.")
+                print(f"   PyVista retry would take ~{len(missing_rays)/1000:.0f} minutes and won't help.")
+                print(f"   (PyVista can't find intersections where DEM doesn't exist)")
+                print(f"\n   Skipping retry. Continuing with {n_points} successful intersections.")
+                print(f"   Expected outcome: Georeferencing will fail threshold check.\n")
+                failed_rays_list = list(missing_rays)
+            else:
+                # Retry failed intersections with slow PyVista (with progress bar)
+                print(f"   Retrying {len(missing_rays)} rays with PyVista...")
+                from tqdm import tqdm
+                
+                successful_retries = 0
+                failed_rays_list = []
+
+                for ray in tqdm(missing_rays, desc="PyVista ray retry", unit="rays"):
+                    # Retry failed intersections with slow pyvista version
+                    point, cell = mesh.ray_trace(
+                        start[ray, :], start[ray, :] + dir[ray, :], first_point=True
+                    )
+
+                    # Check if intersection was found (point is not empty)
+                    if point.size > 0 and cell.size > 0:
+                        cells = np.concatenate((cells, cell), axis=0)
+                        points = np.concatenate((points, point.reshape((1, 3))), axis=0)
+                        rays = np.concatenate((rays, np.array([ray])), axis=0)
+                        successful_retries += 1
+                    else:
+                        failed_rays_list.append(ray)
+
             n_points = int(np.size(points) / 3)
-            print("All rays successfully traced in VTK")
+
+            # Report retry results (if retry was attempted)
+            if len(missing_rays) <= MAX_RETRY_RAYS and 'successful_retries' in locals() and successful_retries > 0:
+                print(
+                    f"PyVista retry: {successful_retries}/{len(missing_rays)} rays successfully traced"
+                )
+
+            if len(failed_rays_list) > 0:
+                failure_rate = len(failed_rays_list) / n_rays * 100
+                print(
+                    f"WARNING: {len(failed_rays_list)} rays failed to intersect after PyVista retry"
+                )
+                print(f"  This means {failure_rate:.1f}% of rays don't hit the DEM")
+                print(f"  Possible causes:")
+                print(f"    - DEM doesn't cover the entire HSI field of view")
+                print(f"    - Camera looking outside DEM boundaries")
+                print(f"    - Time synchronization issue between HSI file 1 and file 2")
+
+                # Raise error if failure rate is too high
+                FAILURE_THRESHOLD = 30.0  # Fail if more than 30% of rays miss (some edge rays are acceptable)
+                if failure_rate > FAILURE_THRESHOLD:
+                    raise ValueError(
+                        f"Georeferencing failed: {failure_rate:.1f}% of rays ({len(failed_rays_list)}/{n_rays}) "
+                        f"failed to intersect with DEM (threshold: {FAILURE_THRESHOLD}%). "
+                        f"This indicates serious issues with DEM coverage or camera alignment. "
+                        f"Cannot proceed with orthorectification."
+                    )
+            else:
+                print("All rays successfully traced in VTK")
+                print(f"✅ Ray intersection success: 100.0% ({n_points}/{n_rays} rays)")
 
         else:
             print(f"All rays were successfully intersected with trimesh")
+            print(f"✅ Ray intersection success: 100.0% ({n_points}/{n_rays} rays)")
 
         stop_time = time.time()
+        
+        # Always print summary statistics
+        success_rate = (n_points / n_rays) * 100
+        print(f"\n📊 Intersection Summary:")
+        print(f"   Total rays cast: {n_rays}")
+        print(f"   Successful intersections: {n_points} ({success_rate:.1f}%)")
+        print(f"   Failed intersections: {n_rays - n_points} ({100 - success_rate:.1f}%)")
+        print(f"   Processing time: {stop_time - start_time:.1f} seconds")
 
         normals = mesh.cell_normals[cells, :]
 

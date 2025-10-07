@@ -69,3 +69,14 @@ python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\057_gro
 
 # for 221
 python gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new\use_gref4hsi\221_redo_with_new_track" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=5 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+
+
+
+
+
+# 06.10.2025. i will now try again
+python -m gref4hsi/tests/test_eely.py --data_dir="E:\mjosa_new_oct_2025\use_gref4hsi\057" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=20 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
+
+
+python -m gref4hsi.tests.test_eely --data_dir="E:\mjosa_new_oct_2025\use_gref4hsi\057" --csv_nav_path="E:\mjosa_new\navigation_data\nav_data_merged.csv" --resolution=20 --interpolation=True --raster_transform="minimal_rectangle" --time_offset_sec=-508
