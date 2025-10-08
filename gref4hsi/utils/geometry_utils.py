@@ -372,6 +372,22 @@ class CameraGeometry:
 
             # Check if retry would take too long or is pointless
             MAX_RETRY_RAYS = 10000  # Don't retry more than this (>10k failures = DEM problem, not accuracy)
+            EARLY_FAILURE_THRESHOLD = 50.0  # Cancel early if >50% rays miss
+            
+            early_failure_rate = len(missing_rays) / n_rays * 100
+            
+            # EARLY FAILURE CHECK: If >50% of rays miss, don't waste time on expensive computations
+            if early_failure_rate > EARLY_FAILURE_THRESHOLD:
+                print(f"\n❌ CRITICAL FAILURE: {len(missing_rays)} rays failed Trimesh intersection ({early_failure_rate:.1f}%)")
+                print(f"   Failure rate exceeds {EARLY_FAILURE_THRESHOLD}% threshold.")
+                print(f"   This indicates DEM doesn't cover the HSI field of view.")
+                print(f"\n   Cancelling georeferencing immediately to save time.")
+                print(f"   (No point computing view angles, sun angles for data that will fail anyway)\n")
+                raise ValueError(
+                    f"Georeferencing cancelled early: {early_failure_rate:.1f}% of rays ({len(missing_rays)}/{n_rays}) "
+                    f"failed to intersect with DEM (early threshold: {EARLY_FAILURE_THRESHOLD}%). "
+                    f"DEM does not cover the HSI field of view. Check DEM time range and spatial coverage."
+                )
             
             if len(missing_rays) > MAX_RETRY_RAYS:
                 print(f"\n⚠️  CRITICAL: {len(missing_rays)} rays failed Trimesh intersection ({len(missing_rays)/n_rays*100:.1f}%)")

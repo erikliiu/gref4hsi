@@ -740,9 +740,21 @@ def altimeter_data_to_point_cloud(nav, config_uhi, lat0, lon0, h0, true_time_hsi
     altimeter_point_cloud = alt_vec_ned[0:3, :].T
 
     # Select the points from an appropriate time interval
-    # Files are continuous transects, so use exact time ranges without overlap
-    crit_1 = nav.altitude.time <= true_time_hsi.max()
-    crit_2 = nav.altitude.time >= true_time_hsi.min()
+    # IMPORTANT: HSI is offset forward from altimeter by translation_body_to_hsi
+    # So HSI looks at seafloor that vehicle will reach LATER
+    # Add time buffer to ensure DEM covers where HSI is actually looking
+
+    # NOTE: This creates intentional DEM OVERLAP between consecutive files:
+    # - File 1's DEM includes future data (from File 2's time range)
+    # - File 2's DEM includes past data (from File 1's time range)
+    # This is CORRECT behavior: each file needs a complete DEM for its entire FOV
+
+    # Estimate time buffer based on vehicle speed and HSI forward offset
+    # Assuming typical speed ~1 m/s and 2.5m forward offset = ~3 second buffer needed
+    TIME_BUFFER_SECONDS = 10  # Buffer for HSI looking ahead of altimeter
+
+    crit_1 = nav.altitude.time <= (true_time_hsi.max() + TIME_BUFFER_SECONDS)
+    crit_2 = nav.altitude.time >= (true_time_hsi.min() - TIME_BUFFER_SECONDS)
 
     # print(
     #     f"Altitude data time range: {nav.altitude.time.min():.1f} to {nav.altitude.time.max():.1f}"
