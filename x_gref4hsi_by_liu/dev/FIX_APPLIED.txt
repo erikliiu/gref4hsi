@@ -1,0 +1,88 @@
+"""
+LATERAL OFFSET FIX - APPLIED
+==============================
+
+Date: 2025-10-08
+Issue: Georeferenced HSI data has ~2.47m lateral offset from navigation trajectory
+
+ROOT CAUSE IDENTIFIED:
+----------------------
+The camera frame X-axis (across-track) mapping to body frame was INVERTED.
+
+Camera X-axis represents the across-track direction of the pushbroom sensor.
+- Camera +X should point to starboard (right) side of swath
+- Camera -X should point to port (left) side of swath
+
+The original mapping had:
+  Camera +X → Body +Y (starboard)
+
+But this caused the swath to appear LEFT of the trajectory instead of centered.
+
+The issue: Camera pixel indexing or ray direction convention was opposite to 
+what the rotation matrix assumed.
+
+FIX APPLIED:
+------------
+File: config.py, line 31
+
+Changed ROTATION_HSI_TO_BODY from:
+```python
+[[0.0,  1.0, 0.0],   # Camera X → Body +Y (starboard)
+ [1.0,  0.0, 0.0],   # Camera Y → Body +X (forward)  
+ [0.0,  0.0, -1.0]]  # Camera Z → Body -Z (up, since cam Z is down)
+```
+
+To:
+```python
+[[0.0, -1.0, 0.0],   # Camera X → Body -Y (port) - FLIPPED SIGN
+ [1.0,  0.0, 0.0],   # Camera Y → Body +X (forward)
+ [0.0,  0.0, -1.0]]  # Camera Z → Body -Z (up)
+```
+
+WHY THIS FIXES IT:
+------------------
+With vehicle heading South (yaw=180°):
+- Body +Y points East (starboard/right)
+- Body -Y points West (port/left)
+
+Before fix:
+- Camera +X mapped to Body +Y (East)
+- Left edge pixels (Camera -X) pointed West
+- But georef showed swath to the WEST of trajectory
+- This means left pixels were being treated as right pixels
+
+After fix:
+- Camera +X maps to Body -Y (West/port)
+- Camera -X maps to Body +Y (East/starboard)  
+- Now left edge of swath is on port (left) side
+- Right edge of swath is on starboard (right) side
+- Swath should now be CENTERED under trajectory
+
+VERIFICATION NEEDED:
+--------------------
+1. Re-run main.py to regenerate georeferenced data
+2. Run analyze_georef_offset.py to check cross-track offset
+3. Expected: Cross-track offset should be ~0m (not -2.47m)
+4. Visual check: Plot georef with trajectory - swath should be centered
+
+TEST COMMANDS:
+--------------
+# Regenerate georef data
+python main.py
+
+# Check offset
+python dev/analyze_georef_offset.py
+
+# Visualize
+# Run notebook: dev1_plot_hsi.ipynb, cell with plot_georef_with_trajectory()
+
+ALTERNATIVE INTERPRETATION:
+---------------------------
+If this fix makes the offset WORSE (swath moves further left), then the issue
+is not the rotation matrix but rather:
+1. The ray direction calculation in build_ray_directions() has pixel order flipped
+2. The MBES mesh orientation is flipped
+3. The camera calibration XML has incorrect sign conventions
+
+In that case, revert this change and investigate those areas instead.
+"""

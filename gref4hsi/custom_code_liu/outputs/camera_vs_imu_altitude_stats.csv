@@ -1,0 +1,5 @@
+metric,value_m
+mean(camera-imu),-0.025598489453264806
+min(camera-imu),-0.064236516474665
+max(camera-imu),0.0102667234371836
+std(camera-imu),0.015321343133224613

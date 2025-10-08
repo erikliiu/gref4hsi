@@ -7,18 +7,33 @@ from pathlib import Path
 
 # ===== INPUT PATHS =====
 NAV_CSV = r"E:\mjosa_new\navigation_data\nav_data_merged.csv"
-MBES_GEOTIFF = r"E:\mjosa_new\DTM\geotiff_2.tif"
-H5_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_code_1to2\input"
+MBES_GEOTIFF = r"E:\mjosa_new\DTM\geotiff_2.tif"  # the correct one
+# MBES_GEOTIFF = r"E:\mjosa_new\DTM\104921.tif"  # the fucked one to check orientation
 
-# ===== OUTPUT PATHS =====
-OUTPUT_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_code_1to2\output"
+# ===== WORKING FOLDER =====
+# Change this to switch between different datasets
+WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_1to2"
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_all"
+
+
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_all"
+
+# Derived paths - no need to change these
+H5_FOLDER = WORKING_FOLDER + r"\input"
+OUTPUT_FOLDER = WORKING_FOLDER + r"\output"
 
 # ===== SENSOR CONFIGURATION =====
 # HSI camera relative to vehicle body frame
-# EELY configuration: UHI and MBES both looking straight down (push-broom)
-# NO ROTATION - camera axes aligned with body axes (both in NED frame)
-ROTATION_HSI_TO_BODY = np.eye(3)  # Identity matrix - no rotation
-TRANSLATION_BODY_TO_HSI = np.array([2.5, 0, 0])  # 2.5m forward offset
+# Body frame: +X forward, +Y starboard/right, +Z up
+# Camera frame (test_eely): +X across-track, +Y along-track, +Z down
+# Mapping cam->body: Xc→+Yb, Yc→+Xb, Zc→−Zb
+ROTATION_HSI_TO_BODY = np.array(
+    [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]], dtype=float
+)
+TRANSLATION_BODY_TO_HSI = np.array([0, -2.5, 0.0], dtype=float)
+
+# Navigation yaw convention used in the CSV ('yaw [deg]' is a compass heading)
+YAW_CONVENTION = "heading_from_north_cw"  # or "enu_yaw_from_east_ccw"
 
 # Time synchronization
 TIME_OFFSET_SEC = 508  # Same as in test_eely.py

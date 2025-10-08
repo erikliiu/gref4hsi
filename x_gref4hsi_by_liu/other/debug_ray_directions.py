@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent))
 import config
-import utils
+import x_gref4hsi_by_liu.utils.utils as utils
 
 # Test with a simple scenario
 print("=" * 80)

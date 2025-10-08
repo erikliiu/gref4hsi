@@ -1,0 +1,121 @@
+"""
+LATERAL OFFSET BUG - ROOT CAUSE AND FIX
+========================================
+
+PROBLEM SUMMARY:
+----------------
+Georeferenced HSI data has a lateral (cross-track) offset of ~2.47m from the navigation trajectory.
+The georef swath appears to the LEFT of the trajectory when it should be centered beneath it.
+
+DIAGNOSIS:
+----------
+Running debug_lateral_offset.py and analyze_georef_offset.py revealed:
+
+1. Vehicle heading SOUTH (yaw ≈ 180°)
+2. Camera offset from nav body: (-2.47m East, +0.34m North) 
+3. Expected camera offset: Should be ~(0, -2.5m) since camera is 2.5m forward
+4. Actual result: Camera appears 2.47m WEST of the vehicle
+
+When vehicle heading is NORTH (yaw = 0°):
+- Body X (forward) → World (0, 1, 0) = North ✓ CORRECT
+- Body Y (starboard/right) → World (-1, 0, 0) = West ❌ WRONG! Should be East
+
+ROOT CAUSE:
+-----------
+The body frame definition has an incorrect sign convention for the Y-axis (starboard).
+
+Current behavior:
+- Body +Y (starboard/right) maps to WEST when heading North
+- This causes a left/right flip in the georeferencing
+
+Expected behavior:
+- Body +Y (starboard/right) should map to EAST when heading North
+- Standard right-handed coordinate: +X forward, +Y right, +Z up
+
+POSSIBLE FIXES:
+---------------
+
+Option 1: Fix the yaw rotation matrix
+--------------------------------------
+In utils/utils.py, euler_to_rotation_matrix_nav(), the Rz matrix may need a sign flip:
+
+Current:
+```python
+Rz = [[cos(yaw), -sin(yaw), 0],
+      [sin(yaw),  cos(yaw), 0],
+      [0,         0,        1]]
+```
+
+This is the standard CCW rotation matrix. But if the body frame convention is different,
+we might need:
+
+```python
+Rz = [[cos(yaw),  sin(yaw), 0],
+      [-sin(yaw), cos(yaw), 0],
+      [0,         0,        1]]
+```
+
+Option 2: Fix the ROTATION_HSI_TO_BODY matrix
+----------------------------------------------
+In config.py, change the sign of one axis in ROTATION_HSI_TO_BODY:
+
+Current:
+```python
+ROTATION_HSI_TO_BODY = np.array(
+    [[0.0, 1.0, 0.0],   # Cam X → Body Y
+     [1.0, 0.0, 0.0],   # Cam Y → Body X
+     [0.0, 0.0, -1.0]], # Cam Z → Body -Z
+    dtype=float
+)
+```
+
+Try flipping the camera X mapping:
+```python
+ROTATION_HSI_TO_BODY = np.array(
+    [[0.0, -1.0, 0.0],  # Cam X → Body -Y (flip starboard/port)
+     [1.0, 0.0, 0.0],   # Cam Y → Body X
+     [0.0, 0.0, -1.0]], # Cam Z → Body -Z
+    dtype=float
+)
+```
+
+Option 3: Fix the yaw convention conversion
+--------------------------------------------
+In utils/utils.py, line 313:
+
+Current:
+```python
+if yaw_convention == "heading_from_north_cw":
+    yaw_rad = np.deg2rad(90.0 - np.asarray(yaw_input_deg, dtype=float))
+```
+
+The conversion from compass heading to ENU yaw might need adjustment. 
+Standard conversion: ENU_yaw = 90° - compass_heading
+
+But we might need: ENU_yaw = 90° + compass_heading
+or: ENU_yaw = -(90° - compass_heading)
+
+RECOMMENDED FIX:
+----------------
+**Try Option 1 first** - flip the sign of sin(yaw) in the Rz rotation matrix.
+
+This is because:
+1. The simulation uses the same rotation code and it works correctly
+2. The camera transformation matrix matches between sim and main.py
+3. The issue is in how the body frame rotates in world coordinates
+
+TEST PROCEDURE:
+---------------
+1. Make the change
+2. Re-run main.py to regenerate georef data
+3. Run analyze_georef_offset.py to check cross-track offset
+4. Expected result: Cross-track offset should be ~0 ± 0.5m (not -2.47m)
+5. Verify in visualization that swath is centered under trajectory
+
+VERIFICATION:
+-------------
+After fix, the debug output should show:
+- Body Y (starboard) → World (+1, 0, 0) = East when heading North
+- Camera offset from nav: ~(0, -2.5) when heading South
+- Cross-track offset: ~0m (not -2.47m)
+"""

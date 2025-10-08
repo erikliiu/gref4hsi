@@ -214,9 +214,9 @@ def main(args):
         raise SystemExit(1)
 
     # Step 5: Orthorectification - creates final hyperspectral maps
-    print("\n################ Starting Orthorectification ################")
-    orthorectification.main(config_file_mission)
-    print("\n✅ Pipeline completed successfully!")
+    # print("\n################ Starting Orthorectification ################")
+    # orthorectification.main(config_file_mission)
+    # print("\n✅ Pipeline completed successfully!")
 
 
 if __name__ == "__main__":

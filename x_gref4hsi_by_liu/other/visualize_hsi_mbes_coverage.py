@@ -16,7 +16,7 @@ import sys
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent))
 import config
-import utils
+import x_gref4hsi_by_liu.utils.utils as utils
 
 
 def load_full_mission_track(nav_csv):

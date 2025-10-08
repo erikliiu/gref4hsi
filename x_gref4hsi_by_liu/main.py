@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 import config
-import utils
+from x_gref4hsi_by_liu.utils import utils
 import georeference_mbes
 
 
@@ -62,10 +62,13 @@ def process_h5_file(h5_path, nav_data, mbes_mesh, camera_calib, output_dir):
         )
         positions_ecef = np.column_stack([pos_ecef_x, pos_ecef_y, pos_ecef_z])
 
-        # Step 4: Convert Euler angles to rotation matrices
+        # Step 4: Convert Euler/heading to BODY->WORLD rotation matrices (ENU)
         print("Converting attitude to rotation matrices...")
-        orientations = utils.euler_to_rotation_matrix(
-            interp_nav["roll"], interp_nav["pitch"], interp_nav["yaw"]
+        orientations = utils.euler_to_rotation_matrix_nav(
+            interp_nav["roll"],
+            interp_nav["pitch"],
+            interp_nav["yaw"],
+            yaw_convention=getattr(config, "YAW_CONVENTION", "heading_from_north_cw"),
         )
 
         # Step 5: Apply sensor transform (body frame → HSI camera frame)
@@ -99,8 +102,6 @@ def process_h5_file(h5_path, nav_data, mbes_mesh, camera_calib, output_dir):
             # Try common dataset paths (UHI format: processed/radiance/dataCube)
             possible_paths = [
                 "processed/radiance/dataCube",  # Standard UHI calibrated radiance
-                "rawdata/hsi/datacube",  # Raw HSI data
-                "processed/radiance",  # Generic processed path
             ]
 
             found_data = False
@@ -133,23 +134,35 @@ def process_h5_file(h5_path, nav_data, mbes_mesh, camera_calib, output_dir):
         n_rays_per_frame = ray_directions_camera.shape[0]
         total_rays = n_frames * n_rays_per_frame
 
-        ray_origins_mbes = np.zeros((total_rays, 3))
-        ray_directions_world = np.zeros((total_rays, 3))
+        ray_origins_mbes = np.zeros((total_rays, 3), dtype=float)
+        ray_directions_world = np.zeros((total_rays, 3), dtype=float)
 
         for i in range(n_frames):
-            # Ray origins: all rays in this frame start from camera position
             idx_start = i * n_rays_per_frame
             idx_end = (i + 1) * n_rays_per_frame
+
+            # ray origins: camera positions (already in MBES CRS)
             ray_origins_mbes[idx_start:idx_end] = hsi_positions_mbes[i]
 
-            # Ray directions: transform from camera frame to world frame
-            R_camera_to_world = hsi_orientations[i]
-            ray_directions_world[idx_start:idx_end] = (
-                R_camera_to_world @ ray_directions_camera.T
-            ).T
+            # orientations: R_world_from_body @ R_body_from_cam  => R_world_from_cam
+            R_world_from_cam = hsi_orientations[
+                i
+            ]  # already computed as R_world_from_body @ ROTATION_HSI_TO_BODY
+
+            dirs_world = (R_world_from_cam @ ray_directions_camera.T).T
+            dirs_world /= np.linalg.norm(dirs_world, axis=1, keepdims=True)  # normalize
+
+            ray_directions_world[idx_start:idx_end] = dirs_world
 
         print(
             f"Prepared {total_rays:,} rays ({n_frames} frames × {n_rays_per_frame} slits)"
+        )
+
+        # Sanity check: print mean boresight direction (should point down, negative Z)
+        up = np.array([0.0, 0.0, 1.0])
+        mean_boresight_dot_up = float(np.mean(ray_directions_world @ up))
+        print(
+            f"Mean boresight·up = {mean_boresight_dot_up:.4f} (should be negative, pointing down)"
         )
 
         # Step 9: Ray trace to MBES mesh
@@ -195,7 +208,13 @@ def process_h5_file(h5_path, nav_data, mbes_mesh, camera_calib, output_dir):
             print(f"Copied H5 file to output directory")
 
         utils.save_intersection_to_h5(
-            str(output_h5_path), intersections_ecef, pixel_indices, frame_indices
+            str(output_h5_path),
+            intersections_ecef,
+            pixel_indices,
+            frame_indices,
+            n_frames=n_frames,
+            n_slits=n_slits,
+            gridded=True,  # Save as (T, S, 3) gridded format like test_eely
         )
 
         # Print summary statistics

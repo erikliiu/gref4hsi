@@ -38,7 +38,7 @@ import argparse
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 import config
-import utils
+import x_gref4hsi_by_liu.utils.utils as utils
 
 
 class Arrow3D(FancyArrowPatch):
