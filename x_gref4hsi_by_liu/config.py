@@ -12,8 +12,10 @@ MBES_GEOTIFF = r"E:\mjosa_new\DTM\geotiff_2.tif"  # the correct one
 
 # ===== WORKING FOLDER =====
 # Change this to switch between different datasets
-WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_1to2"
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_all"
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_1to2"
+WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_completed"
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_redo"
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_get_stats"
 
 
 # WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_all"

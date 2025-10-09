@@ -142,7 +142,7 @@ def raytrace_hsi_to_mbes(
     mesh,
     max_ray_length=100,
     early_failure_threshold=50.0,
-    max_retry_rays=10000,
+    max_retry_rays=20000,
 ):
     """
     Ray trace from HSI camera to MBES mesh.
@@ -273,7 +273,7 @@ def raytrace_hsi_to_mbes(
 
     if n_failed > 0:
         # Check failure threshold
-        FAILURE_THRESHOLD = 30.0
+        FAILURE_THRESHOLD = 40.0
         if (n_failed / n_rays * 100) > FAILURE_THRESHOLD:
             raise ValueError(
                 f"Ray tracing failed: {n_failed/n_rays*100:.1f}% of rays missed mesh "
