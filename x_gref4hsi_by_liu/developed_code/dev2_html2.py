@@ -857,14 +857,14 @@ if __name__ == "__main__":
         hsi_rgb_layer_name="HSI RGB (spectral, thinned)",
         hsi_rgb_stride_tracks=10,  # keep these; thinning happens after striding
         hsi_rgb_stride_slits=10,
-        hsi_rgb_keep_fraction=0.10,  # keep ~10% of strided cells
+        hsi_rgb_keep_fraction=0.02,  # keep ~10% of strided cells
         hsi_rgb_add_tooltip=False,  # tooltips removed for size
         hsi_rgb_red_wl=654.2,
         hsi_rgb_green_wl=560,
         hsi_rgb_blue_wl=440.3,
         hsi_rgb_normalize=True,
         hsi_rgb_use_corrected=False,
-        hsi_rgb_point_radius=3,
+        hsi_rgb_point_radius=0.3,
         hsi_rgb_point_opacity=0.8,
         # EPSG codes from config
         hsi_ecef_epsg=config.EPSG_ECEF,

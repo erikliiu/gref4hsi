@@ -581,6 +581,11 @@ def main():
         else:
             fail_count += 1
 
+        # Explicitly trigger garbage collection after each file to free memory
+        import gc
+
+        gc.collect()
+
     end_time = datetime.now()
     processing_duration = (end_time - start_time).total_seconds()
 

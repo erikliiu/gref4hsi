@@ -8,6 +8,7 @@ import pyvista as pv
 import trimesh
 from tqdm import tqdm
 from pathlib import Path
+import gc
 
 
 def load_mbes_geotiff(geotiff_path, verbose=True):
@@ -187,29 +188,36 @@ def raytrace_hsi_to_mbes(
         geometry=tri_mesh
     )
 
-    # Perform bulk intersection with Trimesh
-    print("Running Trimesh ray intersection...")
-    cells, rays, points = ray_mesh_intersector.intersects_id(
-        ray_origins=ray_origins,
-        ray_directions=ray_directions,
-        multiple_hits=False,
-        return_locations=True,
-    )
+    try:
+        # Perform bulk intersection with Trimesh
+        print("Running Trimesh ray intersection...")
+        cells, rays, points = ray_mesh_intersector.intersects_id(
+            ray_origins=ray_origins,
+            ray_directions=ray_directions,
+            multiple_hits=False,
+            return_locations=True,
+        )
 
-    n_hits = len(points)
-    n_missing = n_rays - n_hits
-    success_rate = n_hits / n_rays * 100
+        n_hits = len(points)
+        n_missing = n_rays - n_hits
+        success_rate = n_hits / n_rays * 100
 
-    print(f"Trimesh results: {n_hits:,}/{n_rays:,} rays hit ({success_rate:.2f}%)")
+        print(f"Trimesh results: {n_hits:,}/{n_rays:,} rays hit ({success_rate:.2f}%)")
 
-    if n_missing == 0:
-        print("✓ All rays intersected successfully!")
-        return {
-            "points": points,
-            "ray_indices": rays,
-            "cell_indices": cells,
-            "success_rate": success_rate,
-        }
+        if n_missing == 0:
+            print("✓ All rays intersected successfully!")
+            return {
+                "points": points,
+                "ray_indices": rays,
+                "cell_indices": cells,
+                "success_rate": success_rate,
+            }
+    finally:
+        # CRITICAL: Clean up Trimesh objects to prevent memory leaks
+        # Clear the cache that stores expensive computations like face normals
+        tri_mesh._cache.clear()
+        del ray_mesh_intersector
+        del tri_mesh
 
     # Check early failure condition
     failure_rate = n_missing / n_rays * 100
@@ -283,6 +291,9 @@ def raytrace_hsi_to_mbes(
             print(
                 f"⚠️  Warning: {n_failed} rays failed, but within acceptable threshold ({FAILURE_THRESHOLD}%)"
             )
+
+    # Force garbage collection to ensure memory is freed
+    gc.collect()
 
     return {
         "points": points,
