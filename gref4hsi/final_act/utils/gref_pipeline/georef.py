@@ -1964,7 +1964,7 @@ def load_transect(
     return TransectDataSet(folder_path, use_corrected=use_corrected)
 
 
-def print_processing_statistics(stats_file_path=None):
+def print_processing_statistics(stats_file_path=None, track_start=None, track_end=None):
     """
     Load and print processing statistics from JSON file.
 
@@ -1972,6 +1972,10 @@ def print_processing_statistics(stats_file_path=None):
     -----------
     stats_file_path : str or Path, optional
         Path to the statistics JSON file. If None, uses config.OUTPUT_FOLDER/processing_statistics.json
+    track_start : int, optional
+        Starting track index for segment-specific statistics (inclusive)
+    track_end : int, optional
+        Ending track index for segment-specific statistics (exclusive)
     """
     import json
     from pathlib import Path
@@ -2132,6 +2136,395 @@ def print_processing_statistics(stats_file_path=None):
             print(f"    Swath width range: [{min_swath:.2f}, {max_swath:.2f}] m")
             print(f"    Coverage efficiency: {eff_pct:.1f}%")
             print(f"      (= covered area / survey bounding box area)")
+
+    # Segment-specific statistics (if track range provided)
+    if track_start is not None and track_end is not None:
+        print("\n" + "=" * 80)
+        print(f"🎯 SEGMENT STATISTICS (tracks {track_start} to {track_end})")
+        print("=" * 80)
+
+        # Validate track range
+        total_frames_agg = get_nested(
+            stats, "aggregated_statistics", "total_frames", default=0
+        )
+        if track_start < 0 or track_end > total_frames_agg or track_start >= track_end:
+            print(
+                f"  ⚠️  Invalid track range: [{track_start}, {track_end}) for total {total_frames_agg} tracks"
+            )
+        else:
+            segment_tracks = track_end - track_start
+            print(f"\n  📏 Segment Info:")
+            print(
+                f"    Track range: [{track_start}, {track_end}) (length: {segment_tracks} tracks)"
+            )
+            print(
+                f"    Percentage of transect: {100 * segment_tracks / max(1, total_frames_agg):.1f}%"
+            )
+
+            # Calculate segment statistics from individual files
+            segment_hits = 0
+            segment_rays = 0
+            segment_files = []
+            segment_start_time = None
+            segment_end_time = None
+
+            if "individual_files" in stats:
+                cumulative_track = 0
+                for file_stat in stats["individual_files"]:
+                    if file_stat.get("status") == "failed":
+                        continue
+
+                    file_frames = get_nested(
+                        file_stat, "hsi_data", "n_frames", default=0
+                    )
+                    file_slits = get_nested(file_stat, "hsi_data", "n_slits", default=0)
+                    file_end_track = cumulative_track + file_frames
+
+                    # Check if this file overlaps with segment
+                    if file_end_track > track_start and cumulative_track < track_end:
+                        segment_files.append(file_stat.get("filename", "Unknown"))
+
+                        # Calculate overlap
+                        overlap_start = max(track_start, cumulative_track)
+                        overlap_end = min(track_end, file_end_track)
+                        overlap_tracks = overlap_end - overlap_start
+
+                        # Get file-level statistics
+                        file_hits = get_nested(
+                            file_stat, "ray_tracing", "successful_hits", default=0
+                        )
+                        file_rays = get_nested(
+                            file_stat, "ray_tracing", "total_rays", default=0
+                        )
+
+                        # Estimate segment contribution (proportional to overlap)
+                        if file_frames > 0:
+                            overlap_ratio = overlap_tracks / file_frames
+                            segment_hits += int(file_hits * overlap_ratio)
+                            segment_rays += int(file_rays * overlap_ratio)
+
+                        # Time range
+                        if (
+                            "hsi_data" in file_stat
+                            and "time_range" in file_stat["hsi_data"]
+                        ):
+                            file_time_start = get_nested(
+                                file_stat, "hsi_data", "time_range", "start", default=0
+                            )
+                            file_time_end = get_nested(
+                                file_stat, "hsi_data", "time_range", "end", default=0
+                            )
+                            file_duration = get_nested(
+                                file_stat,
+                                "hsi_data",
+                                "time_range",
+                                "duration_sec",
+                                default=0,
+                            )
+
+                            if file_duration > 0 and file_frames > 0:
+                                # Estimate time for segment within this file
+                                time_per_track = file_duration / file_frames
+                                local_start_track = overlap_start - cumulative_track
+                                local_end_track = overlap_end - cumulative_track
+
+                                est_start_time = (
+                                    file_time_start + local_start_track * time_per_track
+                                )
+                                est_end_time = (
+                                    file_time_start + local_end_track * time_per_track
+                                )
+
+                                if (
+                                    segment_start_time is None
+                                    or est_start_time < segment_start_time
+                                ):
+                                    segment_start_time = est_start_time
+                                if (
+                                    segment_end_time is None
+                                    or est_end_time > segment_end_time
+                                ):
+                                    segment_end_time = est_end_time
+
+                    cumulative_track = file_end_track
+
+            # Now extract detailed segment data from individual file statistics
+            print(f"\n  💡 Extracting detailed segment metrics from file statistics...")
+
+            # Collect detailed segment data from overlapping files
+            segment_file_stats = []
+            segment_nav_depth = []
+            segment_nav_roll = []
+            segment_nav_pitch = []
+            segment_mission_distances = []
+            segment_mission_durations = []
+            segment_coverage_areas = []
+            segment_coverage_swaths = []
+
+            if "individual_files" in stats:
+                cumulative_track = 0
+
+                for file_stat in stats["individual_files"]:
+                    if file_stat.get("status") == "failed":
+                        continue
+
+                    file_frames = get_nested(
+                        file_stat, "hsi_data", "n_frames", default=0
+                    )
+                    file_end_track = cumulative_track + file_frames
+
+                    # Check if this file overlaps with segment
+                    if file_end_track > track_start and cumulative_track < track_end:
+                        filename = file_stat.get("filename", "Unknown")
+
+                        # Calculate overlap
+                        overlap_start = max(track_start, cumulative_track)
+                        overlap_end = min(track_end, file_end_track)
+                        overlap_tracks = overlap_end - overlap_start
+                        overlap_ratio = (
+                            overlap_tracks / file_frames if file_frames > 0 else 0
+                        )
+
+                        # Store file info
+                        segment_file_stats.append(
+                            {
+                                "filename": filename,
+                                "overlap_tracks": overlap_tracks,
+                                "overlap_ratio": overlap_ratio,
+                                "file_stat": file_stat,
+                            }
+                        )
+
+                        # Extract navigation data from file statistics
+                        if "navigation" in file_stat:
+                            nav = file_stat["navigation"]
+
+                            # Depth
+                            depth_min = get_nested(
+                                nav, "depth_range", "min", default=None
+                            )
+                            depth_max = get_nested(
+                                nav, "depth_range", "max", default=None
+                            )
+                            depth_mean = get_nested(
+                                nav, "depth_range", "mean", default=None
+                            )
+                            if depth_min is not None:
+                                segment_nav_depth.append(
+                                    {
+                                        "min": depth_min,
+                                        "max": depth_max,
+                                        "mean": depth_mean,
+                                        "weight": overlap_tracks,
+                                    }
+                                )
+
+                            # Roll
+                            roll_min = get_nested(
+                                nav, "attitude_ranges", "roll", "min", default=None
+                            )
+                            roll_max = get_nested(
+                                nav, "attitude_ranges", "roll", "max", default=None
+                            )
+                            roll_std = get_nested(
+                                nav, "attitude_ranges", "roll", "std", default=None
+                            )
+                            if roll_min is not None:
+                                segment_nav_roll.append(
+                                    {
+                                        "min": roll_min,
+                                        "max": roll_max,
+                                        "std": roll_std,
+                                        "weight": overlap_tracks,
+                                    }
+                                )
+
+                            # Pitch
+                            pitch_min = get_nested(
+                                nav, "attitude_ranges", "pitch", "min", default=None
+                            )
+                            pitch_max = get_nested(
+                                nav, "attitude_ranges", "pitch", "max", default=None
+                            )
+                            pitch_std = get_nested(
+                                nav, "attitude_ranges", "pitch", "std", default=None
+                            )
+                            if pitch_min is not None:
+                                segment_nav_pitch.append(
+                                    {
+                                        "min": pitch_min,
+                                        "max": pitch_max,
+                                        "std": pitch_std,
+                                        "weight": overlap_tracks,
+                                    }
+                                )
+
+                        # Extract mission metrics
+                        if "mission_metrics" in file_stat:
+                            mission = file_stat["mission_metrics"]
+                            dist = get_nested(mission, "total_distance_m", default=0)
+                            speed_ms = get_nested(mission, "avg_speed_ms", default=0)
+
+                            # Proportional distance for this segment
+                            segment_distance = dist * overlap_ratio
+                            segment_mission_distances.append(segment_distance)
+                            segment_mission_durations.append(
+                                segment_distance / speed_ms if speed_ms > 0 else 0
+                            )
+
+                        # Extract coverage metrics
+                        if "coverage_metrics" in file_stat:
+                            coverage = file_stat["coverage_metrics"]
+                            area = get_nested(
+                                coverage, "coverage_area", "total_covered_m2", default=0
+                            )
+                            swath_mean = get_nested(
+                                coverage, "swath_width", "mean_m", default=0
+                            )
+                            swath_std = get_nested(
+                                coverage, "swath_width", "std_m", default=0
+                            )
+
+                            # Proportional coverage for this segment
+                            segment_coverage_areas.append(area * overlap_ratio)
+                            if swath_mean > 0:
+                                segment_coverage_swaths.append(
+                                    {
+                                        "mean": swath_mean,
+                                        "std": swath_std,
+                                        "weight": overlap_tracks,
+                                    }
+                                )
+
+                    cumulative_track = file_end_track
+
+            # Print segment statistics
+            if segment_rays > 0:
+                segment_success_rate = 100 * segment_hits / segment_rays
+                print(f"\n  🎯 Ray Tracing (segment):")
+                print(f"    Total rays: {segment_rays:,}")
+                print(f"    Successful hits: {segment_hits:,}")
+                print(f"    Success rate: {segment_success_rate:.2f}%")
+
+            if segment_start_time is not None and segment_end_time is not None:
+                segment_duration = segment_end_time - segment_start_time
+                print(f"\n  ⏱️  Time Range (segment):")
+                print(f"    Start: {unix_to_utc(segment_start_time)}")
+                print(f"    End: {unix_to_utc(segment_end_time)}")
+                print(
+                    f"    Duration: {segment_duration:.1f} s ({segment_duration/60:.1f} min)"
+                )
+
+            # Navigation statistics from file stats
+            if segment_nav_depth or segment_nav_roll or segment_nav_pitch:
+                print(f"\n  🧭 Navigation (segment):")
+
+                # Depth statistics
+                if segment_nav_depth:
+                    depth_min = min(d["min"] for d in segment_nav_depth)
+                    depth_max = max(d["max"] for d in segment_nav_depth)
+                    # Weighted mean
+                    total_weight = sum(d["weight"] for d in segment_nav_depth)
+                    depth_mean = (
+                        sum(d["mean"] * d["weight"] for d in segment_nav_depth)
+                        / total_weight
+                        if total_weight > 0
+                        else 0
+                    )
+                    print(
+                        f"    Depth: {depth_min:.2f} to {depth_max:.2f} m (mean: {depth_mean:.2f} m)"
+                    )
+
+                # Roll statistics
+                if segment_nav_roll:
+                    roll_min = min(d["min"] for d in segment_nav_roll)
+                    roll_max = max(d["max"] for d in segment_nav_roll)
+                    # Weighted average of std devs
+                    total_weight = sum(d["weight"] for d in segment_nav_roll)
+                    roll_std_avg = (
+                        sum(d["std"] * d["weight"] for d in segment_nav_roll)
+                        / total_weight
+                        if total_weight > 0
+                        else 0
+                    )
+                    print(
+                        f"    Roll: {roll_min:.2f}° to {roll_max:.2f}° (σ={roll_std_avg:.2f}°)"
+                    )
+
+                # Pitch statistics
+                if segment_nav_pitch:
+                    pitch_min = min(d["min"] for d in segment_nav_pitch)
+                    pitch_max = max(d["max"] for d in segment_nav_pitch)
+                    total_weight = sum(d["weight"] for d in segment_nav_pitch)
+                    pitch_std_avg = (
+                        sum(d["std"] * d["weight"] for d in segment_nav_pitch)
+                        / total_weight
+                        if total_weight > 0
+                        else 0
+                    )
+                    print(
+                        f"    Pitch: {pitch_min:.2f}° to {pitch_max:.2f}° (σ={pitch_std_avg:.2f}°)"
+                    )
+
+            # Mission metrics from file stats
+            if segment_mission_distances:
+                total_distance = sum(segment_mission_distances)
+                print(f"\n  📏 Mission Metrics (segment):")
+                print(f"    Distance: {total_distance:.1f} m")
+
+                if segment_duration > 0:
+                    avg_speed_ms = total_distance / segment_duration
+                    avg_speed_kmh = avg_speed_ms * 3.6
+                    print(
+                        f"    Speed: {avg_speed_ms:.2f} m/s ({avg_speed_kmh:.2f} km/h)"
+                    )
+
+            # Coverage metrics from file stats
+            if segment_coverage_areas or segment_coverage_swaths:
+                print(f"\n  📐 Coverage (segment):")
+
+                if segment_coverage_areas:
+                    total_area = sum(segment_coverage_areas)
+                    print(f"    Area: {total_area:.1f} m²")
+
+                if segment_coverage_swaths:
+                    # Weighted average swath
+                    total_weight = sum(d["weight"] for d in segment_coverage_swaths)
+                    swath_mean = (
+                        sum(d["mean"] * d["weight"] for d in segment_coverage_swaths)
+                        / total_weight
+                        if total_weight > 0
+                        else 0
+                    )
+                    swath_std = (
+                        sum(d["std"] * d["weight"] for d in segment_coverage_swaths)
+                        / total_weight
+                        if total_weight > 0
+                        else 0
+                    )
+                    print(f"    Swath width: {swath_mean:.2f} ± {swath_std:.2f} m")
+
+            # List segment files with details
+            if segment_file_stats:
+                print(f"\n  📄 Files in Segment:")
+                for file_info in segment_file_stats:
+                    fname = file_info["filename"]
+                    overlap = file_info["overlap_tracks"]
+                    ratio = file_info["overlap_ratio"] * 100
+                    print(f"    • {fname}: {overlap} tracks ({ratio:.1f}% of file)")
+
+            # HSI data summary for segment
+            if segment_file_stats:
+                # Get slits/bands from first file
+                first_file = segment_file_stats[0]["file_stat"]
+                segment_slits = get_nested(first_file, "hsi_data", "n_slits", default=0)
+                segment_bands = get_nested(first_file, "hsi_data", "n_bands", default=0)
+                if segment_slits > 0 and segment_bands > 0:
+                    print(f"\n  📸 HSI Data (segment):")
+                    print(f"    Frames: {segment_tracks}")
+                    print(f"    Slits per frame: {segment_slits}")
+                    print(f"    Bands: {segment_bands}")
+                    print(f"    Total pixels: {segment_tracks * segment_slits:,}")
 
     # Individual files
     if "individual_files" in stats and len(stats["individual_files"]) > 0:
