@@ -530,6 +530,46 @@ class CombinedTransectCube:
                 f"  {b['file']}: tracks {b['start_track']}–{b['end_track']} ({b['n_tracks']})"
             )
 
+    def adjust_uhi_alignment(self, dx=0.0, dy=0.0):
+        """
+        Adjust UHI alignment offset by setting config.UHI_ALIGNMENT_DX/DY.
+
+        This shifts the UHI data in NED coordinates when using plot_georef with
+        apply_alignment_shift=True (default). Useful for fine-tuning alignment
+        with MBES or other reference data.
+
+        Parameters:
+        -----------
+        dx : float
+            East shift in meters (added to E coordinate in NED)
+        dy : float
+            North shift in meters (added to N coordinate in NED)
+
+        Example:
+        --------
+        # Shift UHI data 0.05m west and 3m south
+        cube.adjust_uhi_alignment(dx=-0.05, dy=-3.0)
+
+        # Then plot with alignment applied (default behavior)
+        cube.plot_georef(use_corrected=True, coordinate_system='NED')
+        """
+        try:
+            from gref_pipeline import config
+
+            config.UHI_ALIGNMENT_DX = dx
+            config.UHI_ALIGNMENT_DY = dy
+
+            print(f"✅ UHI alignment adjusted:")
+            print(f"   dx (East):  {dx:+.3f} m")
+            print(f"   dy (North): {dy:+.3f} m")
+            print(
+                f"\n💡 This will be applied in plot_georef() with coordinate_system='NED'"
+            )
+        except ImportError:
+            print("❌ Could not import gref_pipeline.config")
+        except Exception as e:
+            print(f"❌ Error setting alignment: {e}")
+
     @staticmethod
     def _read_mbes_geotiff_as_epsg(geotiff_path: str, target_epsg: int):
         """
@@ -654,8 +694,14 @@ class CombinedTransectCube:
         # ROI options (NEW - from plot_rgb)
         roi_collection=None,  # Dict of named ROIs or 'all' to use self.roi_collection
         roi_colors=["yellow", "cyan", "magenta", "orange", "lime", "red", "blue"],
+        roi_color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
         roi_marker_size=100,
+        roi_marker_shape="s",  # Marker shape: 's'=square, 'o'=circle, '^'=triangle, 'D'=diamond, 'v'=triangle_down, '<'=triangle_left, '>'=triangle_right, 'p'=pentagon, '*'=star, 'h'=hexagon, '+'=plus, 'x'=x
+        roi_marker_edgewidth=2,  # Edge width for ROI markers (0 = no edge)
         roi_show_numbers=False,
+        roi_legend_loc="best",  # Legend location: 'best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center', 'outside', or None to hide
+        roi_legend_markersize=10,  # Size of color markers in legend (default=10)
+        roi_legend_marker_border=True,  # Whether to show black border on legend markers
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -932,6 +978,9 @@ class CombinedTransectCube:
         fig, ax = plt.subplots(figsize=figsize)
         ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
 
+        # Store coordinate arrays for interactive tools (e.g., plot_georef_interactive_lines)
+        ax._gref_coord_arrays = (Xp, Yp, start_idx)
+
         if show_file_boundaries and len(self.file_boundaries) > 1:
             for b in self.file_boundaries[1:]:
                 j = b["start_track"]
@@ -946,7 +995,7 @@ class CombinedTransectCube:
                     )
 
         # ========== NEW: Perimeter lines (from plot_rgb) ==========
-        if perimeter_line is not None:
+        if perimeter_line is not None and len(perimeter_line) > 0:
             # Handle single line or list of lines
             if isinstance(perimeter_line[0], (int, float)):
                 lines_to_plot = [perimeter_line]
@@ -1021,8 +1070,11 @@ class CombinedTransectCube:
                             roi_y_coords.append(Yp[t, slit])
 
                     if roi_x_coords:
-                        # Assign color
-                        color = roi_colors[roi_idx % len(roi_colors)]
+                        # Assign color: use color_map if provided, otherwise use default list
+                        if roi_color_map and roi_name in roi_color_map:
+                            color = roi_color_map[roi_name]
+                        else:
+                            color = roi_colors[roi_idx % len(roi_colors)]
 
                         # Plot ROI
                         ax.scatter(
@@ -1030,9 +1082,9 @@ class CombinedTransectCube:
                             roi_y_coords,
                             c=color,
                             s=roi_marker_size,
-                            marker="o",
-                            edgecolors="black",
-                            linewidths=2,
+                            marker=roi_marker_shape,
+                            edgecolors="black" if roi_marker_edgewidth > 0 else "none",
+                            linewidths=roi_marker_edgewidth,
                             alpha=0.8,
                             label=f"{roi_name} ({len(roi_x_coords)})",
                             zorder=11,
@@ -1270,8 +1322,32 @@ class CombinedTransectCube:
             print("💡 Interactive mode: Click on the plot to display coordinates")
 
         # Add legend if perimeter lines or ROIs are shown
-        if perimeter_line is not None or roi_collection is not None:
-            ax.legend(loc="best", fontsize=9, framealpha=0.9)
+        if (
+            perimeter_line is not None or roi_collection is not None
+        ) and roi_legend_loc is not None:
+            if roi_legend_loc == "outside":
+                # Place legend outside the plot area on the right
+                legend = ax.legend(
+                    loc="center left",
+                    bbox_to_anchor=(1.02, 0.5),
+                    fontsize=9,
+                    framealpha=0.9,
+                    markerscale=roi_legend_markersize / 6,
+                )
+            else:
+                legend = ax.legend(
+                    loc=roi_legend_loc,
+                    fontsize=9,
+                    framealpha=0.9,
+                    markerscale=roi_legend_markersize / 6,
+                )
+
+            # Configure legend marker borders
+            if not roi_legend_marker_border and legend:
+                for handle in legend.legend_handles:
+                    if hasattr(handle, "set_edgecolor"):
+                        handle.set_edgecolor("none")
+                        handle.set_linewidth(0)
 
         fig.tight_layout()
         plt.show()
@@ -1344,34 +1420,24 @@ class CombinedTransectCube:
             track_start=track_start,
             track_end=track_end,
             return_fig=True,
+            interactive=False,
         )
 
-        # Get the coordinate arrays (Xp, Yp) for reverse mapping
-        # We need to regenerate them with the same parameters
-        S = self.S
-        T = self.T
-        start_idx = track_start if track_start is not None else 0
-        end_idx = track_end if track_end is not None else T
-
-        # Get georeferenced coordinates
-        X_ecef = self.X_ecef[:, start_idx:end_idx]
-        Y_ecef = self.Y_ecef[:, start_idx:end_idx]
-        Z_ecef = self.Z_ecef[:, start_idx:end_idx]
-
-        if coordinate_system == "LATLON":
-            Xp, Yp = self._ecef_to_geodetic_arrays(X_ecef, Y_ecef, Z_ecef)
-        elif coordinate_system == "NED":
-            if origin is None and use_local_origin:
-                origin = self._compute_local_origin()
-            Xp, Yp, _ = self._ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, origin=origin)
-        else:  # ECEF
-            Xp = X_ecef
-            Yp = Y_ecef
-
-        # Store coordinate arrays in axis for click handler
-        ax._gref_Xp = Xp
-        ax._gref_Yp = Yp
-        ax._gref_start_idx = start_idx
+        # Extract coordinate arrays that plot_georef stored for us
+        if hasattr(ax, "_gref_coord_arrays"):
+            Xp, Yp, start_idx = ax._gref_coord_arrays
+            print(
+                f"✓ Coordinate arrays extracted: Xp shape={Xp.shape}, Yp shape={Yp.shape}"
+            )
+            print(f"✓ Track offset: start_idx={start_idx}")
+            print(
+                f"✓ Coordinate range: X=[{np.nanmin(Xp):.2f}, {np.nanmax(Xp):.2f}], Y=[{np.nanmin(Yp):.2f}, {np.nanmax(Yp):.2f}]"
+            )
+        else:
+            raise RuntimeError(
+                "plot_georef did not store coordinate arrays. "
+                "This may be due to an older version of the code."
+            )
 
         # State for click tracking
         click_state = {
@@ -1382,23 +1448,28 @@ class CombinedTransectCube:
         }
 
         def onclick(event):
+            print(
+                f"🖱️ Click detected: button={event.button}, inaxes={event.inaxes is not None}"
+            )
             if event.inaxes != ax:
+                print("   → Click outside axis, ignoring")
                 return
 
             # Get click coordinates
             x_click, y_click = event.xdata, event.ydata
+            print(f"   → Click coords: x={x_click:.2f}, y={y_click:.2f}")
 
             # Find nearest point in the georef grid
             distances = np.sqrt((Xp - x_click) ** 2 + (Yp - y_click) ** 2)
             min_idx = np.nanargmin(distances)
-            slit_idx, track_offset = np.unravel_index(min_idx, Xp.shape)
+            track_offset, slit_idx = np.unravel_index(min_idx, Xp.shape)
 
             # Convert to absolute track index
             track_idx = start_idx + track_offset
 
             # Get actual coordinates at this point
-            x_actual = Xp[slit_idx, track_offset]
-            y_actual = Yp[slit_idx, track_offset]
+            x_actual = Xp[track_offset, slit_idx]
+            y_actual = Yp[track_offset, slit_idx]
 
             # Add point
             click_state["points"].append((x_actual, y_actual, slit_idx, track_idx))
@@ -1464,9 +1535,14 @@ class CombinedTransectCube:
         # Print summary
         print("\n" + "=" * 60)
         print(f"Interactive line definition complete!")
-        print(f"Created {len(click_state['lines'])} lines:")
-        for i, line in enumerate(click_state["lines"], 1):
-            print(f"  Line {i}: {line}")
+        if len(click_state["lines"]) == 0:
+            print("⚠️  No lines were created!")
+            print("   To create lines, click 2 points on the plot (start → end)")
+            print("   You can create multiple lines before closing the window")
+        else:
+            print(f"Created {len(click_state['lines'])} lines:")
+            for i, line in enumerate(click_state["lines"], 1):
+                print(f"  Line {i}: {line}")
         print("=" * 60)
 
         return click_state["lines"]
@@ -2064,7 +2140,7 @@ class CombinedTransectCube:
                 f"✅ Illumination correction already applied with window={window_size}, strength={strength}"
             )
             print(f"   Loading from disk...")
-            return self.load_illumination_correction()
+            return self.load_illumination_correction(window_size, strength)
 
         # --- sizes ---
         T_total = 0
@@ -2148,6 +2224,135 @@ class CombinedTransectCube:
 
         return self.data_corrected
 
+    def apply_illumination_correction_v2(
+        self, window_size=1000, strength=1.0, force_recompute=False
+    ):
+        """
+        V2: Fixed version using pandas rolling median instead of scipy median_filter.
+
+        Per-slit illumination normalization with automatic persistence.
+
+        Parameters:
+        -----------
+        window_size : int or None
+            - None (or <=1 or >=T_total): global correction (single median per slit-band).
+            - int: rolling median across tracks of length window_size.
+        strength : float
+            Correction strength in [0,1]: 0=no change, 1=full correction.
+        force_recompute : bool
+            If True, recompute even if saved correction exists.
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+
+        print("🔄 Using V2 algorithm (pandas rolling median)")
+
+        # --- Check if already computed and saved ---
+        if not force_recompute and self.has_illumination_correction(
+            window_size, strength
+        ):
+            print(
+                f"✅ Illumination correction already applied with window={window_size}, strength={strength}"
+            )
+            print(f"   Loading from disk...")
+            return self.load_illumination_correction(window_size, strength)
+
+        # --- sizes ---
+        T_total = 0
+        S = B = None
+        for gf in self.geofiles:
+            with h5py.File(gf.path, "r") as f:
+                dset_name = gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
+                if dset_name not in f:
+                    dset_name = gf.DSET_RGB_MAIN
+                t, s, b = f[dset_name].shape
+                T_total += t
+                if S is None:
+                    S, B = s, b
+
+        # decide mode
+        use_global = (
+            (window_size is None) or (window_size <= 1) or (window_size >= T_total)
+        )
+        mode_txt = "global" if use_global else f"rolling (window={int(window_size)})"
+        print(f"🔄 Computing illumination correction: {mode_txt}, strength={strength}")
+
+        self.data_corrected = np.zeros((T_total, S, B), dtype=np.float32)
+
+        try:
+            from tqdm import tqdm
+
+            pbar = tqdm(total=S, desc="   Processing slits", unit="slit")
+            use_tqdm = True
+        except Exception:
+            use_tqdm = False
+            pbar = None
+
+        # --- process one slit at a time ---
+        for s in range(S):
+            slit_data_list = []
+            for gf in self.geofiles:
+                with h5py.File(gf.path, "r") as f:
+                    dset_name = (
+                        gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
+                    )
+                    if dset_name not in f:
+                        dset_name = gf.DSET_RGB_MAIN
+                    slit_slice = f[dset_name][:, s, :].astype(np.float32)  # (T_file, B)
+                    slit_data_list.append(slit_slice)
+            slit_data = np.concatenate(slit_data_list, axis=0)  # (T_total, B)
+            del slit_data_list
+
+            for b in range(B):
+                ts = slit_data[:, b]  # (T_total,)
+
+                if use_global:
+                    ref = np.nanmedian(ts)
+                    if not np.isfinite(ref) or ref == 0:
+                        ref = 1.0
+                    corrected = ts / ref
+                else:
+                    # V2: Use pandas rolling median for proper 1D processing
+                    ref_vec = (
+                        pd.Series(ts)
+                        .rolling(window=int(window_size), center=True, min_periods=1)
+                        .median()
+                        .values
+                    )
+                    ref_vec[ref_vec == 0] = 1.0
+                    ref_vec[~np.isfinite(ref_vec)] = 1.0
+                    corrected = ts / ref_vec
+
+                self.data_corrected[:, s, b] = (
+                    1 - strength
+                ) * ts + strength * corrected
+
+            del slit_data
+            if use_tqdm:
+                pbar.update(1)
+
+        if use_tqdm:
+            pbar.close()
+
+        print(f"✅ data_corrected ready ({mode_txt}) using V2 algorithm")
+
+        # --- Save to disk ---
+        print("💾 Saving illumination correction to HDF5 files...")
+        self.save_illumination_correction(window_size, strength)
+
+        return self.data_corrected
+
+    def _get_correction_dataset_name(self, window_size=1000, strength=1.0):
+        """
+        Generate dataset name for illumination correction with specific parameters.
+        Allows multiple cached versions with different parameters.
+        """
+        # Convert window_size to string (None -> 'global')
+        w_str = "global" if window_size is None else str(int(window_size))
+        s_str = f"{strength:.2f}".replace(".", "p")  # 1.0 -> "1p00"
+        return f"processed/radiance/dataCube_illum_corrected_w{w_str}_s{s_str}"
+
     def has_illumination_correction(self, window_size=1000, strength=1.0):
         """
         Check if illumination correction with these parameters has already been applied.
@@ -2155,15 +2360,17 @@ class CombinedTransectCube:
         """
         import h5py
 
+        dset_name = self._get_correction_dataset_name(window_size, strength)
+
         for gf in self.geofiles:
             try:
                 with h5py.File(gf.path, "r") as f:
                     # Check if corrected dataset exists
-                    if "processed/radiance/dataCube_illum_corrected" not in f:
+                    if dset_name not in f:
                         return False
 
-                    # Check metadata matches
-                    dset = f["processed/radiance/dataCube_illum_corrected"]
+                    # Verify metadata matches
+                    dset = f[dset_name]
                     if "window_size" not in dset.attrs or "strength" not in dset.attrs:
                         return False
 
@@ -2182,12 +2389,14 @@ class CombinedTransectCube:
 
         return True
 
-    def load_illumination_correction(self):
+    def load_illumination_correction(self, window_size=1000, strength=1.0):
         """
         Load previously saved illumination-corrected data from HDF5 files.
         Populates self.data_corrected.
         """
         import h5py
+
+        dset_name = self._get_correction_dataset_name(window_size, strength)
 
         # Calculate total size
         T_total = sum(gf.shape[0] for gf in self.geofiles)
@@ -2202,10 +2411,12 @@ class CombinedTransectCube:
         t_offset = 0
         for gf in self.geofiles:
             with h5py.File(gf.path, "r") as f:
-                if "processed/radiance/dataCube_illum_corrected" not in f:
-                    raise RuntimeError(f"{gf.name}: corrected data not found")
+                if dset_name not in f:
+                    raise RuntimeError(
+                        f"{gf.name}: corrected data not found at {dset_name}"
+                    )
 
-                dset = f["processed/radiance/dataCube_illum_corrected"]
+                dset = f[dset_name]
                 T_file = dset.shape[0]
                 self.data_corrected[t_offset : t_offset + T_file, :, :] = dset[()]
 
@@ -2223,49 +2434,196 @@ class CombinedTransectCube:
     def save_illumination_correction(self, window_size=1000, strength=1.0):
         """
         Save the illumination-corrected data to HDF5 files.
-        Splits self.data_corrected back into individual files and saves as
-        'processed/radiance/dataCube_illum_corrected' with metadata.
+        Splits self.data_corrected back into individual files and saves with
+        unique names based on parameters, allowing multiple cached versions.
         """
         import h5py
+        import time
 
         if self.data_corrected is None:
             raise RuntimeError(
                 "No corrected data to save. Run apply_illumination_correction first."
             )
 
+        dset_path = self._get_correction_dataset_name(window_size, strength)
+
         print(f"💾 Saving illumination correction to {len(self.geofiles)} files...")
+        print(f"   Dataset: {dset_path}")
 
         t_offset = 0
         for gf in self.geofiles:
             T_file = gf.shape[0]
             corrected_chunk = self.data_corrected[t_offset : t_offset + T_file, :, :]
 
-            with h5py.File(gf.path, "a") as f:  # 'a' = read/write, create if not exists
-                dset_path = "processed/radiance/dataCube_illum_corrected"
+            # Retry mechanism in case file is temporarily locked
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    with h5py.File(
+                        gf.path, "a"
+                    ) as f:  # 'a' = read/write, create if not exists
+                        # Remove old dataset if it exists (overwrite same parameters)
+                        if dset_path in f:
+                            del f[dset_path]
 
-                # Remove old dataset if it exists
-                if dset_path in f:
-                    del f[dset_path]
+                        # Create new dataset with compression
+                        dset = f.create_dataset(
+                            dset_path,
+                            data=corrected_chunk,
+                            compression="gzip",
+                            compression_opts=4,
+                            dtype=np.float32,
+                        )
 
-                # Create new dataset with compression
-                dset = f.create_dataset(
-                    dset_path,
-                    data=corrected_chunk,
-                    compression="gzip",
-                    compression_opts=4,
-                    dtype=np.float32,
-                )
+                        # Save metadata
+                        dset.attrs["window_size"] = (
+                            window_size if window_size is not None else -1
+                        )
+                        dset.attrs["strength"] = strength
+                        dset.attrs["description"] = (
+                            "Illumination-corrected radiance data"
+                        )
 
-                # Save metadata
-                dset.attrs["window_size"] = window_size
-                dset.attrs["strength"] = strength
-                dset.attrs["description"] = "Illumination-corrected radiance data"
+                        print(f"   ✓ {gf.name}: saved {corrected_chunk.shape}")
+                    break  # Success, exit retry loop
 
-                print(f"   ✓ {gf.name}: saved {corrected_chunk.shape}")
+                except BlockingIOError as e:
+                    if attempt < max_retries - 1:
+                        print(
+                            f"   ⚠️  File locked, retrying in 1 second... (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(1)
+                    else:
+                        print(
+                            f"   ❌ Failed to save to {gf.name} after {max_retries} attempts"
+                        )
+                        print(
+                            f"      Try closing any programs that might have the file open"
+                        )
+                        raise
 
             t_offset += T_file
 
         print(f"✅ Illumination correction saved to disk")
+
+    def list_saved_corrections(self):
+        """
+        Display all cached illumination correction versions across all files.
+        Shows parameters, dataset paths, and sizes for each cached version.
+        """
+        import h5py
+
+        print("\n📋 Cached illumination corrections:")
+        print("=" * 80)
+
+        corrections_found = False
+        for gf in self.geofiles:
+            file_corrections = []
+
+            with h5py.File(gf.path, "r") as f:
+                # Look for all datasets matching the pattern
+                if "processed/radiance" in f:
+                    for key in f["processed/radiance"].keys():
+                        if key.startswith("dataCube_illum_corrected_"):
+                            dset = f[f"processed/radiance/{key}"]
+
+                            # Extract metadata
+                            window = dset.attrs.get("window_size", "unknown")
+                            if window == -1:
+                                window = "global"
+                            strength = dset.attrs.get("strength", "unknown")
+
+                            # Get size info
+                            shape = dset.shape
+                            size_mb = dset.nbytes / (1024 * 1024)
+
+                            file_corrections.append(
+                                {
+                                    "dataset": key,
+                                    "window": window,
+                                    "strength": strength,
+                                    "shape": shape,
+                                    "size_mb": size_mb,
+                                }
+                            )
+
+            if file_corrections:
+                corrections_found = True
+                print(f"\n📁 File: {gf.name}")
+                for corr in file_corrections:
+                    print(
+                        f"   ✓ window={corr['window']}, strength={corr['strength']:.1f}"
+                    )
+                    print(f"     Dataset: {corr['dataset']}")
+                    print(
+                        f"     Shape: {corr['shape']}, Size: {corr['size_mb']:.1f} MB"
+                    )
+
+        if not corrections_found:
+            print("\n   No cached corrections found in any files.")
+
+        print("=" * 80)
+
+    def delete_correction(self, window_size=1000, strength=1.0, confirm=True):
+        """
+        Delete a specific cached illumination correction from all files.
+
+        Parameters:
+        -----------
+        window_size : int or None
+            The window size of the correction to delete. None for global correction.
+        strength : float
+            The strength parameter of the correction to delete.
+        confirm : bool, default=True
+            If True, asks for confirmation before deleting.
+
+        Returns:
+        --------
+        bool : True if deletion was successful, False if cancelled or not found.
+        """
+        import h5py
+
+        dset_path = self._get_correction_dataset_name(window_size, strength)
+
+        # Check if it exists in any files
+        found_in_files = []
+        for gf in self.geofiles:
+            with h5py.File(gf.path, "r") as f:
+                if dset_path in f:
+                    found_in_files.append(gf.name)
+
+        if not found_in_files:
+            print(
+                f"❌ No cached correction found with window={window_size}, strength={strength}"
+            )
+            return False
+
+        # Ask for confirmation if requested
+        if confirm:
+            print(
+                f"\n⚠️  About to delete correction from {len(found_in_files)} file(s):"
+            )
+            print(f"   Parameters: window={window_size}, strength={strength}")
+            print(f"   Dataset: {dset_path}")
+            for fname in found_in_files:
+                print(f"     - {fname}")
+
+            response = input("\n   Delete these? (yes/no): ").strip().lower()
+            if response not in ["yes", "y"]:
+                print("   Deletion cancelled.")
+                return False
+
+        # Delete from all files
+        print(f"\n🗑️  Deleting correction from {len(found_in_files)} file(s)...")
+        for gf in self.geofiles:
+            if gf.name in found_in_files:
+                with h5py.File(gf.path, "a") as f:
+                    if dset_path in f:
+                        del f[dset_path]
+                        print(f"   ✓ Deleted from {gf.name}")
+
+        print(f"✅ Correction deleted successfully")
+        return True
 
     def apply_illumination_correction_method2(self, window_size=1000):
         """
@@ -2532,8 +2890,14 @@ class CombinedTransectCube:
         roi_pixels=None,  # Single ROI (backward compatibility)
         roi_collection=None,  # NEW: Multiple ROIs with names
         roi_colors=["yellow", "cyan", "magenta", "orange", "lime", "red", "blue"],
+        roi_color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
         roi_marker_size=100,
+        roi_marker_shape="s",  # Marker shape: 's'=square, 'o'=circle, '^'=triangle, 'D'=diamond, etc.
+        roi_marker_edgewidth=2,  # Edge width for ROI markers (0 = no edge)
         roi_show_numbers=False,
+        roi_legend_loc="best",  # Legend location: 'best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center', 'outside', or None to hide
+        roi_legend_markersize=10,  # Size of color markers in legend (default=10)
+        roi_legend_marker_border=True,  # Whether to show black border on legend markers
         line_colors=["red", "blue", "orange", "magenta"],
         line_width=2,
         line_style="-",
@@ -2655,8 +3019,11 @@ class CombinedTransectCube:
                         roi_tracks = [track for slit, track in valid_rois]
                         roi_slits = [slit for slit, track in valid_rois]
 
-                        # Assign color
-                        color = roi_colors[roi_idx % len(roi_colors)]
+                        # Assign color: use color_map if provided, otherwise use default list
+                        if roi_color_map and roi_name in roi_color_map:
+                            color = roi_color_map[roi_name]
+                        else:
+                            color = roi_colors[roi_idx % len(roi_colors)]
 
                         # Plot ROI with unique color
                         plt.scatter(
@@ -2664,9 +3031,9 @@ class CombinedTransectCube:
                             roi_slits,
                             c=color,
                             s=roi_marker_size,
-                            marker="o",
-                            edgecolors="black",
-                            linewidths=2,
+                            marker=roi_marker_shape,
+                            edgecolors="black" if roi_marker_edgewidth > 0 else "none",
+                            linewidths=roi_marker_edgewidth,
                             alpha=0.8,
                             label=f"{roi_name} ({len(valid_rois)})",
                         )
@@ -2707,9 +3074,9 @@ class CombinedTransectCube:
                     roi_slits,
                     c=roi_colors[0],
                     s=roi_marker_size,
-                    marker="o",
-                    edgecolors="black",
-                    linewidths=2,
+                    marker=roi_marker_shape,
+                    edgecolors="black" if roi_marker_edgewidth > 0 else "none",
+                    linewidths=roi_marker_edgewidth,
                     alpha=0.8,
                     label=f"ROI Pixels ({len(valid_rois)})",
                 )
@@ -2734,8 +3101,26 @@ class CombinedTransectCube:
             or roi_collection is not None
             or (roi_pixels is not None and len(roi_pixels) > 0)
         )
-        if has_overlays:
-            plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        if has_overlays and roi_legend_loc is not None:
+            if roi_legend_loc == "outside":
+                # Place legend outside the plot area on the right
+                legend = plt.legend(
+                    bbox_to_anchor=(1.05, 1),
+                    loc="upper left",
+                    markerscale=roi_legend_markersize / 6,
+                )
+            else:
+                legend = plt.legend(
+                    loc=roi_legend_loc,
+                    markerscale=roi_legend_markersize / 6,
+                )
+
+            # Configure legend marker borders
+            if not roi_legend_marker_border and legend:
+                for handle in legend.legend_handles:
+                    if hasattr(handle, "set_edgecolor"):
+                        handle.set_edgecolor("none")
+                        handle.set_linewidth(0)
 
         plt.tight_layout()
         plt.show()
@@ -2744,12 +3129,14 @@ class CombinedTransectCube:
         self,
         perimeter_line,
         wavelength=None,
+        wavelength_range=None,  # NEW: Wavelength range for averaging ('red', 'green', 'blue', 'all', or tuple)
         use_average=False,
         use_corrected=False,
         figsize=(12, 6),
         line_colors=["red", "blue", "purple", "magenta", "pink"],
         line_width=2,
         moving_average_window=1,
+        moving_average_percent=None,  # NEW: Auto-calculate window as % of line length (overrides moving_average_window)
         show_markers=True,
         marker_size=4,
         line_labels=None,
@@ -2759,7 +3146,16 @@ class CombinedTransectCube:
         """
         Plot intensity profiles with optional intensity normalization for better comparison.
 
-        NEW NORMALIZATION OPTIONS:
+        WAVELENGTH OPTIONS:
+        - wavelength=654.2: Single wavelength (creates 1 plot)
+        - use_average=True: Average across wavelengths
+          - wavelength_range='red': Average red bands (640-680nm)
+          - wavelength_range='green': Average green bands (520-580nm)
+          - wavelength_range='blue': Average blue bands (420-480nm)
+          - wavelength_range='all' or None: Average all bands
+          - wavelength_range=(500, 600): Custom range in nm
+
+        NORMALIZATION OPTIONS:
         - normalize_intensities=True: Enable intensity normalization
         - normalization_method='minmax': Scale to [0,1] range
         - normalization_method='zscore': Z-score normalization (mean=0, std=1)
@@ -2786,6 +3182,15 @@ class CombinedTransectCube:
 
         max_length = max(line_lengths)
 
+        # Auto-calculate moving average window from percentage
+        if moving_average_percent is not None:
+            moving_average_window = max(
+                1, int(max_length * moving_average_percent / 100)
+            )
+            print(
+                f"📊 Auto-calculated moving average window: {moving_average_window} samples ({moving_average_percent}% of {max_length} samples)"
+            )
+
         # Get data and wavelength setup
         cube_data = (
             self.data_corrected
@@ -2794,21 +3199,49 @@ class CombinedTransectCube:
         )
         n_tracks, n_slits, n_wavelengths = cube_data.shape
 
-        # Wavelength selection
+        # Determine which wavelength bands to use
         if use_average:
-            mean_wl = self.wavelengths.mean()
-            wl_idx = np.argmin(np.abs(self.wavelengths - mean_wl))
+            # Define wavelength ranges for averaging
+            if wavelength_range is None or wavelength_range == "all":
+                wl_mask = np.ones(len(self.wavelengths), dtype=bool)
+                range_label = "all wavelengths"
+            elif wavelength_range == "red":
+                wl_mask = (self.wavelengths >= 640) & (self.wavelengths <= 680)
+                range_label = "red (640-680nm)"
+            elif wavelength_range == "green":
+                wl_mask = (self.wavelengths >= 520) & (self.wavelengths <= 580)
+                range_label = "green (520-580nm)"
+            elif wavelength_range == "blue":
+                wl_mask = (self.wavelengths >= 420) & (self.wavelengths <= 480)
+                range_label = "blue (420-480nm)"
+            elif (
+                isinstance(wavelength_range, (tuple, list))
+                and len(wavelength_range) == 2
+            ):
+                wl_min, wl_max = wavelength_range
+                wl_mask = (self.wavelengths >= wl_min) & (self.wavelengths <= wl_max)
+                range_label = f"{wl_min}-{wl_max}nm"
+            else:
+                raise ValueError(f"Invalid wavelength_range: {wavelength_range}")
+
+            if not np.any(wl_mask):
+                raise ValueError(f"No wavelengths found in range: {wavelength_range}")
+
             method = "average"
-            base_ylabel = "Average Intensity"
+            base_ylabel = f"Average Intensity ({range_label})"
+            wl_indices = np.where(wl_mask)[0]
+
         elif wavelength is not None:
             wl_idx = np.argmin(np.abs(self.wavelengths - wavelength))
             method = "specific"
             base_ylabel = f"Intensity at {self.wavelengths[wl_idx]:.1f} nm"
+            wl_indices = [wl_idx]
         else:
             median_wl = np.median(self.wavelengths)
             wl_idx = np.argmin(np.abs(self.wavelengths - median_wl))
             method = "median"
             base_ylabel = f"Intensity at {self.wavelengths[wl_idx]:.1f} nm"
+            wl_indices = [wl_idx]
 
         # NEW: Adjust ylabel based on normalization
         if normalize_intensities:
@@ -2823,7 +3256,12 @@ class CombinedTransectCube:
         else:
             ylabel = base_ylabel
 
-        actual_wl = self.wavelengths[wl_idx]
+        # Get wavelength info for display
+        if method == "average":
+            actual_wl_info = range_label
+        else:
+            actual_wl = self.wavelengths[wl_indices[0]]
+            actual_wl_info = f"{actual_wl:.1f} nm"
 
         plt.figure(figsize=figsize)
         all_results = []
@@ -2850,7 +3288,12 @@ class CombinedTransectCube:
             intensities = []
             for track_idx, slit_idx in zip(track_indices, slit_indices):
                 if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
-                    intensity = cube_data[track_idx, slit_idx, wl_idx]
+                    if len(wl_indices) == 1:
+                        # Single wavelength
+                        intensity = cube_data[track_idx, slit_idx, wl_indices[0]]
+                    else:
+                        # Average across multiple wavelengths
+                        intensity = np.mean(cube_data[track_idx, slit_idx, wl_indices])
                     intensities.append(intensity)
 
             intensities = np.array(intensities)
@@ -2892,9 +3335,7 @@ class CombinedTransectCube:
 
                 half_window = moving_average_window // 2
                 plot_intensities = smoothed
-                plot_sample_indices = sample_indices[
-                    half_window : half_window + len(smoothed)
-                ]
+                plot_sample_indices = np.arange(len(smoothed))
                 has_std = True
             else:
                 plot_intensities = intensities
@@ -2979,7 +3420,7 @@ class CombinedTransectCube:
         norm_info = (
             f" ({normalization_method} normalized)" if normalize_intensities else ""
         )
-        stats_text = f"Wavelength: {actual_wl:.1f} nm{norm_info} | Sample points: {max_length} | Lines: {len(lines_to_plot)}"
+        stats_text = f"Wavelength: {actual_wl_info}{norm_info} | Sample points: {max_length} | Lines: {len(lines_to_plot)}"
         plt.figtext(0.02, 0.01, stats_text, fontsize=9, ha="left")
 
         plt.subplots_adjust(bottom=0.15)
@@ -2987,7 +3428,7 @@ class CombinedTransectCube:
         plt.show()
 
         return {
-            "wavelength": actual_wl,
+            "wavelength": actual_wl_info,
             "wavelength_method": method,
             "smoothing_window": moving_average_window,
             "number_of_lines": len(lines_to_plot),
@@ -2998,6 +3439,234 @@ class CombinedTransectCube:
             ),
             "lines": all_results,
         }
+
+    def plot_wavelength_comparison(
+        self,
+        line,
+        wavelength_ranges=None,
+        use_corrected=False,
+        figsize=(12, 8),
+        moving_average_window=1,
+        moving_average_percent=None,  # NEW: Auto-calculate window as % of line length
+        show_markers=False,
+        marker_size=4,
+        normalize_intensities=False,
+        normalization_method="minmax",
+    ):
+        """
+        Compare different wavelength ranges for a single line.
+
+        Parameters:
+        -----------
+        line : tuple
+            Single line definition: ((slit1, track1), (slit2, track2))
+        wavelength_ranges : list, optional
+            List of wavelength ranges to compare. Default: ['red', 'green', 'blue', 'all']
+            Can use: 'red', 'green', 'blue', 'all', or tuples like (500, 600)
+
+        Example:
+        --------
+        cube.plot_wavelength_comparison(
+            line=lines[0],  # First line
+            wavelength_ranges=['red', 'green', 'blue', 'all'],
+            moving_average_window=50,
+            use_corrected=True
+        )
+        """
+
+        if wavelength_ranges is None:
+            wavelength_ranges = ["red", "green", "blue", "all"]
+
+        # Validate line format
+        if not (isinstance(line, (list, tuple)) and len(line) == 2):
+            raise ValueError("Line must be [(slit1,track1), (slit2,track2)]")
+
+        (slit1, track1), (slit2, track2) = line
+
+        # Get data
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Validate coordinates
+        if not (0 <= slit1 < n_slits and 0 <= slit2 < n_slits):
+            raise ValueError(f"Slit indices out of range [0, {n_slits-1}]")
+        if not (0 <= track1 < n_tracks and 0 <= track2 < n_tracks):
+            raise ValueError(f"Track indices out of range [0, {n_tracks-1}]")
+
+        # Calculate sampling length
+        length = max(abs(track2 - track1), abs(slit2 - slit1)) + 1
+
+        # Auto-calculate moving average window from percentage
+        if moving_average_percent is not None:
+            moving_average_window = max(1, int(length * moving_average_percent / 100))
+            print(
+                f"📊 Auto-calculated moving average window: {moving_average_window} samples ({moving_average_percent}% of {length} samples)"
+            )
+
+        # Generate sampling points
+        track_indices = np.linspace(track1, track2, length, dtype=int)
+        slit_indices = np.linspace(slit1, slit2, length, dtype=int)
+
+        plt.figure(figsize=figsize)
+
+        # Color scheme for different ranges
+        range_colors = {
+            "red": "#e74c3c",
+            "green": "#27ae60",
+            "blue": "#3498db",
+            "all": "#95a5a6",
+        }
+
+        for wl_range in wavelength_ranges:
+            # Define wavelength mask
+            if wl_range == "all":
+                wl_mask = np.ones(len(self.wavelengths), dtype=bool)
+                range_label = "All wavelengths"
+            elif wl_range == "red":
+                wl_mask = (self.wavelengths >= 640) & (self.wavelengths <= 680)
+                range_label = "Red (640-680nm)"
+            elif wl_range == "green":
+                wl_mask = (self.wavelengths >= 520) & (self.wavelengths <= 580)
+                range_label = "Green (520-580nm)"
+            elif wl_range == "blue":
+                wl_mask = (self.wavelengths >= 420) & (self.wavelengths <= 480)
+                range_label = "Blue (420-480nm)"
+            elif isinstance(wl_range, (tuple, list)) and len(wl_range) == 2:
+                wl_min, wl_max = wl_range
+                wl_mask = (self.wavelengths >= wl_min) & (self.wavelengths <= wl_max)
+                range_label = f"{wl_min}-{wl_max}nm"
+            else:
+                raise ValueError(f"Invalid wavelength_range: {wl_range}")
+
+            if not np.any(wl_mask):
+                print(f"⚠️ Warning: No wavelengths found in range: {wl_range}")
+                continue
+
+            wl_indices = np.where(wl_mask)[0]
+
+            # Extract intensities
+            intensities = []
+            for track_idx, slit_idx in zip(track_indices, slit_indices):
+                if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
+                    # Average across wavelength range
+                    intensity = np.mean(cube_data[track_idx, slit_idx, wl_indices])
+                    intensities.append(intensity)
+
+            intensities = np.array(intensities)
+
+            # Apply normalization
+            if normalize_intensities and len(intensities) > 0:
+                if normalization_method == "minmax":
+                    if intensities.max() != intensities.min():
+                        intensities = (intensities - intensities.min()) / (
+                            intensities.max() - intensities.min()
+                        )
+                elif normalization_method == "zscore":
+                    if intensities.std() != 0:
+                        intensities = (
+                            intensities - intensities.mean()
+                        ) / intensities.std()
+                elif normalization_method == "mean":
+                    if intensities.mean() != 0:
+                        intensities = intensities / intensities.mean()
+
+            sample_indices = np.arange(len(intensities))
+
+            # Apply smoothing
+            if moving_average_window > 1:
+                if moving_average_window > len(intensities):
+                    moving_average_window = len(intensities)
+
+                window = np.ones(moving_average_window) / moving_average_window
+                smoothed = np.convolve(intensities, window, mode="valid")
+
+                std_devs = []
+                for i in range(len(smoothed)):
+                    window_data = intensities[i : i + moving_average_window]
+                    std_devs.append(np.std(window_data))
+                std_devs = np.array(std_devs)
+
+                half_window = moving_average_window // 2
+                plot_intensities = smoothed
+                plot_sample_indices = np.arange(len(smoothed))
+                has_std = True
+            else:
+                plot_intensities = intensities
+                plot_sample_indices = sample_indices
+                std_devs = None
+                has_std = False
+
+            # Get color
+            color = range_colors.get(wl_range, "#34495e")
+            if isinstance(wl_range, (tuple, list)):
+                color = "#9b59b6"  # Purple for custom ranges
+
+            # Plot
+            marker_style = "o" if show_markers else None
+            marker_size_actual = marker_size if show_markers else 0
+
+            plt.plot(
+                plot_sample_indices,
+                plot_intensities,
+                color=color,
+                linewidth=2.5,
+                marker=marker_style,
+                markersize=marker_size_actual,
+                label=range_label,
+                alpha=0.8,
+            )
+
+            # Add std dev bands
+            if has_std:
+                plt.fill_between(
+                    plot_sample_indices,
+                    plot_intensities - std_devs,
+                    plot_intensities + std_devs,
+                    color=color,
+                    alpha=0.15,
+                )
+
+        # Formatting
+        plt.xlabel("Sample Index", fontsize=12)
+
+        if normalize_intensities:
+            if normalization_method == "minmax":
+                ylabel = "Normalized Intensity [0-1]"
+            elif normalization_method == "zscore":
+                ylabel = "Z-Score Intensity"
+            elif normalization_method == "mean":
+                ylabel = "Relative Intensity"
+            else:
+                ylabel = "Normalized Intensity"
+        else:
+            ylabel = "Average Intensity"
+
+        plt.ylabel(ylabel, fontsize=12)
+
+        title = f"Wavelength Range Comparison"
+        if normalize_intensities:
+            title += f" ({normalization_method.upper()} normalized)"
+        if moving_average_window > 1:
+            title += f"\nSmoothed with {moving_average_window}-point moving average"
+
+        plt.title(title, fontsize=14, fontweight="bold")
+        plt.grid(True, alpha=0.3)
+        plt.legend(fontsize=10, loc="best")
+
+        # Stats
+        stats_text = (
+            f"Line: ({slit1},{track1}) → ({slit2},{track2}) | Sample points: {length}"
+        )
+        if normalize_intensities:
+            stats_text += f" | {normalization_method} normalized"
+        plt.figtext(0.02, 0.01, stats_text, fontsize=9, ha="left")
+
+        plt.tight_layout()
+        plt.show()
 
     def list_rois(self):
         """Display all saved ROIs"""
@@ -3033,10 +3702,15 @@ class CombinedTransectCube:
         if filename is None:
             filename = f"roi_collection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
+        # Convert sets to lists for JSON serialization
+        roi_collection_serializable = {
+            roi_name: list(pixels) for roi_name, pixels in self.roi_collection.items()
+        }
+
         export_data = {
             "transect_name": self.name,
             "export_date": datetime.now().isoformat(),
-            "roi_collection": self.roi_collection,
+            "roi_collection": roi_collection_serializable,
         }
 
         with open(filename, "w") as f:
@@ -3054,12 +3728,91 @@ class CombinedTransectCube:
                 self.roi_collection = {}
 
             imported_rois = data["roi_collection"]
-            self.roi_collection.update(imported_rois)
+
+            # Convert lists to tuples (JSON stores lists, we need tuples for sets)
+            for roi_name, pixels in imported_rois.items():
+                self.roi_collection[roi_name] = set(
+                    tuple(pixel) if isinstance(pixel, list) else pixel
+                    for pixel in pixels
+                )
 
             print(f"📂 Imported {len(imported_rois)} ROIs from {filename}")
 
         except Exception as e:
             print(f"❌ Import failed: {e}")
+
+    def combine_rois(self, roi_names_to_combine, new_roi_name):
+        """
+        Combine multiple ROIs into a single ROI with a new name.
+
+        Parameters:
+        -----------
+        roi_names_to_combine : list of str
+            List of ROI names to combine
+        new_roi_name : str
+            Name for the combined ROI
+
+        Returns:
+        --------
+        int : Number of pixels in the combined ROI
+
+        Example:
+        --------
+        cube.combine_rois(roi_names_to_combine=["sed1", "sed2", "sed3"], new_roi_name="all_sediment")
+        """
+        combined_pixels = set()
+
+        for roi_name in roi_names_to_combine:
+            if roi_name in self.roi_collection:
+                roi_pixels = self.roi_collection[roi_name]
+                combined_pixels.update(roi_pixels)
+                print(f"  Added {len(roi_pixels)} pixels from '{roi_name}'")
+            else:
+                print(f"  Warning: ROI '{roi_name}' not found, skipping")
+
+        if combined_pixels:
+            self.roi_collection[new_roi_name] = combined_pixels
+            print(f"✅ Created ROI '{new_roi_name}' with {len(combined_pixels)} pixels")
+            return len(combined_pixels)
+        else:
+            print(f"❌ No pixels found, ROI '{new_roi_name}' not created")
+            return 0
+
+    def rename_roi(self, old_roi_name, new_roi_name):
+        """
+        Rename an existing ROI.
+
+        Parameters:
+        -----------
+        old_roi_name : str
+            Current name of the ROI
+        new_roi_name : str
+            New name for the ROI
+
+        Returns:
+        --------
+        bool : True if successful, False otherwise
+
+        Example:
+        --------
+        cube.rename_roi(old_roi_name="sed1", new_roi_name="sediment_1")
+        """
+        if old_roi_name not in self.roi_collection:
+            print(f"❌ ROI '{old_roi_name}' not found")
+            return False
+
+        if new_roi_name in self.roi_collection:
+            print(f"❌ ROI '{new_roi_name}' already exists")
+            return False
+
+        # Copy pixels to new name and delete old name
+        self.roi_collection[new_roi_name] = self.roi_collection[old_roi_name]
+        del self.roi_collection[old_roi_name]
+
+        print(
+            f"✅ Renamed ROI '{old_roi_name}' → '{new_roi_name}' ({len(self.roi_collection[new_roi_name])} pixels)"
+        )
+        return True
 
     def plot_interactive_rgb(
         self,
@@ -3072,6 +3825,7 @@ class CombinedTransectCube:
         roi_name=None,
         load_existing=True,
         highlight_color=[1, 0, 0, 0.8],  # Bright red with transparency
+        marker_size=3,  # Size of marker in pixels (e.g., 3 = 3x3 square)
     ):
         """
         Interactive RGB with pixel highlighting and right-click deletion.
@@ -3093,7 +3847,11 @@ class CombinedTransectCube:
 
         # Load existing or start fresh
         if load_existing and roi_name in self.roi_collection:
-            current_roi = set(self.roi_collection[roi_name])
+            # Convert lists to tuples for hashable set items
+            roi_data = self.roi_collection[roi_name]
+            current_roi = set(
+                tuple(pixel) if isinstance(pixel, list) else pixel for pixel in roi_data
+            )
             print(f"📂 Loaded '{roi_name}' with {len(current_roi)} pixels")
         else:
             current_roi = set()
@@ -3142,9 +3900,15 @@ class CombinedTransectCube:
             """Refresh pixel highlights"""
             highlight_overlay[:, :, :] = 0
 
+            half_size = marker_size // 2
             for slit_idx, track_idx in current_roi:
-                if 0 <= slit_idx < n_slits and 0 <= track_idx < n_tracks:
-                    highlight_overlay[slit_idx, track_idx, :] = highlight_color
+                # Draw a marker_size x marker_size square centered on the pixel
+                for dy in range(-half_size, half_size + 1):
+                    for dx in range(-half_size, half_size + 1):
+                        y = slit_idx + dy
+                        x = track_idx + dx
+                        if 0 <= y < n_slits and 0 <= x < n_tracks:
+                            highlight_overlay[y, x, :] = highlight_color
 
             overlay_im.set_array(highlight_overlay)
             ax.set_title(f"{roi_name}: {len(current_roi)} pixels selected")
@@ -3259,6 +4023,7 @@ class CombinedTransectCube:
             "#00FF00",
             "#B8860B",
         ],
+        color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
         use_inline_labels=True,
         normalize=False,
         show_std=True,  # NEW: Control standard deviation bands
@@ -3327,8 +4092,14 @@ class CombinedTransectCube:
                 return spectrum
             if window_size > len(spectrum):
                 window_size = len(spectrum)
-            window = np.ones(window_size) / window_size
-            return np.convolve(spectrum, window, mode="valid")
+            # Use pandas rolling for proper alignment - same as illumination correction V2
+            import pandas as pd
+
+            series = pd.Series(spectrum)
+            smoothed = series.rolling(
+                window=window_size, center=True, min_periods=1
+            ).mean()
+            return smoothed.values
 
         # Normalization function (only applies if normalize=True)
         def normalize_spectrum(spectrum):
@@ -3350,7 +4121,9 @@ class CombinedTransectCube:
                 valid_spectra = []
 
                 for slit_idx, track_idx in roi_pixels_list:
-                    rel_track = track_idx - self.track_offset
+                    # Use track_offset if available, otherwise assume 0 for combined cubes
+                    track_offset = getattr(self, "track_offset", 0)
+                    rel_track = track_idx - track_offset
                     if 0 <= rel_track < cube.shape[0] and 0 <= slit_idx < cube.shape[1]:
                         spectrum = cube[rel_track, slit_idx, :][wl_mask]
                         valid_spectra.append(spectrum)
@@ -3368,10 +4141,8 @@ class CombinedTransectCube:
                         smoothed_std = smooth_spectrum(
                             std_spectrum, wavelength_smoothing
                         )
-                        half_window = wavelength_smoothing // 2
-                        plot_wavelengths = wavelengths[
-                            half_window : half_window + len(smoothed_avg)
-                        ]
+                        # pandas rolling with center=True keeps the same length, no trimming needed
+                        plot_wavelengths = wavelengths
                         plot_avg = smoothed_avg
                         plot_std = smoothed_std
                     else:
@@ -3384,7 +4155,11 @@ class CombinedTransectCube:
                     if show_std:  # Only normalize std if we're going to show it
                         plot_std = normalize_spectrum(plot_std)
 
-                    color = colors[i % len(colors)]
+                    # Assign color: use color_map if provided, otherwise use default list
+                    if color_map and roi_name_key in color_map:
+                        color = color_map[roi_name_key]
+                    else:
+                        color = colors[i % len(colors)]
 
                     # Always plot the main line
                     plt.plot(plot_wavelengths, plot_avg, color=color, linewidth=2)
@@ -3429,15 +4204,14 @@ class CombinedTransectCube:
 
         else:
             # Single pixel mode
-            rel_track = track_index - self.track_offset
+            track_offset = getattr(self, "track_offset", 0)
+            rel_track = track_index - track_offset
             spectrum = cube[rel_track, slit_index, :][wl_mask]
 
             if wavelength_smoothing > 1:
                 smoothed_spectrum = smooth_spectrum(spectrum, wavelength_smoothing)
-                half_window = wavelength_smoothing // 2
-                plot_wavelengths = wavelengths[
-                    half_window : half_window + len(smoothed_spectrum)
-                ]
+                # pandas rolling with center=True keeps the same length, no trimming needed
+                plot_wavelengths = wavelengths
                 plot_spectrum = smoothed_spectrum
             else:
                 plot_wavelengths = wavelengths
