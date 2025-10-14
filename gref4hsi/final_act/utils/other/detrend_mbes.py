@@ -60,6 +60,258 @@ from pyproj import Transformer
 __all__ = ["MBESDetrender", "ScoreWeights", "RunResult", "AutoTuneMBES"]
 
 
+# --------------------------- UHI footprint helpers ---------------------------
+
+
+def pcolormesh_pad(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Pad coordinate arrays for pcolormesh corner coordinates.
+
+    Parameters
+    ----------
+    X, Y : np.ndarray
+        2D coordinate arrays at cell centers (shape: T×S).
+
+    Returns
+    -------
+    Xc, Yc : np.ndarray
+        2D coordinate arrays at cell corners (shape: (T+1)×(S+1)).
+    """
+    Xc = np.pad(X, ((0, 1), (0, 1)), mode="edge")
+    Yc = np.pad(Y, ((0, 1), (0, 1)), mode="edge")
+    return Xc, Yc
+
+
+def _boundary_segments_from_mask(
+    mask: np.ndarray, Xc: np.ndarray, Yc: np.ndarray
+) -> Tuple[np.ndarray, List[Tuple[Tuple[int, int], Tuple[int, int]]]]:
+    """Build boundary segments EXACTLY along cell edges from a boolean mask.
+
+    This function extracts all edges where the mask transitions from True to
+    False (or vice versa), as well as all outer edges where the mask is True.
+    The result is a set of line segments that precisely trace the boundary of
+    the True region in the mask.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Boolean 2D array (shape: T×S) indicating valid pixels.
+    Xc, Yc : np.ndarray
+        2D coordinate arrays at cell corners (shape: (T+1)×(S+1)).
+
+    Returns
+    -------
+    segs_xy : np.ndarray
+        Array of shape (N, 2, 2) containing [[x0,y0],[x1,y1]] for each segment.
+    segs_idx : list
+        List of ((i0,j0),(i1,j1)) corner-index pairs for loop tracing.
+    """
+    T, S = mask.shape
+    segs_xy = []
+    segs_idx = []
+
+    # Vertical internal edges (between columns)
+    vdiff = mask[:, 1:] != mask[:, :-1]  # shape (T, S-1)
+    iv, jv = np.nonzero(vdiff)
+    jline = jv + 1
+    for i, j in zip(iv, jline):
+        a = (i, j)
+        b = (i + 1, j)
+        segs_idx.append((a, b))
+        segs_xy.append([[Xc[a], Yc[a]], [Xc[b], Yc[b]]])
+
+    # Left outer edge (j=0)
+    i_left = np.nonzero(mask[:, 0])[0]
+    for i in i_left:
+        a = (i, 0)
+        b = (i + 1, 0)
+        segs_idx.append((a, b))
+        segs_xy.append([[Xc[a], Yc[a]], [Xc[b], Yc[b]]])
+
+    # Right outer edge (j=S)
+    i_right = np.nonzero(mask[:, -1])[0]
+    for i in i_right:
+        a = (i, S)
+        b = (i + 1, S)
+        segs_idx.append((a, b))
+        segs_xy.append([[Xc[a], Yc[a]], [Xc[b], Yc[b]]])
+
+    # Horizontal internal edges (between rows)
+    hdiff = mask[1:, :] != mask[:-1, :]  # shape (T-1, S)
+    ih, jh = np.nonzero(hdiff)
+    iline = ih + 1
+    for i, j in zip(iline, jh):
+        a = (i, j)
+        b = (i, j + 1)
+        segs_idx.append((a, b))
+        segs_xy.append([[Xc[a], Yc[a]], [Xc[b], Yc[b]]])
+
+    # Top outer edge (i=0)
+    j_top = np.nonzero(mask[0, :])[0]
+    for j in j_top:
+        a = (0, j)
+        b = (0, j + 1)
+        segs_idx.append((a, b))
+        segs_xy.append([[Xc[a], Yc[a]], [Xc[b], Yc[b]]])
+
+    # Bottom outer edge (i=T)
+    j_bot = np.nonzero(mask[-1, :])[0]
+    for j in j_bot:
+        a = (T, j)
+        b = (T, j + 1)
+        segs_idx.append((a, b))
+        segs_xy.append([[Xc[a], Yc[a]], [Xc[b], Yc[b]]])
+
+    return np.asarray(segs_xy, dtype=float), segs_idx
+
+
+def _trace_loops_from_segments(
+    segs_idx: List[Tuple[Tuple[int, int], Tuple[int, int]]],
+) -> List[List[Tuple[int, int]]]:
+    """Convert corner-index segments into closed loops of corner indices.
+
+    This function builds an adjacency graph from the segments and traces closed
+    loops by following edges. It assumes the boundary graph is composed of
+    closed rings (typical for a mask boundary).
+
+    Parameters
+    ----------
+    segs_idx : list
+        List of ((i0,j0),(i1,j1)) corner-index pairs.
+
+    Returns
+    -------
+    loops : list
+        List of loops, where each loop is a list of (i,j) corner indices.
+    """
+    # Build adjacency (undirected)
+    adj: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    for a, b in segs_idx:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    # Visit edges
+    unvisited = set(frozenset((a, b)) for a, b in segs_idx)
+    loops: List[List[Tuple[int, int]]] = []
+
+    while unvisited:
+        # Start from any remaining edge
+        e = unvisited.pop()
+        a, b = tuple(e)
+        # Build a loop starting with (a->b)
+        loop = [a, b]
+        prev, cur = a, b
+
+        while True:
+            nbrs = adj[cur]
+            # Choose next neighbor that is not the previous vertex
+            nxt_candidates = [n for n in nbrs if n != prev]
+            if not nxt_candidates:
+                break  # open edge (shouldn't happen)
+            nxt = nxt_candidates[0]
+            # mark edge cur<->nxt visited
+            edge = frozenset((cur, nxt))
+            if edge in unvisited:
+                unvisited.remove(edge)
+            loop.append(nxt)
+            prev, cur = cur, nxt
+            if nxt == loop[0]:
+                break  # closed
+
+        loops.append(loop)
+
+        # Remove any already-visited edges incident to this loop
+        i = 0
+        while i < len(loop) - 1:
+            edge = frozenset((loop[i], loop[i + 1]))
+            unvisited.discard(edge)
+            i += 1
+
+    return loops
+
+
+def _compound_path_from_loops(
+    loops: List[List[Tuple[int, int]]], Xc: np.ndarray, Yc: np.ndarray
+) -> MplPath:
+    """Create a matplotlib Compound Path from corner-index loops.
+
+    Parameters
+    ----------
+    loops : list
+        List of loops, where each loop is a list of (i,j) corner indices.
+    Xc, Yc : np.ndarray
+        2D coordinate arrays at cell corners.
+
+    Returns
+    -------
+    path : matplotlib.path.Path
+        Compound path ready for plotting.
+    """
+    paths = []
+    for ring in loops:
+        xs = [Xc[idx] for idx in ring]
+        ys = [Yc[idx] for idx in ring]
+        # Ensure closed
+        if xs[0] != xs[-1] or ys[0] != ys[-1]:
+            xs.append(xs[0])
+            ys.append(ys[0])
+        verts = np.column_stack([xs, ys])
+        codes = np.full(len(verts), MplPath.LINETO, dtype=MplPath.code_type)
+        codes[0] = MplPath.MOVETO
+        codes[-1] = MplPath.CLOSEPOLY
+        paths.append(MplPath(verts, codes))
+    if len(paths) == 1:
+        return paths[0]
+    return MplPath.make_compound_path(*paths)
+
+
+def _robust_z(a: np.ndarray) -> np.ndarray:
+    """Compute robust z-scores using median and MAD.
+
+    Parameters
+    ----------
+    a : np.ndarray
+        Input array.
+
+    Returns
+    -------
+    z : np.ndarray
+        Robust z-scores: (a - median) / MAD, where MAD is scaled to match
+        standard deviation (MAD * 1.4826). Returns NaN for all-NaN input.
+    """
+    finite = np.isfinite(a)
+    if not np.any(finite):
+        return np.full_like(a, np.nan, dtype=float)
+    m = np.nanmedian(a)
+    mad = median_abs_deviation(a[finite], scale="normal")
+    if not np.isfinite(mad) or mad == 0:
+        mad = 1.0
+    return (a - m) / mad
+
+
+def _minmax_normalize(a: np.ndarray) -> np.ndarray:
+    """Normalize array to [0, 1] range using min-max normalization.
+
+    Parameters
+    ----------
+    a : np.ndarray
+        Input array.
+
+    Returns
+    -------
+    normalized : np.ndarray
+        Normalized array with values in [0, 1] range. Returns NaN for all-NaN input.
+    """
+    finite = np.isfinite(a)
+    if not np.any(finite):
+        return np.full_like(a, np.nan, dtype=float)
+    vmin = np.nanmin(a)
+    vmax = np.nanmax(a)
+    if vmax == vmin:
+        # All values are the same, return 0.5 (middle of range)
+        return np.full_like(a, 0.5, dtype=float)
+    return (a - vmin) / (vmax - vmin)
+
+
 # --------------------------- plotting helpers --------------------------------
 
 
@@ -250,6 +502,10 @@ class MBESDetrender:
     max_row_iters: int = 3
     clip_sigma: float = 6.0
     central_frac: float = 0.8
+    # UHI footprint overlay parameters
+    uhi_transect_folder: Optional[str] = None
+    uhi_files: Optional[List[str]] = None
+    uhi_track_range: Optional[Tuple[int, int]] = None
     # internal fields
     data: Optional[np.ndarray] = None
     valid_mask: Optional[np.ndarray] = None
@@ -271,6 +527,21 @@ class MBESDetrender:
     residuals: Optional[np.ndarray] = None
     _transformer_utm_to_geo: Optional[Transformer] = None
     _ned_origin_utm: Optional[Tuple[float, float]] = None
+    uhi_footprint: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = (
+        None  # (E, N, valid_mask)
+    )
+    uhi_footprint_adjusted: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = (
+        None  # Adjusted footprint: (E_adj, N_adj, valid_mask)
+    )
+    # UHI data cache - loaded once, reused by all methods
+    _uhi_transect_cache: Optional[object] = None  # Cache the transect object
+    _uhi_cube_cache: Optional[object] = None
+    _uhi_cube_cache_key: Optional[Tuple] = None  # Track which files are cached
+    _uhi_data_corrected_cache: Optional[np.ndarray] = None
+    _uhi_mean_cache: Optional[np.ndarray] = None
+    _uhi_rgb_cache: Optional[np.ndarray] = None
+    _uhi_resampled_cache: Optional[np.ndarray] = None
+    _uhi_cache_params: Optional[Dict] = None
 
     def load(self) -> "MBESDetrender":
         """Load raster data from ``tif_path`` and initialize coordinates.
@@ -329,7 +600,323 @@ class MBESDetrender:
                 self.extent[2] - y0_utm,
                 self.extent[3] - y0_utm,
             )
+
+        # Load UHI footprint if parameters are provided
+        self._load_uhi_footprint()
+
         return self
+
+    def _load_uhi_footprint(self) -> None:
+        """Load UHI footprint automatically if parameters are provided.
+
+        This method attempts to load the UHI transect data and extract the
+        footprint coordinates in the same coordinate system as the MBES data.
+        If any required parameter is missing or if loading fails, it silently
+        skips the footprint loading (with a warning message).
+
+        The footprint is stored as self.uhi_footprint = (E, N, valid_mask).
+        """
+        # Import config module to get defaults
+        try:
+            import sys
+            import os
+
+            # Try to find config in the expected location
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            gref_pipeline_dir = os.path.join(
+                os.path.dirname(os.path.dirname(current_dir)), "gref_pipeline"
+            )
+            if gref_pipeline_dir not in sys.path:
+                sys.path.insert(0, gref_pipeline_dir)
+            from config import OUTPUT_FOLDER, UHI_FILES, UHI_TRACK_RANGE
+        except ImportError:
+            warnings.warn(
+                "Could not import config module for UHI footprint defaults. Skipping UHI footprint loading."
+            )
+            return
+
+        # Use provided parameters or fall back to config defaults
+        transect_folder = self.uhi_transect_folder or OUTPUT_FOLDER
+        uhi_files = self.uhi_files or UHI_FILES
+        track_range = self.uhi_track_range or UHI_TRACK_RANGE
+
+        # Check if all required parameters are available
+        if not transect_folder or not uhi_files or not track_range:
+            # Silently skip - no warning if user didn't provide params
+            return
+
+        # Check if NED coordinate system is being used (required for UHI footprint)
+        if self.coord_system.lower() != "ned":
+            warnings.warn(
+                "UHI footprint loading requires coord_system='ned'. "
+                "Skipping UHI footprint. Set coord_system='ned' and provide ned_origin."
+            )
+            return
+
+        if self.ned_origin is None:
+            warnings.warn(
+                "UHI footprint loading requires ned_origin. Skipping UHI footprint."
+            )
+            return
+
+        try:
+            # Import georef module
+            georef_dir = os.path.join(
+                os.path.dirname(os.path.dirname(current_dir)), "gref_pipeline"
+            )
+            if georef_dir not in sys.path:
+                sys.path.insert(0, georef_dir)
+            from utils.gref_pipeline import georef
+            from utils.gref_pipeline.georef import _ecef_to_ned_arrays
+        except ImportError:
+            try:
+                # Alternative import path
+                import georef
+                from georef import _ecef_to_ned_arrays
+            except ImportError:
+                warnings.warn(
+                    "Could not import georef module. Skipping UHI footprint loading."
+                )
+                return
+
+        try:
+            # Load transect and select UHI files (use cache to avoid duplicate loading)
+            if self._uhi_transect_cache is None:
+                transect = georef.load_transect(transect_folder)
+                self._uhi_transect_cache = transect
+            else:
+                transect = self._uhi_transect_cache
+
+            # Cache the cube object to avoid calling select_files() multiple times
+            cache_key = (transect_folder, tuple(uhi_files))
+            if (
+                self._uhi_cube_cache is None
+                or not hasattr(self, "_uhi_cube_cache_key")
+                or self._uhi_cube_cache_key != cache_key
+            ):
+                cube = transect.select_files(uhi_files)
+                self._uhi_cube_cache = cube
+                self._uhi_cube_cache_key = cache_key
+            else:
+                cube = self._uhi_cube_cache
+
+            # Extract track range
+            track_start, track_end = track_range
+            X_ecef = cube.X_ecef[track_start:track_end, :]
+            Y_ecef = cube.Y_ecef[track_start:track_end, :]
+            Z_ecef = cube.Z_ecef[track_start:track_end, :]
+
+            # Build valid mask (all coordinates must be finite)
+            valid_mask = np.isfinite(X_ecef) & np.isfinite(Y_ecef) & np.isfinite(Z_ecef)
+
+            # Also check RGB if available
+            if hasattr(cube, "R") and hasattr(cube, "G") and hasattr(cube, "B"):
+                R = cube.R[track_start:track_end, :]
+                G = cube.G[track_start:track_end, :]
+                B = cube.B[track_start:track_end, :]
+                rgb_valid = np.isfinite(R) & np.isfinite(G) & np.isfinite(B)
+                valid_mask = valid_mask & rgb_valid
+
+            # Convert to NED coordinates
+            lon0, lat0, h0 = self.ned_origin
+            N, E, _ = _ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, lat0, lon0, h0)
+
+            # Store footprint
+            self.uhi_footprint = (E, N, valid_mask)
+
+        except Exception as e:
+            warnings.warn(
+                f"Failed to load UHI footprint: {e}. Continuing without footprint overlay."
+            )
+            self.uhi_footprint = None
+
+    def adjust_uhi_alignment(self, dx: float = 0.0, dy: float = 0.0) -> "MBESDetrender":
+        """Adjust UHI footprint alignment with translation.
+
+        This method applies a translation offset to the UHI footprint coordinates
+        without modifying the original footprint or the underlying hyperspectral
+        data. The adjusted footprint is stored separately and can be used in
+        plotting methods by setting `use_adjusted=True`.
+
+        Calling this method multiple times replaces the previous adjustment.
+
+        Parameters
+        ----------
+        dx : float, optional
+            East offset in meters (positive = shift east). Default: 0.0
+        dy : float, optional
+            North offset in meters (positive = shift north). Default: 0.0
+
+        Returns
+        -------
+        self : MBESDetrender
+            Returns self for method chaining.
+
+        Raises
+        ------
+        ValueError
+            If UHI footprint hasn't been loaded yet.
+
+        Examples
+        --------
+        >>> mb_ned.adjust_uhi_alignment(dx=0.5, dy=-0.3)
+        >>> fig = mb_ned.plot_uhi_mbes_comparison(use_adjusted=True)
+        """
+        if self.uhi_footprint is None:
+            raise ValueError(
+                "UHI footprint not loaded. Call load() first to load the footprint."
+            )
+
+        # Unpack original footprint
+        E_orig, N_orig, mask = self.uhi_footprint
+
+        # Apply translation
+        E_adjusted = E_orig + dx
+        N_adjusted = N_orig + dy
+
+        # Store adjusted footprint
+        self.uhi_footprint_adjusted = (E_adjusted, N_adjusted, mask)
+
+        # Clear resampled cache since coordinates changed
+        self._uhi_resampled_cache = None
+
+        print(f"✅ UHI footprint adjusted: dx={dx:.3f}m E, dy={dy:.3f}m N")
+
+        return self
+
+    def _ensure_uhi_cube_loaded(
+        self, window_size: int = 1000, strength: float = 1.0
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Load and cache UHI cube data (loads once, reuses thereafter).
+
+        This method checks if the UHI cube is already loaded with the same
+        parameters. If yes, it returns the cached data. If no, it loads the
+        cube, applies illumination correction, and caches everything.
+
+        Parameters
+        ----------
+        window_size : int
+            Window size for illumination correction.
+        strength : float
+            Strength parameter for illumination correction.
+
+        Returns
+        -------
+        data_corrected : np.ndarray
+            Illumination-corrected cube data (T, S, wavelengths).
+        uhi_mean : np.ndarray
+            Mean across wavelengths (T, S).
+        rgb : np.ndarray
+            RGB composite (T, S, 3).
+        cube : object
+            The loaded cube object (for access to other attributes if needed).
+        """
+        # Check if already cached with same parameters
+        current_params = {
+            "window_size": window_size,
+            "strength": strength,
+            "transect_folder": self.uhi_transect_folder,
+            "files": tuple(self.uhi_files) if self.uhi_files else None,
+            "track_range": self.uhi_track_range,
+        }
+
+        if (
+            self._uhi_cube_cache is not None
+            and self._uhi_cache_params == current_params
+        ):
+            # Return cached data
+            return (
+                self._uhi_data_corrected_cache,
+                self._uhi_mean_cache,
+                self._uhi_rgb_cache,
+                self._uhi_cube_cache,
+            )
+
+        # Not cached or different parameters - need to load
+        print("🔄 Loading UHI cube data (first time only)...")
+
+        try:
+            import sys
+            import os
+
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            gref_pipeline_dir = os.path.join(
+                os.path.dirname(os.path.dirname(current_dir)), "gref_pipeline"
+            )
+            if gref_pipeline_dir not in sys.path:
+                sys.path.insert(0, gref_pipeline_dir)
+            from config import OUTPUT_FOLDER, UHI_FILES, UHI_TRACK_RANGE
+            from utils.gref_pipeline import georef
+        except ImportError:
+            try:
+                from config import OUTPUT_FOLDER, UHI_FILES, UHI_TRACK_RANGE
+                import georef
+            except ImportError:
+                raise ImportError(
+                    "Could not import required modules (config, georef). "
+                    "Check your Python path."
+                )
+
+        transect_folder = self.uhi_transect_folder or OUTPUT_FOLDER
+        uhi_files = self.uhi_files or UHI_FILES
+        track_range = self.uhi_track_range or UHI_TRACK_RANGE
+        track_start, track_end = track_range
+
+        # Load transect (cache it to avoid "Rebuilding grids..." message)
+        if self._uhi_transect_cache is None:
+            transect = georef.load_transect(transect_folder)
+            self._uhi_transect_cache = transect
+        else:
+            transect = self._uhi_transect_cache
+
+        # Use cached cube if available (avoids calling select_files() which rebuilds grids)
+        cache_key = (transect_folder, tuple(uhi_files))
+        if (
+            self._uhi_cube_cache is not None
+            and hasattr(self, "_uhi_cube_cache_key")
+            and self._uhi_cube_cache_key == cache_key
+        ):
+            cube = self._uhi_cube_cache
+        else:
+            # Need to load cube for the first time
+            cube = transect.select_files(uhi_files)
+            self._uhi_cube_cache = cube
+            self._uhi_cube_cache_key = cache_key
+
+        # Apply illumination correction (this checks if already applied)
+        cube.apply_illumination_correction(window_size=window_size, strength=strength)
+
+        # Extract data
+        data_corrected = cube.data_corrected[track_start:track_end, :, :]
+        uhi_mean = np.nanmean(data_corrected, axis=2)
+
+        # Get RGB from CORRECTED data (like plot_georef does with use_corrected=True)
+        # Extract RGB channels from corrected cube using correct parameter names
+        R, G, B = cube._extract_rgb_from_cube(
+            cube.data_corrected, Rnm=654.2, Gnm=560.0, Bnm=440.3
+        )
+        # Extract track range
+        R = R[track_start:track_end, :]
+        G = G[track_start:track_end, :]
+        B = B[track_start:track_end, :]
+
+        # Normalize each channel independently (like plot_georef does)
+        for C in (R, G, B):
+            m, M = np.nanmin(C), np.nanmax(C)
+            if np.isfinite(m) and np.isfinite(M) and M > m:
+                C[:] = (C - m) / (M - m)
+
+        rgb = np.stack([R, G, B], axis=-1)
+        rgb = np.clip(rgb, 0, 1)  # Cache everything (including cube object to reuse)
+        self._uhi_cube_cache = cube
+        self._uhi_data_corrected_cache = data_corrected
+        self._uhi_mean_cache = uhi_mean
+        self._uhi_rgb_cache = rgb
+        self._uhi_cache_params = current_params
+
+        print("✅ UHI cube cached! Subsequent calls will reuse this data.")
+
+        return data_corrected, uhi_mean, rgb, cube
 
     def detrend(
         self,
@@ -523,22 +1110,20 @@ class MBESDetrender:
         equal_aspect: bool = True,
         show: bool = True,
         *,
+        footprint_style: str = "outline",
         uhi_footprint: Optional[
             Union[MplPath, Tuple[np.ndarray, np.ndarray, np.ndarray]]
         ] = None,
+        use_adjusted: bool = False,
     ) -> plt.Figure:
         """Plot original, trend, and residual panels with optional footprint overlay.
 
         This method produces a figure with three columns: the original raster,
-        the estimated trend, and the residual (detrended) bathymetry.  If
-        ``uhi_footprint`` is provided, the footprint region will be filled
-        with black on the residual panel while all other data remain
-        unchanged.  Acceptable values for ``uhi_footprint`` are either a
-        Matplotlib ``Path`` object delineating the footprint, or a tuple
-        ``(E, N, mask)`` where ``E`` and ``N`` are meshgrids of eastings
-        and northings (as returned by ``numpy.meshgrid``) and ``mask`` is a
-        boolean array of the same shape indicating membership in the
-        footprint.
+        the estimated trend, and the residual (detrended) bathymetry.  The UHI
+        footprint overlay can be rendered in different styles (outline, fill, or both).
+
+        The footprint is automatically loaded during load() if UHI parameters are
+        provided. You can also override it by passing uhi_footprint explicitly.
 
         Parameters
         ----------
@@ -561,8 +1146,18 @@ class MBESDetrender:
             True.
         show: bool, optional
             If True, display the figure immediately.  Defaults to True.
+        footprint_style: str, optional
+            Style for rendering the UHI footprint overlay. Options:
+            - 'outline': Black outline only (no fill) - default
+            - 'fill': Filled black region (no outline)
+            - 'both': Black fill with black outline
         uhi_footprint: Path or (E, N, mask), optional
-            Optional overlay footprint to fill with black on the residual panel.
+            Optional override for the UHI footprint. If not provided, uses
+            the footprint loaded during load(). Can be a matplotlib Path or
+            a tuple (E, N, mask).
+        use_adjusted: bool, optional
+            If True, use the adjusted UHI footprint (after alignment shifts).
+            If False, use the original footprint. Defaults to False.
 
         Returns
         -------
@@ -592,7 +1187,7 @@ class MBESDetrender:
         axs[0].set_title("Original")
         axs[0].set_xlabel(xlabel)
         axs[0].set_ylabel(ylabel)
-        fig.colorbar(im0, ax=axs[0], label="Depth (m)", fraction=0.035, pad=0.02)
+        fig.colorbar(im0, ax=axs[0], label="Depth (m)", fraction=0.025, pad=0.02)
         # Trend panel
         im1 = axs[1].imshow(
             np.ma.masked_invalid(self.trend),
@@ -609,7 +1204,7 @@ class MBESDetrender:
         )
         axs[1].set_xlabel(xlabel)
         axs[1].set_ylabel(ylabel)
-        fig.colorbar(im1, ax=axs[1], label="Depth (m)", fraction=0.035, pad=0.02)
+        fig.colorbar(im1, ax=axs[1], label="Depth (m)", fraction=0.025, pad=0.02)
         # Residual panel
         vmin, vmax = _robust_sym_vlim(self.residuals, q=0.98)
         im2 = axs[2].imshow(
@@ -624,69 +1219,104 @@ class MBESDetrender:
         axs[2].set_title("Residuals (local variations)")
         axs[2].set_xlabel(xlabel)
         axs[2].set_ylabel(ylabel)
-        fig.colorbar(im2, ax=axs[2], label="m", fraction=0.035, pad=0.02)
+        fig.colorbar(im2, ax=axs[2], label="m", fraction=0.025, pad=0.02)
         # Determine cropping extents
         if crop_to_data:
             x_min, x_max, y_min, y_max = self._data_window(bounds_percentile)
         else:
             x_min, x_max, y_min, y_max = self._extent()
-        # Overlay the footprint as a black fill on the residual panel if provided
-        if uhi_footprint is not None:
-            # helper to build a Path from (E, N, mask)
-            def _build_path(
-                E: np.ndarray, N: np.ndarray, mask: np.ndarray
-            ) -> Optional[MplPath]:
-                # create a contour at 0.5 to trace the mask boundary
-                cs = axs[2].contour(
-                    E, N, mask.astype(float), levels=[0.5], linewidths=0
-                )
-                polys: List[np.ndarray] = []
-                for coll in cs.collections:
-                    for p in coll.get_paths():
-                        v = p.vertices
-                        if v.shape[0] >= 3:
-                            polys.append(v.copy())
-                # remove temporary contour
-                for coll in cs.collections:
-                    coll.remove()
-                if not polys:
-                    return None
-                verts_all: List[np.ndarray] = []
-                codes_all: List[np.ndarray] = []
-                for poly in polys:
-                    codes = np.full(
-                        poly.shape[0], MplPath.LINETO, dtype=MplPath.code_type
-                    )
-                    codes[0] = MplPath.MOVETO
-                    verts_all.append(poly)
-                    codes_all.append(codes)
-                return MplPath(np.vstack(verts_all), np.concatenate(codes_all))
 
-            # determine if user supplied a Path or a tuple
-            if isinstance(uhi_footprint, MplPath):
-                fp_path = uhi_footprint
+        # Overlay the UHI footprint on the residual panel
+        # Use provided footprint or fall back to stored footprint (adjusted or original)
+        if uhi_footprint is not None:
+            footprint_to_use = uhi_footprint
+        elif use_adjusted and self.uhi_footprint_adjusted is not None:
+            footprint_to_use = self.uhi_footprint_adjusted
+        else:
+            footprint_to_use = self.uhi_footprint
+
+        if footprint_to_use is not None:
+            # Handle both Path and (E, N, mask) tuple formats
+            if isinstance(footprint_to_use, MplPath):
+                fp_path = footprint_to_use
             elif (
-                isinstance(uhi_footprint, tuple)
-                and len(uhi_footprint) == 3
-                and isinstance(uhi_footprint[0], np.ndarray)
-                and isinstance(uhi_footprint[1], np.ndarray)
-                and isinstance(uhi_footprint[2], np.ndarray)
+                isinstance(footprint_to_use, tuple)
+                and len(footprint_to_use) == 3
+                and isinstance(footprint_to_use[0], np.ndarray)
+                and isinstance(footprint_to_use[1], np.ndarray)
+                and isinstance(footprint_to_use[2], np.ndarray)
             ):
-                E, N, mask = uhi_footprint
-                fp_path = _build_path(E, N, mask)
+                E, N, mask = footprint_to_use
+                # Build pixel-perfect boundary path using helper functions
+                Xc, Yc = pcolormesh_pad(E, N)
+                segs_xy, segs_idx = _boundary_segments_from_mask(mask, Xc, Yc)
+
+                if len(segs_idx) > 0:
+                    loops = _trace_loops_from_segments(segs_idx)
+                    fp_path = _compound_path_from_loops(loops, Xc, Yc)
+                else:
+                    fp_path = None
             else:
                 raise TypeError(
                     "uhi_footprint must be a matplotlib.path.Path or (E, N, mask) tuple"
                 )
+
+            # Render footprint according to style
             if fp_path is not None:
-                patch = PathPatch(
-                    fp_path,
-                    transform=axs[2].transData,
-                    facecolor="k",
-                    edgecolor="none",
-                    zorder=10,
-                )
-                axs[2].add_patch(patch)
+                if footprint_style == "outline":
+                    # Black outline only (no fill)
+                    patch = PathPatch(
+                        fp_path,
+                        transform=axs[2].transData,
+                        facecolor="none",
+                        edgecolor="black",
+                        linewidth=2.0,
+                        zorder=10,
+                        alpha=1.0,
+                    )
+                    axs[2].add_patch(patch)
+                elif footprint_style == "fill":
+                    # Filled black region (no outline)
+                    patch = PathPatch(
+                        fp_path,
+                        transform=axs[2].transData,
+                        facecolor="black",
+                        edgecolor="none",
+                        zorder=10,
+                        alpha=1.0,
+                    )
+                    axs[2].add_patch(patch)
+                elif footprint_style == "both":
+                    # Black fill with black outline
+                    patch = PathPatch(
+                        fp_path,
+                        transform=axs[2].transData,
+                        facecolor="black",
+                        edgecolor="black",
+                        linewidth=2.0,
+                        zorder=10,
+                        alpha=1.0,
+                    )
+                    axs[2].add_patch(patch)
+                else:
+                    warnings.warn(
+                        f"Unknown footprint_style='{footprint_style}'. "
+                        "Valid options: 'outline', 'fill', 'both'. Using 'outline'."
+                    )
+                    # Default to outline
+                    patch = PathPatch(
+                        fp_path,
+                        transform=axs[2].transData,
+                        facecolor="none",
+                        edgecolor="black",
+                        linewidth=2.0,
+                        zorder=10,
+                        alpha=1.0,
+                    )
+                    axs[2].add_patch(patch)
+        elif uhi_footprint is None and self.uhi_footprint is None:
+            # No footprint available - show plots without overlay (silent, no error)
+            pass
         # apply padded limits on all panels
         for ax in axs:
             _pad_limits(
@@ -777,7 +1407,7 @@ class MBESDetrender:
 
     def plot_components(
         self,
-        figsize: Tuple[int, int] = (10, 8),
+        figsize: Tuple[int, int] = (10, 3),
         bounds_percentile: float = 99.5,
         margin_frac: float = 0.03,
         show: bool = True,
@@ -852,19 +1482,861 @@ class MBESDetrender:
 
     # --- convenience ---
     def plot_all(
-        self, *, show: bool = True
-    ) -> Tuple[plt.Figure, plt.Figure, plt.Figure]:
-        """Plot triptych, components, and residual heatmap.
+        self, *, show: bool = True, include_uhi_comparison: bool = True
+    ) -> Tuple[plt.Figure, ...]:
+        """Plot all available visualizations.
 
-        Returns the three figures created by ``plot_triptych``,
-        ``plot_components``, and ``plot_residual_heatmap`` respectively.
+        By default, generates five figures:
+        1. Triptych (data, trend, residuals)
+        2. Components (trend parameters)
+        3. Residual heatmap
+        4. UHI-MBES comparison (three-panel: RGB | residuals | Δz) - if UHI data available
+        5. Density scatter (UHI vs MBES correlation) - if UHI data available
+
+        If UHI footprint is not available or include_uhi_comparison=False, returns
+        only the first three figures.
+
+        Parameters
+        ----------
+        show : bool, optional
+            Whether to display all plots, by default True.
+        include_uhi_comparison : bool, optional
+            Whether to include UHI comparison plots (requires UHI footprint data),
+            by default True.
+
+        Returns
+        -------
+        tuple of matplotlib.figure.Figure
+            Tuple of generated figures. Either (f1, f2, f3) or (f1, f2, f3, f4, f5)
+            depending on UHI data availability.
         """
         f1 = self.plot_triptych(show=False)
         f2 = self.plot_components(show=False)
         f3 = self.plot_residual_heatmap(show=False)
+
+        # Try to generate UHI comparison plots if requested and data is available
+        figures = [f1, f2, f3]
+        if (
+            include_uhi_comparison
+            and self.uhi_footprint is not None
+            and self.coord_system.lower() == "ned"
+        ):
+            try:
+                f4 = self.plot_uhi_mbes_comparison(show=False)
+                f5 = self.plot_density_scatter(show=False)
+                figures.extend([f4, f5])
+            except Exception as e:
+                warnings.warn(
+                    f"Could not generate UHI comparison plots: {e}. "
+                    "Returning basic plots only."
+                )
+
         if show:
             plt.show(block=False)
-        return f1, f2, f3
+        return tuple(figures)
+
+    def plot_zoomed_residuals(
+        self,
+        outline_color: str = "black",
+        outline_width: float = 1.2,
+        outline_alpha: float = 0.9,
+        cmap: str = "RdBu_r",
+        figsize: Tuple[int, int] = (9, 11),
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot MBES residuals zoomed to UHI footprint with pixel-perfect outline.
+
+        This method creates a separate figure showing only the MBES residuals
+        within the UHI footprint region. The residuals are clipped to show only
+        the area inside the footprint, and a pixel-perfect outline is drawn
+        around the footprint boundary.
+
+        Requirements:
+        - Must use coord_system='ned' (raises error otherwise)
+        - Must have loaded UHI footprint (self.uhi_footprint must exist)
+        - Must have run detrend() first
+
+        Parameters
+        ----------
+        outline_color : str, optional
+            Color of the footprint outline. Defaults to 'black'.
+        outline_width : float, optional
+            Width of the outline in points. Defaults to 1.2.
+        outline_alpha : float, optional
+            Opacity of the outline (0=transparent, 1=opaque). Defaults to 0.9.
+        cmap : str, optional
+            Colormap for the residuals. Defaults to 'RdBu_r' (red-blue reversed).
+        figsize : tuple, optional
+            Figure size in inches (width, height). Defaults to (9, 11).
+        show : bool, optional
+            If True, display the figure immediately. Defaults to True.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure.
+
+        Raises
+        ------
+        ValueError
+            If coord_system is not 'ned' or if UHI footprint is not loaded.
+        AssertionError
+            If detrend() has not been run yet.
+        """
+        # Validate requirements
+        assert self.trend is not None, "Run detrend() first."
+
+        if self.coord_system.lower() != "ned":
+            raise ValueError(
+                "plot_zoomed_residuals() requires coord_system='ned'. "
+                f"Current coord_system='{self.coord_system}'"
+            )
+
+        if self.uhi_footprint is None:
+            raise ValueError(
+                "plot_zoomed_residuals() requires UHI footprint data. "
+                "Ensure UHI footprint was loaded during .load() or provide manually."
+            )
+
+        if self.ned_origin is None:
+            raise ValueError("plot_zoomed_residuals() requires ned_origin to be set.")
+
+        # Extract UHI footprint
+        E_uhi, N_uhi, mask_uhi = self.uhi_footprint
+
+        # MBES is already in NED coordinates (x_cols = East, y_rows = North)
+        # No coordinate transformation needed since load() already converted to NED
+        mbes_e_ned = self.x_cols
+        mbes_n_ned = self.y_rows
+
+        # Build pixel-perfect UHI footprint outline using helper functions
+        Xc, Yc = pcolormesh_pad(E_uhi, N_uhi)
+        segs_xy, segs_idx = _boundary_segments_from_mask(mask_uhi, Xc, Yc)
+
+        if len(segs_idx) == 0:
+            warnings.warn("No valid UHI footprint boundary found. Creating empty plot.")
+            fig, ax = plt.subplots(1, 1, figsize=figsize, num="MBES Residuals (Zoomed)")
+            ax.text(0.5, 0.5, "No valid UHI footprint", ha="center", va="center")
+            return fig
+
+        loops = _trace_loops_from_segments(segs_idx)
+        comp_path = _compound_path_from_loops(loops, Xc, Yc)
+
+        # Create figure
+        fig, ax = plt.subplots(
+            1, 1, figsize=figsize, num="MBES Residuals within UHI Footprint (NED)"
+        )
+
+        # Determine color limits for residuals
+        vmin, vmax = _robust_sym_vlim(self.residuals, q=0.98)
+
+        # Create MBES meshgrid for extent calculation
+        extent_ned = [
+            np.min(mbes_e_ned),
+            np.max(mbes_e_ned),
+            np.min(mbes_n_ned),
+            np.max(mbes_n_ned),
+        ]
+
+        # Plot full-resolution MBES residuals
+        im = ax.imshow(
+            np.ma.masked_invalid(self.residuals),
+            extent=extent_ned,
+            origin="upper",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            zorder=1,
+        )
+
+        # Clip MBES image to UHI footprint using PathPatch
+        patch = PathPatch(comp_path, transform=ax.transData, facecolor="none")
+        im.set_clip_path(patch)
+
+        # Draw the pixel-perfect outline (jagged grid edges)
+        if len(segs_xy) > 0:
+            lc = LineCollection(
+                segs_xy,
+                colors=outline_color,
+                linewidths=outline_width,
+                alpha=outline_alpha,
+                zorder=10,
+            )
+            ax.add_collection(lc)
+
+        # Zoom to footprint bounding box with padding
+        xs_outline = comp_path.vertices[:, 0]
+        ys_outline = comp_path.vertices[:, 1]
+        x_min, x_max = np.nanmin(xs_outline), np.nanmax(xs_outline)
+        y_min, y_max = np.nanmin(ys_outline), np.nanmax(ys_outline)
+        _pad_limits(ax, x_min, x_max, y_min, y_max, pad_frac=0.03, equal_aspect=True)
+
+        # Labels and title
+        ax.set_title(
+            "MBES Residuals within UHI Footprint (NED)\n"
+            "Pixel-perfect outline, full MBES resolution"
+        )
+        ax.set_xlabel("East (m)")
+        ax.set_ylabel("North (m)")
+
+        # Colorbar
+        cbar = fig.colorbar(im, ax=ax, label="MBES Residuals (m)")
+
+        fig.tight_layout()
+
+        if show:
+            plt.show(block=False)
+
+        return fig
+
+    def plot_uhi_mbes_comparison(
+        self,
+        outline_color: str = "black",
+        outline_width: float = 1.0,
+        outline_alpha: float = 0.9,
+        figsize: Tuple[int, int] = (26, 6.5),
+        use_adjusted: bool = False,
+        flip_uhi_sign: bool = False,
+        normalization_method: str = "zscore",
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot four-panel comparison: Raw UHI RGB | Corrected UHI RGB | MBES residuals | Δz heatmap.
+
+        This method creates a four-panel figure comparing UHI hyperspectral data
+        with MBES bathymetry residuals, all normalized using robust z-scores for
+        comparison. The panels show:
+
+        1. UHI RGB composite (raw, no correction)
+        2. UHI RGB composite (illumination-corrected)
+        3. MBES residuals (detrended bathymetry)
+        4. Δz heatmap (normalized difference: z(MBES) - z(UHI))
+           - Positive (red): MBES shallower than UHI predicts
+           - Negative (blue): MBES deeper than UHI predicts
+           - Near zero (white): Good agreement
+
+        All four panels are clipped to the UHI footprint with pixel-perfect outline.
+
+        Parameters
+        ----------
+        outline_color : str, optional
+            Color of the footprint outline, by default "black".
+        outline_width : float, optional
+            Width of the footprint outline, by default 1.0.
+        outline_alpha : float, optional
+            Transparency of the footprint outline, by default 0.9.
+        figsize : tuple, optional
+            Figure size (width, height), by default (20, 6.5).
+        use_adjusted : bool, optional
+            Use adjusted footprint if available, by default False.
+        flip_uhi_sign : bool, optional
+            If True, invert UHI values before normalization (use if dark=shallow, bright=deep).
+            If False (default), assume bright=shallow (typical for water depth imaging).
+        normalization_method : str, optional
+            Normalization method for comparison. Options:
+            - 'zscore' (default): Robust z-score normalization (values typically -6 to +6)
+              Formula: (x - median) / MAD
+            - 'minmax': Min-max normalization to [0, 1] range
+              Formula: (x - min) / (max - min)
+        show : bool, optional
+            Whether to show the plot immediately, by default True.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The generated figure.
+
+        Raises
+        ------
+        ValueError
+            If coord_system is not 'ned', or if UHI footprint data is not loaded,
+            or if detrend() has not been called.
+        """
+        # Validation
+        if self.coord_system.lower() != "ned":
+            raise ValueError(
+                "plot_uhi_mbes_comparison requires coord_system='ned'. "
+                "Create MBESDetrender with coord_system='ned' and ned_origin=(lon0, lat0, h0)."
+            )
+
+        if self.uhi_footprint is None:
+            raise ValueError(
+                "UHI footprint not loaded. Ensure uhi_transect_folder, uhi_files, "
+                "and uhi_track_range are set."
+            )
+
+        if self.residuals is None:
+            raise ValueError("Residuals not computed. Call .detrend() before plotting.")
+
+        if self.ned_origin is None:
+            raise ValueError("ned_origin required for NED coordinate system.")
+
+        # Select footprint (original or adjusted)
+        using_adjusted = use_adjusted and self.uhi_footprint_adjusted is not None
+        if using_adjusted:
+            E_uhi, N_uhi, mask_valid = self.uhi_footprint_adjusted
+        else:
+            E_uhi, N_uhi, mask_valid = self.uhi_footprint
+
+        # Load UHI cube (cached after first call)
+        data_corr, uhi_mean, rgb_corrected, cube = self._ensure_uhi_cube_loaded(
+            window_size=1000, strength=1.0
+        )
+
+        # Get track range (use config if not explicitly set)
+        try:
+            from gref_pipeline.config import UHI_TRACK_RANGE
+        except ImportError:
+            try:
+                from config import UHI_TRACK_RANGE
+            except ImportError:
+                raise ImportError("Could not import UHI_TRACK_RANGE from config")
+
+        track_range = self.uhi_track_range or UHI_TRACK_RANGE
+        track_start, track_end = track_range
+
+        # Extract RAW RGB (from cube.R, cube.G, cube.B which are built from raw data)
+        # The cube's R, G, B are already extracted during build_grids_and_rgb()
+        R_raw = cube.R[track_start:track_end, :].copy()
+        G_raw = cube.G[track_start:track_end, :].copy()
+        B_raw = cube.B[track_start:track_end, :].copy()
+
+        # Normalize raw RGB channels
+        for C in (R_raw, G_raw, B_raw):
+            m, M = np.nanmin(C), np.nanmax(C)
+            if np.isfinite(m) and np.isfinite(M) and M > m:
+                C[:] = (C - m) / (M - m)
+
+        rgb_raw = np.stack([R_raw, G_raw, B_raw], axis=-1)
+        rgb_raw = np.clip(rgb_raw, 0, 1)
+
+        # Build pixel-perfect footprint path
+        Xc_uhi, Yc_uhi = pcolormesh_pad(E_uhi, N_uhi)
+        segs_xy, segs_idx = _boundary_segments_from_mask(mask_valid, Xc_uhi, Yc_uhi)
+        loops = _trace_loops_from_segments(segs_idx)
+        footprint_path = _compound_path_from_loops(loops, Xc_uhi, Yc_uhi)
+        xs_outline = footprint_path.vertices[:, 0]
+        ys_outline = footprint_path.vertices[:, 1]
+        x_min, x_max = np.nanmin(xs_outline), np.nanmax(xs_outline)
+        y_min, y_max = np.nanmin(ys_outline), np.nanmax(ys_outline)
+
+        # RGB already loaded from cache
+
+        # MBES is already in NED coordinates (self.x_cols = East, self.y_rows = North)
+        # because coord_system='ned' was set during initialization
+        from scipy.spatial import cKDTree
+
+        mbes_e_ned = self.x_cols
+        mbes_n_ned = self.y_rows
+        extent_ned = [
+            np.min(mbes_e_ned),
+            np.max(mbes_e_ned),
+            np.min(mbes_n_ned),
+            np.max(mbes_n_ned),
+        ]
+
+        # Create MBES grid for inside check
+        MBES_E, MBES_N = np.meshgrid(mbes_e_ned, mbes_n_ned)
+
+        # Determine which MBES pixels are inside UHI footprint
+        pts_mbes = np.column_stack([MBES_E.ravel(), MBES_N.ravel()])
+        inside = footprint_path.contains_points(pts_mbes).reshape(MBES_E.shape)
+
+        # Resample UHI mean to MBES grid (cached after first time, but skip cache if using adjusted footprint)
+        if self._uhi_resampled_cache is not None and not using_adjusted:
+            uhi_on_mbes = self._uhi_resampled_cache
+        else:
+            valid_uhi = (
+                mask_valid
+                & np.isfinite(uhi_mean)
+                & np.isfinite(E_uhi)
+                & np.isfinite(N_uhi)
+            )
+            uhi_on_mbes = np.full(self.residuals.shape, np.nan, dtype=float)
+            if np.any(valid_uhi):
+                uhi_pts = np.column_stack([E_uhi[valid_uhi], N_uhi[valid_uhi]])
+                uhi_vals = uhi_mean[valid_uhi]
+                tree = cKDTree(uhi_pts)
+                idx_inside = np.where(inside.ravel())[0]
+                d, nn = tree.query(pts_mbes[idx_inside], k=1)
+                flat = uhi_on_mbes.ravel()
+                flat[idx_inside] = uhi_vals[nn]
+                uhi_on_mbes = flat.reshape(MBES_E.shape)
+            # Cache the resampled data
+            self._uhi_resampled_cache = uhi_on_mbes
+
+        # Compute normalized values for comparison
+        mbes_in = np.where(inside, self.residuals, np.nan)
+        uhi_in = np.where(inside, uhi_on_mbes, np.nan)
+
+        # Optionally flip UHI sign (if dark water = shallow instead of deep)
+        if flip_uhi_sign:
+            uhi_in = -uhi_in
+
+        # Extract valid paired samples BEFORE normalization
+        # (normalization should be applied to paired data, not full grids)
+        valid_pairs_mask = np.isfinite(mbes_in) & np.isfinite(uhi_in)
+        mbes_valid = mbes_in[valid_pairs_mask]
+        uhi_valid = uhi_in[valid_pairs_mask]
+
+        # Normalize each dataset INDEPENDENTLY to standardize them (center=0, spread=1)
+        # This makes them comparable: both have same scale but preserve their patterns
+        if normalization_method.lower() == "minmax":
+            # Normalize each to [0, 1] based on their own range
+            mbes_min, mbes_max = np.nanmin(mbes_valid), np.nanmax(mbes_valid)
+            uhi_min, uhi_max = np.nanmin(uhi_valid), np.nanmax(uhi_valid)
+            mbes_norm = (mbes_valid - mbes_min) / (mbes_max - mbes_min)
+            uhi_norm = (uhi_valid - uhi_min) / (uhi_max - uhi_min)
+            # Center both around 0.5 by subtracting 0.5 so difference is centered at 0
+            mbes_norm = mbes_norm - 0.5
+            uhi_norm = uhi_norm - 0.5
+            norm_label = "normalized [0-1]"
+        elif normalization_method.lower() == "zscore":
+            # Normalize each to mean=0, std=1 based on their own statistics
+            mbes_med = np.nanmedian(mbes_valid)
+            uhi_med = np.nanmedian(uhi_valid)
+            mbes_mad = median_abs_deviation(mbes_valid, nan_policy="omit")
+            uhi_mad = median_abs_deviation(uhi_valid, nan_policy="omit")
+            mbes_norm = (mbes_valid - mbes_med) / mbes_mad
+            uhi_norm = (uhi_valid - uhi_med) / uhi_mad
+            norm_label = "z-units"
+        else:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Choose 'zscore' or 'minmax'."
+            )
+
+        # Reconstruct grids with normalized values
+        z_mbes = np.full_like(mbes_in, np.nan)
+        z_uhi = np.full_like(uhi_in, np.nan)
+        z_mbes[valid_pairs_mask] = mbes_norm
+        z_uhi[valid_pairs_mask] = uhi_norm
+
+        # Heatmap shows: Δ = MBES - UHI
+        # Positive Δ = MBES shallower than UHI predicts (red)
+        # Negative Δ = MBES deeper than UHI predicts (blue)
+        diff_z = z_mbes - z_uhi
+
+        # Determine color limits
+        vmin_mbes, vmax_mbes = _robust_sym_vlim(self.residuals, q=0.98)
+        finite_diff = np.isfinite(diff_z)
+
+        # For minmax normalization, use symmetric limits around zero
+        # For zscore, use robust percentile-based limits
+        if normalization_method.lower() == "minmax":
+            # Minmax: differences are in [-1, 1] range, use symmetric limits
+            # But compute based on actual data distribution to handle bias
+            if np.any(finite_diff):
+                diff_data = diff_z[finite_diff]
+                # Use 2nd and 98th percentiles to handle outliers
+                vmin_diff = float(np.nanpercentile(diff_data, 2.0))
+                vmax_diff = float(np.nanpercentile(diff_data, 98.0))
+                # Make symmetric around zero for better visualization
+                vlim = max(abs(vmin_diff), abs(vmax_diff))
+                vmin_diff, vmax_diff = -vlim, vlim
+            else:
+                vmin_diff, vmax_diff = -1.0, 1.0
+        else:
+            # Zscore: use robust symmetric limits based on absolute values
+            vmax_diff = (
+                np.nanpercentile(np.abs(diff_z[finite_diff]), 98.0)
+                if np.any(finite_diff)
+                else 1.0
+            )
+            vmin_diff = -vmax_diff
+
+        # Create figure with 4 panels in 1x4 layout
+        from matplotlib import gridspec
+
+        fig = plt.figure(
+            constrained_layout=True,
+            figsize=figsize,
+            num="UHI-MBES Comparison: Raw RGB | Corrected RGB | Residuals | Δz",
+        )
+        gs = gridspec.GridSpec(ncols=4, nrows=1, figure=fig, width_ratios=[1, 1, 1, 1])
+
+        axR = fig.add_subplot(gs[0, 0])  # Raw UHI RGB
+        axU = fig.add_subplot(gs[0, 1])  # Corrected UHI RGB
+        axM = fig.add_subplot(gs[0, 2])  # MBES residuals
+        axD = fig.add_subplot(gs[0, 3])  # Δz heatmap
+
+        # Panel 1: Raw UHI RGB composite using pcolormesh (native grid coords)
+        rgb_raw_plot = rgb_raw.copy()
+        rgb_raw_plot[~mask_valid] = np.nan
+
+        # Plot raw RGB using pcolormesh (NO colormap - RGB is the color!)
+        im_raw = axR.pcolormesh(Xc_uhi, Yc_uhi, rgb_raw_plot, shading="flat")
+        im_raw.set_clip_path(
+            PathPatch(footprint_path, transform=axR.transData, facecolor="none")
+        )
+
+        # Draw outline
+        if len(segs_xy) > 0:
+            axR.add_collection(
+                LineCollection(
+                    segs_xy,
+                    colors=outline_color,
+                    linewidths=outline_width,
+                    alpha=outline_alpha,
+                )
+            )
+        _pad_limits(axR, x_min, x_max, y_min, y_max, pad_frac=0.03, equal_aspect=True)
+        axR.set_title("UHI RGB (raw) — NED")
+        axR.set_xlabel("East (m)")
+        axR.set_ylabel("North (m)")
+
+        # Panel 2: Corrected UHI RGB composite using pcolormesh (native grid coords)
+        rgb_corr_plot = rgb_corrected.copy()
+        rgb_corr_plot[~mask_valid] = np.nan
+
+        # Plot corrected RGB using pcolormesh (NO colormap - RGB is the color!)
+        im_uhi = axU.pcolormesh(Xc_uhi, Yc_uhi, rgb_corr_plot, shading="flat")
+        im_uhi.set_clip_path(
+            PathPatch(footprint_path, transform=axU.transData, facecolor="none")
+        )
+
+        # Draw outline
+        if len(segs_xy) > 0:
+            axU.add_collection(
+                LineCollection(
+                    segs_xy,
+                    colors=outline_color,
+                    linewidths=outline_width,
+                    alpha=outline_alpha,
+                )
+            )
+        _pad_limits(axU, x_min, x_max, y_min, y_max, pad_frac=0.03, equal_aspect=True)
+        axU.set_title("UHI RGB (illum-corrected) — NED")
+        axU.set_xlabel("East (m)")
+        axU.set_ylabel("North (m)")
+
+        # Panel 3: MBES residuals (clipped to footprint)
+        im_mbes = axM.imshow(
+            np.ma.masked_invalid(self.residuals),
+            extent=extent_ned,
+            origin="upper",
+            cmap="RdBu_r",
+            vmin=vmin_mbes,
+            vmax=vmax_mbes,
+        )
+        im_mbes.set_clip_path(
+            PathPatch(footprint_path, transform=axM.transData, facecolor="none")
+        )
+        if len(segs_xy) > 0:
+            axM.add_collection(
+                LineCollection(
+                    segs_xy,
+                    colors=outline_color,
+                    linewidths=outline_width,
+                    alpha=outline_alpha,
+                )
+            )
+        _pad_limits(axM, x_min, x_max, y_min, y_max, pad_frac=0.03, equal_aspect=True)
+        axM.set_title("MBES Residuals — NED")
+        axM.set_xlabel("East (m)")
+        axM.set_ylabel("North (m)")
+        fig.colorbar(
+            im_mbes, ax=axM, fraction=0.025, pad=0.02, label="MBES Residuals (m)"
+        )
+
+        # Panel 4: Δz heatmap (normalized difference)
+        im_diff = axD.imshow(
+            np.ma.masked_invalid(diff_z),
+            extent=extent_ned,
+            origin="upper",
+            cmap="RdBu_r",
+            vmin=vmin_diff,
+            vmax=vmax_diff,
+        )
+        im_diff.set_clip_path(
+            PathPatch(footprint_path, transform=axD.transData, facecolor="none")
+        )
+        if len(segs_xy) > 0:
+            axD.add_collection(
+                LineCollection(
+                    segs_xy,
+                    colors=outline_color,
+                    linewidths=outline_width,
+                    alpha=outline_alpha,
+                )
+            )
+        _pad_limits(axD, x_min, x_max, y_min, y_max, pad_frac=0.03, equal_aspect=True)
+        axD.set_title(f"Δ ({norm_label}): MBES − UHI — NED")
+        axD.set_xlabel("East (m)")
+        axD.set_ylabel("North (m)")
+        fig.colorbar(
+            im_diff,
+            ax=axD,
+            fraction=0.025,
+            pad=0.02,
+            label=f"Δ ({norm_label})\n+ve=MBES shallower",
+        )
+
+        if show:
+            plt.show(block=False)
+
+        return fig
+
+    def plot_density_scatter(
+        self,
+        gridsize: int = 80,
+        cmap: str = "viridis",
+        figsize: Tuple[int, int] = (10, 9),
+        use_adjusted: bool = False,
+        flip_uhi_sign: bool = False,
+        normalization_method: str = "zscore",
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot hexbin density scatter comparing normalized UHI vs MBES.
+
+        This method creates a density scatter plot (hexbin) comparing normalized
+        UHI hyperspectral data with MBES bathymetry residuals. Both datasets are
+        normalized using robust z-scores for comparison. The plot includes:
+
+        - Hexbin density visualization
+        - 1:1 reference line (perfect agreement)
+        - Linear regression fit with slope displayed
+        - Correlation statistics
+
+        Parameters
+        ----------
+        gridsize : int, optional
+            Number of hexagons in x-direction for hexbin plot, by default 80.
+        cmap : str, optional
+            Colormap for hexbin density, by default "viridis".
+        figsize : tuple, optional
+            Figure size (width, height), by default (10, 9).
+        use_adjusted : bool, optional
+            Use adjusted footprint if available, by default False.
+        flip_uhi_sign : bool, optional
+            If True, invert UHI values before normalization (use if dark=shallow, bright=deep).
+            If False (default), assume bright=shallow (typical for water depth imaging).
+        normalization_method : str, optional
+            Normalization method for comparison. Options:
+            - 'zscore' (default): Robust z-score normalization (values typically -6 to +6)
+            - 'minmax': Min-max normalization to [0, 1] range
+        show : bool, optional
+            Whether to show the plot immediately, by default True.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The generated figure.
+
+        Raises
+        ------
+        ValueError
+            If coord_system is not 'ned', or if UHI footprint data is not loaded,
+            or if detrend() has not been called.
+        """
+        # Validation
+        if self.coord_system.lower() != "ned":
+            raise ValueError(
+                "plot_density_scatter requires coord_system='ned'. "
+                "Create MBESDetrender with coord_system='ned' and ned_origin=(lon0, lat0, h0)."
+            )
+
+        if self.uhi_footprint is None:
+            raise ValueError(
+                "UHI footprint not loaded. Ensure uhi_transect_folder, uhi_files, "
+                "and uhi_track_range are set."
+            )
+
+        if self.residuals is None:
+            raise ValueError("Residuals not computed. Call .detrend() before plotting.")
+
+        if self.ned_origin is None:
+            raise ValueError("ned_origin required for NED coordinate system.")
+
+        # Select footprint (original or adjusted)
+        if use_adjusted and self.uhi_footprint_adjusted is not None:
+            E_uhi, N_uhi, mask_valid = self.uhi_footprint_adjusted
+            # Clear cache when using adjusted footprint (coordinates changed)
+            using_adjusted = True
+        else:
+            E_uhi, N_uhi, mask_valid = self.uhi_footprint
+            using_adjusted = False
+
+        # Load UHI cube (cached after first call)
+        data_corr, uhi_mean, rgb, cube = self._ensure_uhi_cube_loaded(
+            window_size=1000, strength=1.0
+        )
+
+        # Build pixel-perfect footprint path
+        Xc_uhi, Yc_uhi = pcolormesh_pad(E_uhi, N_uhi)
+        segs_xy, segs_idx = _boundary_segments_from_mask(mask_valid, Xc_uhi, Yc_uhi)
+        loops = _trace_loops_from_segments(segs_idx)
+        footprint_path = _compound_path_from_loops(loops, Xc_uhi, Yc_uhi)
+
+        # MBES is already in NED coordinates (self.x_cols = East, self.y_rows = North)
+        from scipy.spatial import cKDTree
+
+        mbes_e_ned = self.x_cols
+        mbes_n_ned = self.y_rows
+
+        # Create MBES grid for inside check
+        MBES_E, MBES_N = np.meshgrid(mbes_e_ned, mbes_n_ned)
+
+        # Determine which MBES pixels are inside UHI footprint
+        pts_mbes = np.column_stack([MBES_E.ravel(), MBES_N.ravel()])
+        inside = footprint_path.contains_points(pts_mbes).reshape(MBES_E.shape)
+
+        # Resample UHI mean to MBES grid (don't use cache if using adjusted footprint)
+        if self._uhi_resampled_cache is not None and not using_adjusted:
+            uhi_on_mbes = self._uhi_resampled_cache
+        else:
+            valid_uhi = (
+                mask_valid
+                & np.isfinite(uhi_mean)
+                & np.isfinite(E_uhi)
+                & np.isfinite(N_uhi)
+            )
+            uhi_on_mbes = np.full(self.residuals.shape, np.nan, dtype=float)
+            if np.any(valid_uhi):
+                uhi_pts = np.column_stack([E_uhi[valid_uhi], N_uhi[valid_uhi]])
+                uhi_vals = uhi_mean[valid_uhi]
+                tree = cKDTree(uhi_pts)
+                idx_inside = np.where(inside.ravel())[0]
+                d, nn = tree.query(pts_mbes[idx_inside], k=1)
+                flat = uhi_on_mbes.ravel()
+                flat[idx_inside] = uhi_vals[nn]
+                uhi_on_mbes = flat.reshape(MBES_E.shape)
+            # Cache the resampled data
+            self._uhi_resampled_cache = uhi_on_mbes
+
+        # Compute normalized values for comparison
+        mbes_in = np.where(inside, self.residuals, np.nan)
+        uhi_in = np.where(inside, uhi_on_mbes, np.nan)
+
+        # Optionally flip UHI sign (if dark water = shallow instead of deep)
+        if flip_uhi_sign:
+            uhi_in = -uhi_in
+
+        # DEBUG: Print diagnostics
+        print(f"\n=== DENSITY SCATTER DEBUG ===")
+        print(f"flip_uhi_sign: {flip_uhi_sign}")
+        print(f"normalization_method: {normalization_method}")
+        print(f"inside.shape: {inside.shape}, inside.sum(): {np.sum(inside)}")
+        print(f"mbes_in.shape: {mbes_in.shape}, finite: {np.isfinite(mbes_in).sum()}")
+        print(f"uhi_in.shape: {uhi_in.shape}, finite: {np.isfinite(uhi_in).sum()}")
+        print(f"mbes_in range: [{np.nanmin(mbes_in):.4f}, {np.nanmax(mbes_in):.4f}]")
+        print(f"uhi_in range: [{np.nanmin(uhi_in):.4f}, {np.nanmax(uhi_in):.4f}]")
+
+        # FIX: Extract valid pairs BEFORE normalization to avoid creating spurious correlation
+        # Normalizing each dataset separately can artificially create correlation patterns
+        valid_pairs_raw = np.isfinite(mbes_in) & np.isfinite(uhi_in) & inside
+        mbes_raw = mbes_in[valid_pairs_raw].ravel()
+        uhi_raw = uhi_in[valid_pairs_raw].ravel()
+
+        # Apply normalization method to the PAIRED data only (not the full grids)
+        if normalization_method.lower() == "minmax":
+            # Normalize using the ranges of the paired samples
+            z_mbes = _minmax_normalize(mbes_raw)
+            z_uhi = _minmax_normalize(uhi_raw)
+            norm_label = "normalized [0-1]"
+        elif normalization_method.lower() == "zscore":
+            # Normalize using robust z-scores of the paired samples
+            z_mbes = _robust_z(mbes_raw)
+            z_uhi = _robust_z(uhi_raw)
+            norm_label = "z-units"
+        else:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Choose 'zscore' or 'minmax'."
+            )
+
+        print(f"After {normalization_method} (on paired samples only):")
+        print(f"z_mbes range: [{np.nanmin(z_mbes):.4f}, {np.nanmax(z_mbes):.4f}]")
+        print(f"z_uhi range: [{np.nanmin(z_uhi):.4f}, {np.nanmax(z_uhi):.4f}]")
+        print(
+            f"z_mbes median: {np.nanmedian(z_mbes):.4f}, std: {np.nanstd(z_mbes):.4f}"
+        )
+        print(f"z_uhi median: {np.nanmedian(z_uhi):.4f}, std: {np.nanstd(z_uhi):.4f}")
+        print(f"===========================\n")
+
+        # Use the normalized paired data directly (already extracted as 1D arrays)
+        zM = z_mbes
+        zU = z_uhi
+
+        if zM.size == 0:
+            raise RuntimeError(
+                "No overlapping valid samples to plot. Check footprints/masks."
+            )
+
+        # Compute statistics
+        pearson_r = float(np.corrcoef(zM, zU)[0, 1]) if zM.size > 1 else np.nan
+        from scipy.stats import spearmanr
+
+        spearman_rho = (
+            float(spearmanr(zM, zU, nan_policy="omit").correlation)
+            if zM.size > 1
+            else np.nan
+        )
+        # Linear fit: zU = a + b*zM
+        b, a = np.polyfit(zM, zU, 1) if zM.size > 1 else (np.nan, np.nan)
+        r2 = float(pearson_r**2) if np.isfinite(pearson_r) else np.nan
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=figsize, num="Density Scatter: UHI vs MBES")
+
+        # Hexbin density plot
+        hb = ax.hexbin(zM, zU, gridsize=gridsize, mincnt=1, cmap=cmap)
+
+        # Determine axis limits (symmetric)
+        lim = np.nanmax(np.abs([np.nanmin([zM, zU]), np.nanmax([zM, zU])]))
+        lim = float(np.clip(lim, 2.0, 6.0))
+
+        # Plot 1:1 line
+        ax.plot([-lim, lim], [-lim, lim], "k--", lw=1.2, label="1:1 line")
+
+        # Plot regression line
+        ax.plot(
+            [-lim, lim],
+            [a + b * (-lim), a + b * (lim)],
+            "r-",
+            lw=1.3,
+            label=f"fit: y = {a:.2f} + {b:.2f}x",
+        )
+
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_xlabel(f"MBES residuals ({norm_label})", fontsize=12)
+        ax.set_ylabel(f"UHI mean intensity ({norm_label})", fontsize=12)
+        ax.set_title(f"Density Scatter: UHI vs MBES ({norm_label})", fontsize=14)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+
+        # Colorbar
+        cbar = fig.colorbar(hb, ax=ax, fraction=0.025, pad=0.02)
+        cbar.set_label("count", fontsize=11)
+
+        # Add statistics text box
+        stats_text = (
+            f"n = {zM.size:,}\n"
+            f"Pearson r = {pearson_r:.3f}\n"
+            f"Spearman ρ = {spearman_rho:.3f}\n"
+            f"R² = {r2:.3f}\n"
+            f"slope = {b:.3f}\n"
+            f"intercept = {a:.3f}"
+        )
+        ax.text(
+            0.03,
+            0.97,
+            stats_text,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+            fontsize=10,
+        )
+
+        ax.legend(loc="lower right", fontsize=10)
+
+        fig.tight_layout()
+
+        if show:
+            plt.show(block=False)
+
+        return fig
 
 
 # ------------------------------ tuner helpers --------------------------------

@@ -7,6 +7,7 @@ from pathlib import Path
 
 # ===== INPUT PATHS =====
 NAV_CSV = r"E:\mjosa_new\navigation_data\nav_data_merged.csv"
+DB_PATH = r"E:\mjosa\29\log_files\LOG_2024-10-29_10-13-32.db3"  # ROS bag database for DVL data
 MBES_GEOTIFF = r"E:\mjosa_new\DTM\geotiff_2.tif"  # the correct one
 # MBES_GEOTIFF = r"E:\mjosa_new\DTM\104921.tif"  # the fucked one to check orientation
 
@@ -54,6 +55,10 @@ LON0 = 10.705125
 LAT0 = 60.801146
 H0 = 0.0
 
+# UHI alignment adjustment (for matching with MBES data in NED coordinates)
+# These offsets shift the UHI footprint to better align with ground truth
+UHI_ALIGNMENT_DX = -0.05  # East offset in meters (positive = shift east)
+UHI_ALIGNMENT_DY = -3.0  # North offset in meters (positive = shift north)
 
 # EPSG codes
 EPSG_GEOGRAPHIC = 4326  # WGS84 lat/lon
@@ -80,6 +85,11 @@ CSV_COLUMNS = {
     "altitude": "altitude [m]",
 }
 
+# ===== UHI FOOTPRINT OVERLAY =====
+# Default UHI files and track range for MBES detrending footprint overlay
+UHI_FILES = ["rad_uhi_20241029_115057_4", "rad_uhi_20241029_115057_5"]
+UHI_TRACK_RANGE_4TO5 = (3039, 4029)  # (track_start, track_end) #this is the focus area
+UHI_TRACK_RANGE_5 = (576, 1566)
 # ===== MESH CREATION =====
 # When converting MBES GeoTIFF to mesh
 MESH_SIMPLIFICATION = False  # Set True to reduce mesh size

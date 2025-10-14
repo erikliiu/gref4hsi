@@ -585,6 +585,9 @@ def build_map_with_mbes(
     vmin=None,
     vmax=None,
     legend_caption="MBES (depth, m)",
+    # OPTIONAL: Multiple TIF overlays from folder
+    tif_folder=None,
+    tif_opacity=0.7,
     # HSI inputs
     hsi_h5_paths=None,
     hsi_h5_dir=None,
@@ -675,6 +678,56 @@ def build_map_with_mbes(
         opacity=opacity,
         show=True,
     )
+
+    # 5b) OPTIONAL: Add multiple TIF overlays from folder
+    if tif_folder and os.path.isdir(tif_folder):
+        print(f"\n📂 Processing additional TIF files from: {tif_folder}")
+        tif_files = sorted(glob.glob(os.path.join(tif_folder, "*.tif")))
+        tif_files.extend(sorted(glob.glob(os.path.join(tif_folder, "*.tiff"))))
+        tif_files = sorted(set(tif_files))  # Remove duplicates and sort
+
+        if len(tif_files) > 0:
+            print(f"   Found {len(tif_files)} TIF file(s)")
+
+            for idx, tif_path in enumerate(tif_files, 1):
+                tif_basename = os.path.basename(tif_path)
+                print(
+                    f"   [{idx}/{len(tif_files)}] Processing {tif_basename}...", end=" "
+                )
+
+                try:
+                    with rasterio.open(tif_path) as src:
+                        arr_tif, _, bounds_tif = reproject_to_epsg4326(src)
+
+                    # Use same colormap and vmin/vmax as original MBES
+                    rgba_tif, _, _, _ = colorize_to_rgba_array(
+                        arr_tif,
+                        cmap_name=cmap_name,
+                        vmin=used_vmin,
+                        vmax=used_vmax,
+                        pct_clip=pct_clip,
+                        make_transparent_on_nan=True,
+                    )
+
+                    # Add overlay with TIF filename as layer name, hidden by default
+                    add_mbes_overlay_from_array(
+                        fmap,
+                        rgba_tif,
+                        bounds_tif,
+                        name=tif_basename,
+                        opacity=tif_opacity,
+                        show=False,  # Hidden by default
+                    )
+                    print("✅")
+
+                except Exception as e:
+                    print(f"❌ Error: {e}")
+
+            print(
+                f"✅ Added {len(tif_files)} additional TIF overlay(s) (toggle via layer control)"
+            )
+        else:
+            print(f"⚠️  No TIF files found in {tif_folder}")
 
     # 6) Add navigation track and start/end markers
     coords = list(zip(nav["lat"].to_numpy(), nav["lon"].to_numpy()))
@@ -885,4 +938,83 @@ if __name__ == "__main__":
     print(
         "   - Increase hsi_rgb_stride_* and/or reduce hsi_rgb_keep_fraction to 0.05 or 0.02"
     )
+    print("=" * 70)
+
+
+def test_multiple_tifs():
+    """
+    Test function to verify multiple TIF overlay feature.
+    Uses the additional TIF folder provided by user.
+    """
+    print("=" * 70)
+    print("TEST: Building map with multiple TIF overlays")
+    print("=" * 70)
+
+    # Input paths from config
+    NAV_CSV = config.NAV_CSV
+    GEOTIFF = config.MBES_GEOTIFF
+    HSI_DIR = config.OUTPUT_FOLDER
+
+    # Additional TIF folder
+    TIF_FOLDER = r"E:\mjosa_new_oct_2025\all_tifs_from_eiva\relevant_tifs_only"
+
+    # Output
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    OUTPUT_HTML = os.path.join(script_dir, "test_multiple_tifs_map.html")
+
+    print(f"\n📍 Input paths:")
+    print(f"  Navigation CSV:    {NAV_CSV}")
+    print(f"  Main MBES GeoTIFF: {GEOTIFF}")
+    print(f"  Additional TIFs:   {TIF_FOLDER}")
+    print(f"  HSI H5 folder:     {HSI_DIR}")
+    print(f"\n📄 Output:")
+    print(f"  HTML map: {OUTPUT_HTML}\n")
+
+    # Verify paths
+    if not os.path.exists(NAV_CSV):
+        print(f"❌ ERROR: Navigation CSV not found: {NAV_CSV}")
+        sys.exit(1)
+    if not os.path.exists(GEOTIFF):
+        print(f"❌ ERROR: MBES GeoTIFF not found: {GEOTIFF}")
+        sys.exit(1)
+    if not os.path.isdir(TIF_FOLDER):
+        print(f"❌ ERROR: TIF folder not found: {TIF_FOLDER}")
+        sys.exit(1)
+
+    build_map_with_mbes(
+        NAV_CSV,
+        GEOTIFF,
+        output_html=OUTPUT_HTML,
+        cmap_name="viridis",
+        opacity=0.70,
+        pct_clip=(2, 98),
+        vmin=None,
+        vmax=None,
+        legend_caption="MBES (depth, m)",
+        # NEW FEATURE: Multiple TIF overlays
+        tif_folder=TIF_FOLDER,
+        tif_opacity=0.70,
+        # HSI settings (minimal for testing)
+        hsi_h5_dir=HSI_DIR,
+        hsi_recursive=False,
+        hsi_layer_name="HSI footprint (outline)",
+        hsi_stride_tracks=10,
+        hsi_stride_slits=10,
+        hsi_add_lines=True,
+        hsi_add_points=False,
+        hsi_color="#ffff00",
+        hsi_add_rgb=False,  # Disable RGB for faster testing
+        hsi_ecef_epsg=config.EPSG_ECEF,
+        hsi_geodetic_epsg=4979,
+    )
+
+    print("\n" + "=" * 70)
+    print("✅ TEST COMPLETE!")
+    print("=" * 70)
+    print(f"📂 Open the test map in your browser:")
+    print(f"   {OUTPUT_HTML}\n")
+    print("💡 Check the layer control (top right):")
+    print("   - Main 'MBES overlay' should be visible by default")
+    print("   - Additional TIF layers (named by timestamp) should be hidden")
+    print("   - Toggle each TIF layer to verify it appears correctly")
     print("=" * 70)

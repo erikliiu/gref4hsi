@@ -9,6 +9,9 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from pyproj import Transformer
+import json
+from datetime import datetime
+from types import SimpleNamespace
 
 try:
     from gref_pipeline import config
@@ -55,11 +58,14 @@ def _ecef_to_ned_arrays(x, y, z, lat0, lon0, h0):
 
 
 def unix_to_utc(timestamp):
-    """Convert unix timestamp to UTC string format."""
+    """Convert unix timestamp to UTC string format, applying TIME_OFFSET_SEC from config."""
     from datetime import datetime
 
     try:
-        return datetime.utcfromtimestamp(float(timestamp)).strftime(
+        # Apply time offset from config if available
+        offset = getattr(config, "TIME_OFFSET_SEC", 0) if config is not None else 0
+        corrected_timestamp = float(timestamp) + float(offset)
+        return datetime.utcfromtimestamp(corrected_timestamp).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         )
     except (ValueError, OSError):
@@ -325,34 +331,64 @@ class TransectDataSet:
         if not self.files:
             print("  (none)")
 
-    def select_files(self, names: List[str]) -> "CombinedTransectCube":
+    def select_files(
+        self, names: List[str], normalize_per_file: bool = False
+    ) -> "CombinedTransectCube":
+        """
+        Select files and combine them into a CombinedTransectCube.
+
+        Parameters:
+        -----------
+        names : List[str]
+            List of file names (without .h5 extension) to select
+        normalize_per_file : bool, default=True
+            If True, normalize each file's RGB to [0,1] before combining to avoid
+            color discontinuities from different acquisition conditions
+        """
         missing = [n for n in names if n not in self.files]
         if missing:
             print(f"⚠️  Missing files: {missing}")
         chosen = [self.files[n] for n in names if n in self.files]
         if not chosen:
             raise ValueError("No valid files selected")
-        return CombinedTransectCube(chosen, self.folder, self.use_corrected)
+        return CombinedTransectCube(
+            chosen, self.folder, self.use_corrected, normalize_per_file
+        )
 
-    def select_all_files(self) -> "CombinedTransectCube":
-        return self.select_files(list(self.files.keys()))
+    def select_all_files(
+        self, normalize_per_file: bool = False
+    ) -> "CombinedTransectCube":
+        return self.select_files(
+            list(self.files.keys()), normalize_per_file=normalize_per_file
+        )
 
-    def select_files_by_pattern(self, pattern: str) -> "CombinedTransectCube":
+    def select_files_by_pattern(
+        self, pattern: str, normalize_per_file: bool = False
+    ) -> "CombinedTransectCube":
         import fnmatch
 
         names = [n for n in self.files if fnmatch.fnmatch(n, pattern)]
         if not names:
             raise ValueError(f"No files match pattern: {pattern}")
-        return self.select_files(names)
+        return self.select_files(names, normalize_per_file=normalize_per_file)
 
 
 class CombinedTransectCube:
     """Combines multiple GeoFiles into a single logical cube along track."""
 
-    def __init__(self, geofiles: List[GeoFile], folder: str, use_corrected: bool):
+    def __init__(
+        self,
+        geofiles: List[GeoFile],
+        folder: str,
+        use_corrected: bool,
+        normalize_per_file: bool = False,
+    ):
         self.geofiles = geofiles
         self.folder = folder
         self.use_corrected = use_corrected
+        self.normalize_per_file = (
+            normalize_per_file  # NEW: normalize each file's RGB independently
+        )
         self.name = f"Combined_{os.path.basename(folder)}"
         self.file_boundaries = []  # list of dict with start_track etc.
 
@@ -366,7 +402,14 @@ class CombinedTransectCube:
         self.wavelengths = geofiles[0].wavelengths if geofiles else None
         self.timestamps = None  # Combined timestamps from all files
 
+        # Full hyperspectral cube (loaded on demand for methods that need it)
+        self.data = None  # Shape: (T_combined, S, B)
+        self.data_corrected = (
+            None  # Corrected version if illumination correction applied
+        )
+
         self._build_combined()
+        self._load_full_cube()  # Load the full hyperspectral data
 
     def _build_combined(self):
         print("🔄 Rebuilding grids from georef hits for selected files...")
@@ -390,9 +433,19 @@ class CombinedTransectCube:
             xs.append(d["X_ecef"])
             ys.append(d["Y_ecef"])
             zs.append(d["Z_ecef"])
-            rs.append(d["R"])
-            gs.append(d["G"])
-            bs.append(d["B"])
+
+            # NEW: Optionally normalize each file's RGB independently
+            R_file, G_file, B_file = d["R"], d["G"], d["B"]
+            if self.normalize_per_file:
+                for C in (R_file, G_file, B_file):
+                    m, M = np.nanmin(C), np.nanmax(C)
+                    if np.isfinite(m) and np.isfinite(M) and M > m:
+                        C[:] = (C - m) / (M - m)
+                print(f"      ✓ Normalized RGB to [0,1]")
+
+            rs.append(R_file)
+            gs.append(G_file)
+            bs.append(B_file)
 
             # Collect timestamps if available
             if gf.timestamps is not None and len(gf.timestamps) == T:
@@ -427,6 +480,41 @@ class CombinedTransectCube:
             self.timestamps = None
 
         print(f"✅ Combined shapes: X/Y/Z {self.X_ecef.shape}, RGB {self.R.shape}")
+
+    def _load_full_cube(self):
+        """
+        Load the full hyperspectral cube (T, S, B) from all H5 files.
+        This enables methods like plot_rgb() with custom wavelengths, plot_spectrum(), etc.
+        """
+        print("🔄 Loading full hyperspectral cube...")
+        cubes = []
+
+        dset_name = (
+            "processed/radiance/dataCube_corrected"
+            if self.use_corrected
+            else "processed/radiance/dataCube"
+        )
+
+        for gf in self.geofiles:
+            print(f"   • Loading {gf.name}...")
+            try:
+                with h5py.File(gf.path, "r") as f:
+                    # Try corrected first, fallback to raw
+                    if dset_name in f:
+                        cube = f[dset_name][()]
+                    elif "processed/radiance/dataCube" in f:
+                        cube = f["processed/radiance/dataCube"][()]
+                    else:
+                        raise KeyError(f"No radiance cube found in {gf.name}")
+
+                    cubes.append(cube)
+            except Exception as e:
+                print(f"      ⚠️  Failed to load: {e}")
+                return  # Exit if we can't load all cubes
+
+        # Concatenate along track axis
+        self.data = np.concatenate(cubes, axis=0)
+        print(f"✅ Loaded full cube: {self.data.shape} (T × S × B)")
 
     def describe(self):
         T, S = self.X_ecef.shape
@@ -549,6 +637,7 @@ class CombinedTransectCube:
         track_start=None,  # inclusive
         track_end=None,  # exclusive
         use_corrected=False,  # use illumination corrected data if available
+        apply_alignment_shift=False,  # apply UHI alignment shift from config (NED only)
         # trajectory options
         show_trajectory=False,
         nav_csv_path=None,  # CSV must have lon/lat
@@ -556,6 +645,17 @@ class CombinedTransectCube:
         trajectory_linewidth=2.0,
         trajectory_alpha=0.85,
         trajectory_decimate=1,  # >=1
+        # perimeter line options (NEW - from plot_rgb)
+        perimeter_line=None,  # Lines in (slit, track) coords
+        line_colors=["red", "blue", "orange", "magenta"],
+        line_width=2,
+        line_style="-",
+        line_labels=None,
+        # ROI options (NEW - from plot_rgb)
+        roi_collection=None,  # Dict of named ROIs or 'all' to use self.roi_collection
+        roi_colors=["yellow", "cyan", "magenta", "orange", "lime", "red", "blue"],
+        roi_marker_size=100,
+        roi_show_numbers=False,
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -563,11 +663,126 @@ class CombinedTransectCube:
         """
         RGB georeferenced composite in LATLON, NED, or ECEF with optional trajectory.
         Only interactive click readouts are printed when interactive=True.
+
+        Parameters
+        ----------
+        apply_alignment_shift : bool, optional
+            If True and coordinate_system=='NED', applies the alignment shift from
+            config (UHI_ALIGNMENT_DX, UHI_ALIGNMENT_DY) to match MBES data.
+            Default: False
         """
         import io, contextlib, warnings
         import numpy as np
         import matplotlib.pyplot as plt
         from pyproj import Transformer
+
+        # ---------- helpers for robust timestamp handling ----------
+        def _normalize_epoch_scalar(v):
+            """Handle sec / ms / µs / ns -> seconds (float)."""
+            try:
+                v = float(v)
+            except Exception:
+                return np.nan
+            # thresholds chosen so 2020+ in various units land correctly
+            if v > 1e15:  # micro/nano
+                return v / 1e9
+            if v > 1e12:  # ms
+                return v / 1e3
+            return v  # seconds
+
+        def _read_ts_from_file(h5_path):
+            """Read timestamps array from a single H5 file with robust key search."""
+            import h5py
+
+            KEYS = [
+                "processed/radiance/timestamps",  # preferred
+                "processed/radiance/timestamp",
+                "processed/timestamps",
+                "processed/timestamp",
+                "timestamps",
+                "timestamp",
+            ]
+            with h5py.File(h5_path, "r") as f:
+                # exact matches first
+                for k in KEYS:
+                    if k in f:
+                        return np.asarray(f[k][()]).ravel()
+                # case-insensitive search inside processed/radiance
+                try:
+                    grp = f["processed"]["radiance"]
+                    for name, obj in grp.items():
+                        if hasattr(obj, "shape") and "timestamp" in name.lower():
+                            return np.asarray(obj[()]).ravel()
+                except Exception:
+                    pass
+
+                # global fall-back: any dataset containing 'timestamp'
+                def _walk(g):
+                    for k, v in g.items():
+                        if hasattr(v, "shape"):
+                            if "timestamp" in k.lower():
+                                return np.asarray(v[()]).ravel()
+                        if isinstance(v, type(g)):
+                            out = _walk(v)
+                            if out is not None:
+                                return out
+                    return None
+
+                out = _walk(f)
+                return out if out is not None else np.array([], dtype=float)
+
+        def _utc_range_for_slice(start_idx, end_idx):
+            """Return (start_txt, end_txt) for plotted slice using self.timestamps or per-file H5 read."""
+            # 1) try self.timestamps
+            ts = getattr(self, "timestamps", None)
+            if ts is not None and len(ts) >= end_idx:
+                sl = np.asarray(ts[start_idx:end_idx]).ravel()
+                if sl.size:
+                    sln = np.array(
+                        [_normalize_epoch_scalar(v) for v in sl], dtype=float
+                    )
+                    finite = np.isfinite(sln)
+                    if finite.any():
+                        first = sln[np.where(finite)[0][0]]
+                        last = sln[np.where(finite)[0][-1]]
+                        return unix_to_utc(first), unix_to_utc(last)
+
+            # 2) robust per-file read just for the overlapped range
+            parts = []
+            name_to_gf = {gf.name: gf for gf in self.geofiles}
+            for b in self.file_boundaries:
+                f_start = b["start_track"]
+                f_end = b["end_track"] + 1  # exclusive
+                # overlap with [start_idx, end_idx)
+                a = max(start_idx, f_start)
+                z = min(end_idx, f_end)
+                if a >= z:
+                    continue
+                gf = name_to_gf[b["file"]]
+                full_ts = _read_ts_from_file(gf.path)
+                if full_ts.size == 0:
+                    parts.append(np.full(z - a, np.nan))
+                    continue
+                # cut relative window within this file
+                rel0 = a - f_start
+                rel1 = rel0 + (z - a)
+                rel0 = max(0, rel0)
+                rel1 = min(len(full_ts), rel1)
+                seg = full_ts[rel0:rel1]
+                if len(seg) < (z - a):
+                    pad = np.full((z - a,), np.nan)
+                    pad[: len(seg)] = seg
+                    seg = pad
+                parts.append(np.asarray(seg))
+            if parts:
+                sl = np.concatenate(parts).ravel()
+                sln = np.array([_normalize_epoch_scalar(v) for v in sl], dtype=float)
+                finite = np.isfinite(sln)
+                if finite.any():
+                    first = sln[np.where(finite)[0][0]]
+                    last = sln[np.where(finite)[0][-1]]
+                    return unix_to_utc(first), unix_to_utc(last)
+            return "N/A", "N/A"
 
         def _silence():
             return contextlib.ExitStack()
@@ -619,9 +834,11 @@ class CombinedTransectCube:
 
         T, S = X_ecef.shape
 
+        # Always define start_idx for perimeter/ROI coordinate conversion
+        start_idx = track_start if track_start is not None else 0
+        end_idx = track_end if track_end is not None else T
+
         if track_start is not None or track_end is not None:
-            start_idx = track_start if track_start is not None else 0
-            end_idx = track_end if track_end is not None else T
             if start_idx < 0 or start_idx >= T:
                 raise ValueError(f"track_start={start_idx} out of range [0, {T})")
             if end_idx <= start_idx or end_idx > T:
@@ -655,6 +872,32 @@ class CombinedTransectCube:
         elif coordinate_system.upper() == "NED":
             lat0, lon0, h0 = origin
             N, E, D = _ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, lat0, lon0, h0)
+
+            # Apply alignment shift if requested (to match MBES coordinates)
+            if apply_alignment_shift:
+                try:
+                    if "config" in globals():
+                        dx = getattr(config, "UHI_ALIGNMENT_DX", 0.0)
+                        dy = getattr(config, "UHI_ALIGNMENT_DY", 0.0)
+                    else:
+                        # Try importing config
+                        try:
+                            from gref_pipeline import config as cfg
+
+                            dx = getattr(cfg, "UHI_ALIGNMENT_DX", 0.0)
+                            dy = getattr(cfg, "UHI_ALIGNMENT_DY", 0.0)
+                        except ImportError:
+                            dx, dy = 0.0, 0.0
+                    E = E + dx
+                    N = N + dy
+                    if not quiet:
+                        print(
+                            f"Applied UHI alignment shift: dx={dx:.3f}m E, dy={dy:.3f}m N"
+                        )
+                except Exception:
+                    if not quiet:
+                        print("⚠️  Could not apply alignment shift")
+
             Xp, Yp = E, N
             xlabel, ylabel = f"East (m) from {lat0}°, {lon0}°", "North (m)"
         elif coordinate_system.upper() == "ECEF":
@@ -702,6 +945,122 @@ class CombinedTransectCube:
                         alpha=0.9,
                     )
 
+        # ========== NEW: Perimeter lines (from plot_rgb) ==========
+        if perimeter_line is not None:
+            # Handle single line or list of lines
+            if isinstance(perimeter_line[0], (int, float)):
+                lines_to_plot = [perimeter_line]
+            else:
+                lines_to_plot = perimeter_line
+
+            for line_idx, line in enumerate(lines_to_plot):
+                (slit1, track1), (slit2, track2) = line
+
+                # Convert (slit, track) indices to georeferenced coordinates
+                # Tracks are relative to the slice, so adjust by start_idx
+                t1 = track1 - start_idx
+                t2 = track2 - start_idx
+
+                # Bounds check
+                if 0 <= t1 < T and 0 <= t2 < T and 0 <= slit1 < S and 0 <= slit2 < S:
+                    x1, y1 = Xp[t1, slit1], Yp[t1, slit1]
+                    x2, y2 = Xp[t2, slit2], Yp[t2, slit2]
+
+                    color = line_colors[line_idx % len(line_colors)]
+
+                    if line_labels and line_idx < len(line_labels):
+                        label = line_labels[line_idx]
+                    elif len(lines_to_plot) > 1:
+                        label = f"Line {line_idx + 1}"
+                    else:
+                        label = "Perimeter line"
+
+                    ax.plot(
+                        [x1, x2],
+                        [y1, y2],
+                        color=color,
+                        linewidth=line_width,
+                        linestyle=line_style,
+                        label=label,
+                        zorder=10,
+                    )
+
+        # ========== NEW: ROI collection (from plot_rgb) ==========
+        if roi_collection is not None:
+            # Determine which ROIs to plot
+            if roi_collection == "all":
+                if hasattr(self, "roi_collection") and self.roi_collection:
+                    rois_to_plot = self.roi_collection
+                else:
+                    if not quiet:
+                        print(
+                            "⚠️  No ROI collection found. Use plot_interactive_rgb() first."
+                        )
+                    rois_to_plot = {}
+            elif isinstance(roi_collection, dict):
+                rois_to_plot = roi_collection
+            else:
+                if not quiet:
+                    print("❌ roi_collection must be 'all' or a dictionary")
+                rois_to_plot = {}
+
+            # Plot each ROI with different color
+            for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
+                if roi_pixels_list:
+                    # Convert (slit, track) to georeferenced coordinates
+                    roi_x_coords = []
+                    roi_y_coords = []
+
+                    for slit, track in roi_pixels_list:
+                        # Adjust track by start_idx
+                        t = track - start_idx
+
+                        # Bounds check
+                        if 0 <= t < T and 0 <= slit < S:
+                            roi_x_coords.append(Xp[t, slit])
+                            roi_y_coords.append(Yp[t, slit])
+
+                    if roi_x_coords:
+                        # Assign color
+                        color = roi_colors[roi_idx % len(roi_colors)]
+
+                        # Plot ROI
+                        ax.scatter(
+                            roi_x_coords,
+                            roi_y_coords,
+                            c=color,
+                            s=roi_marker_size,
+                            marker="o",
+                            edgecolors="black",
+                            linewidths=2,
+                            alpha=0.8,
+                            label=f"{roi_name} ({len(roi_x_coords)})",
+                            zorder=11,
+                        )
+
+                        # Optional: Add numbers
+                        if roi_show_numbers:
+                            for i, (x, y) in enumerate(
+                                zip(roi_x_coords, roi_y_coords), 1
+                            ):
+                                ax.text(
+                                    x,
+                                    y,
+                                    str(i),
+                                    ha="center",
+                                    va="center",
+                                    fontsize=8,
+                                    fontweight="bold",
+                                    color="white",
+                                    bbox=dict(
+                                        boxstyle="round,pad=0.3",
+                                        facecolor=color,
+                                        edgecolor="black",
+                                        linewidth=1,
+                                    ),
+                                    zorder=12,
+                                )
+
         if coordinate_system.upper() == "LATLON":
             if origin and origin[0] != 0:
                 lat_center = origin[0]
@@ -722,27 +1081,9 @@ class CombinedTransectCube:
         ):
             title += f"\norigin @ {origin[0]:.6f}°, {origin[1]:.6f}°"
 
-        # Add UTC time information if timestamps are available and track range is specified
-        if self.timestamps is not None and (
-            track_start is not None or track_end is not None
-        ):
-            start_idx = track_start if track_start is not None else 0
-            end_idx = (track_end if track_end is not None else len(self.timestamps)) - 1
-
-            # Get start and end timestamps using the same helper as print_processing_statistics
-            if start_idx < len(self.timestamps) and np.isfinite(
-                self.timestamps[start_idx]
-            ):
-                start_time = unix_to_utc(self.timestamps[start_idx])
-            else:
-                start_time = "N/A"
-
-            if end_idx < len(self.timestamps) and np.isfinite(self.timestamps[end_idx]):
-                end_time = unix_to_utc(self.timestamps[end_idx])
-            else:
-                end_time = "N/A"
-
-            title += f"\nTime: {start_time} → {end_time}"
+        # Add UTC time information using robust timestamp reading
+        t0_txt, t1_txt = _utc_range_for_slice(start_idx, end_idx)
+        title += f"\nTime (displayed): {t0_txt} → {t1_txt}"
 
         if interactive:
             title += "\n(Click to show coordinates)"
@@ -928,9 +1269,207 @@ class CombinedTransectCube:
             fig.canvas.mpl_connect("button_press_event", on_click)
             print("💡 Interactive mode: Click on the plot to display coordinates")
 
+        # Add legend if perimeter lines or ROIs are shown
+        if perimeter_line is not None or roi_collection is not None:
+            ax.legend(loc="best", fontsize=9, framealpha=0.9)
+
         fig.tight_layout()
         plt.show()
         return (fig, ax) if return_fig else None
+
+    def plot_georef_interactive_lines(
+        self,
+        red_wl=654.2,
+        green_wl=560.0,
+        blue_wl=440.3,
+        normalize=True,
+        figsize=(15, 10),
+        coordinate_system=None,
+        use_local_origin=True,
+        origin=None,
+        use_corrected=False,
+        track_start=None,
+        track_end=None,
+        line_width=2,
+        line_color="red",
+    ):
+        """
+        Interactive tool for defining lines by clicking on georeferenced plot.
+
+        Click 2 points to define each line (start point → end point).
+        Close the window when done to return the list of lines.
+
+        Parameters
+        ----------
+        red_wl, green_wl, blue_wl : float
+            Wavelengths for RGB composite
+        normalize : bool
+            Normalize RGB channels
+        figsize : tuple
+            Figure size
+        coordinate_system : str
+            'LATLON', 'NED', or 'ECEF'
+        use_local_origin : bool
+            For NED, use local origin
+        origin : tuple
+            Custom origin (lat, lon, alt_m)
+        use_corrected : bool
+            Use illumination-corrected data
+        track_start, track_end : int
+            Track range to display
+        line_width : float
+            Width of drawn lines
+        line_color : str
+            Color of completed lines
+
+        Returns
+        -------
+        list
+            List of lines in format [((slit1, track1), (slit2, track2)), ...]
+            Compatible with plot_georef(perimeter_line=...) parameter
+        """
+        import matplotlib.pyplot as plt
+
+        # First generate the georef plot to get coordinate arrays
+        fig, ax = self.plot_georef(
+            red_wl=red_wl,
+            green_wl=green_wl,
+            blue_wl=blue_wl,
+            normalize=normalize,
+            figsize=figsize,
+            coordinate_system=coordinate_system,
+            use_local_origin=use_local_origin,
+            origin=origin,
+            use_corrected=use_corrected,
+            track_start=track_start,
+            track_end=track_end,
+            return_fig=True,
+        )
+
+        # Get the coordinate arrays (Xp, Yp) for reverse mapping
+        # We need to regenerate them with the same parameters
+        S = self.S
+        T = self.T
+        start_idx = track_start if track_start is not None else 0
+        end_idx = track_end if track_end is not None else T
+
+        # Get georeferenced coordinates
+        X_ecef = self.X_ecef[:, start_idx:end_idx]
+        Y_ecef = self.Y_ecef[:, start_idx:end_idx]
+        Z_ecef = self.Z_ecef[:, start_idx:end_idx]
+
+        if coordinate_system == "LATLON":
+            Xp, Yp = self._ecef_to_geodetic_arrays(X_ecef, Y_ecef, Z_ecef)
+        elif coordinate_system == "NED":
+            if origin is None and use_local_origin:
+                origin = self._compute_local_origin()
+            Xp, Yp, _ = self._ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, origin=origin)
+        else:  # ECEF
+            Xp = X_ecef
+            Yp = Y_ecef
+
+        # Store coordinate arrays in axis for click handler
+        ax._gref_Xp = Xp
+        ax._gref_Yp = Yp
+        ax._gref_start_idx = start_idx
+
+        # State for click tracking
+        click_state = {
+            "points": [],  # List of (x, y, slit_idx, track_idx)
+            "lines": [],  # List of completed lines
+            "circles": [],  # Visual markers for clicked points
+            "line_objs": [],  # Visual line objects
+        }
+
+        def onclick(event):
+            if event.inaxes != ax:
+                return
+
+            # Get click coordinates
+            x_click, y_click = event.xdata, event.ydata
+
+            # Find nearest point in the georef grid
+            distances = np.sqrt((Xp - x_click) ** 2 + (Yp - y_click) ** 2)
+            min_idx = np.nanargmin(distances)
+            slit_idx, track_offset = np.unravel_index(min_idx, Xp.shape)
+
+            # Convert to absolute track index
+            track_idx = start_idx + track_offset
+
+            # Get actual coordinates at this point
+            x_actual = Xp[slit_idx, track_offset]
+            y_actual = Yp[slit_idx, track_offset]
+
+            # Add point
+            click_state["points"].append((x_actual, y_actual, slit_idx, track_idx))
+
+            # Draw circle marker
+            circle = plt.Circle(
+                (x_actual, y_actual),
+                radius=5,
+                color="cyan",
+                fill=True,
+                alpha=0.8,
+                zorder=10,
+            )
+            ax.add_patch(circle)
+            click_state["circles"].append(circle)
+
+            print(
+                f"Point {len(click_state['points'])}: slit={slit_idx}, track={track_idx}"
+            )
+
+            # If we have 2 points, create a line
+            if len(click_state["points"]) == 2:
+                p1 = click_state["points"][0]
+                p2 = click_state["points"][1]
+
+                # Draw line between points
+                (line,) = ax.plot(
+                    [p1[0], p2[0]],
+                    [p1[1], p2[1]],
+                    color=line_color,
+                    linewidth=line_width,
+                    zorder=9,
+                )
+                click_state["line_objs"].append(line)
+
+                # Store line in (slit, track) format
+                line_coords = ((p1[2], p1[3]), (p2[2], p2[3]))
+                click_state["lines"].append(line_coords)
+
+                print(f"✓ Line created: {line_coords}")
+                print(f"  Total lines: {len(click_state['lines'])}")
+
+                # Reset for next line
+                click_state["points"] = []
+
+            fig.canvas.draw()
+
+        # Connect event handler
+        cid = fig.canvas.mpl_connect("button_press_event", onclick)
+
+        # Display instructions
+        ax.set_title(
+            ax.get_title()
+            + "\n\n🖱️ Click 2 points for each line | Close window when done",
+            fontsize=10,
+        )
+
+        plt.show()
+
+        # Disconnect handler
+        fig.canvas.mpl_disconnect(cid)
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print(f"Interactive line definition complete!")
+        print(f"Created {len(click_state['lines'])} lines:")
+        for i, line in enumerate(click_state["lines"], 1):
+            print(f"  Line {i}: {line}")
+        print("=" * 60)
+
+        return click_state["lines"]
 
     def plot_georef_with_trajectory(
         self,
@@ -1945,6 +2484,993 @@ class CombinedTransectCube:
             f"✅ data_corrected ready (METHOD 3: reference-band {reference_band_index}, colors preserved)"
         )
         return self.data_corrected
+
+    def slice_tracks(self, start_track=0, end_track=None):
+        """
+        Create a new CombinedTransectCube with a subset of tracks.
+        Tracks are relative to self.track_offset.
+        """
+        if end_track is None:
+            end_track = self.data.shape[0]
+
+        # Validate
+        if not (0 <= start_track < self.data.shape[0]):
+            raise ValueError(f"start_track {start_track} out of range")
+        if not (start_track < end_track <= self.data.shape[0]):
+            raise ValueError(f"end_track {end_track} invalid")
+
+        new_cube = SimpleNamespace()
+        new_cube.data = self.data[start_track:end_track, :, :]
+        new_cube.wavelengths = self.wavelengths
+        new_cube.track_offset = self.track_offset + start_track
+        new_cube.name = f"{self.name}_tracks{start_track}-{end_track}"
+        print(
+            f"✅ Sliced cube: tracks {start_track}-{end_track}, shape {new_cube.data.shape}"
+        )
+        return new_cube
+
+    def get_file_info(self, track_index):
+        """Returns file boundary info for a given track index."""
+        for i, (start, end) in enumerate(self.file_boundaries):
+            if start <= track_index < end:
+                return {"file_number": i + 1, "start_track": start, "end_track": end}
+        return None
+
+    def plot_rgb(
+        self,
+        red_wl=654.2,
+        green_wl=560,
+        blue_wl=440.3,
+        spacing=4,
+        track_index=None,
+        slit_index=None,
+        normalize=True,
+        show_file_boundaries=True,
+        figsize=None,
+        use_corrected=False,
+        perimeter_line=None,
+        roi_pixels=None,  # Single ROI (backward compatibility)
+        roi_collection=None,  # NEW: Multiple ROIs with names
+        roi_colors=["yellow", "cyan", "magenta", "orange", "lime", "red", "blue"],
+        roi_marker_size=100,
+        roi_show_numbers=False,
+        line_colors=["red", "blue", "orange", "magenta"],
+        line_width=2,
+        line_style="-",
+        line_labels=None,
+    ):
+        """
+        Enhanced RGB plot supporting multiple named ROIs with different colors.
+
+        NEW MULTI-ROI FEATURES:
+        - roi_collection: Dict of named ROIs or 'all' to use cube.roi_collection
+        - Automatic color assignment per ROI
+        - Legend shows ROI names and pixel counts
+        """
+
+        # Original RGB setup (unchanged)
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        red_idx = np.argmin(np.abs(self.wavelengths - red_wl))
+        green_idx = np.argmin(np.abs(self.wavelengths - green_wl))
+        blue_idx = np.argmin(np.abs(self.wavelengths - blue_wl))
+
+        R = cube_data[:, :, red_idx].T.copy()
+        G = cube_data[:, :, green_idx].T.copy()
+        B = cube_data[:, :, blue_idx].T.copy()
+
+        if normalize:
+            for C in (R, G, B):
+                if C.max() != C.min():
+                    C[:] = (C - C.min()) / (C.max() - C.min())
+
+        rgb_image = np.stack([R, G, B], axis=-1)
+        n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
+
+        if figsize is None:
+            figsize = (12 * spacing, 6)
+        plt.figure(figsize=figsize)
+
+        plt.imshow(
+            rgb_image, aspect="auto", origin="lower", extent=[0, n_tracks, 0, n_slits]
+        )
+
+        # File boundaries (unchanged)
+        if show_file_boundaries:
+            for b in self.file_boundaries[1:]:
+                plt.axvline(
+                    b["start_track"],
+                    color="yellow",
+                    linestyle=":",
+                    linewidth=2,
+                    alpha=0.8,
+                    label="File boundary" if b == self.file_boundaries[1] else "",
+                )
+
+        # Cross-hairs (unchanged)
+        if track_index is not None:
+            plt.axvline(track_index, color="cyan", linestyle="--", linewidth=2)
+        if slit_index is not None:
+            plt.axhline(slit_index, color="lime", linestyle="--", linewidth=2)
+
+        # Perimeter lines (unchanged)
+        if perimeter_line is not None:
+            if isinstance(perimeter_line[0], (int, float)):
+                lines_to_plot = [perimeter_line]
+            else:
+                lines_to_plot = perimeter_line
+
+            for line_idx, line in enumerate(lines_to_plot):
+                (slit1, track1), (slit2, track2) = line
+                color = line_colors[line_idx % len(line_colors)]
+
+                if line_labels and line_idx < len(line_labels):
+                    label = line_labels[line_idx]
+                elif len(lines_to_plot) > 1:
+                    label = f"Line {line_idx + 1}"
+                else:
+                    label = "Perimeter line"
+
+                plt.plot(
+                    [track1, track2],
+                    [slit1, slit2],
+                    color=color,
+                    linewidth=line_width,
+                    linestyle=line_style,
+                    label=label,
+                )
+
+        # NEW: Handle multiple ROIs
+        if roi_collection is not None:
+            # Determine which ROIs to plot
+            if roi_collection == "all":
+                if hasattr(self, "roi_collection") and self.roi_collection:
+                    rois_to_plot = self.roi_collection
+                else:
+                    print(
+                        "⚠️  No ROI collection found. Use plot_interactive_rgb() first."
+                    )
+                    rois_to_plot = {}
+            elif isinstance(roi_collection, dict):
+                rois_to_plot = roi_collection
+            else:
+                print("❌ roi_collection must be 'all' or a dictionary")
+                rois_to_plot = {}
+
+            # Plot each ROI with different color
+            for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
+                if roi_pixels_list:
+                    # Validate coordinates
+                    valid_rois = [
+                        (slit, track)
+                        for slit, track in roi_pixels_list
+                        if 0 <= slit < n_slits and 0 <= track < n_tracks
+                    ]
+
+                    if valid_rois:
+                        roi_tracks = [track for slit, track in valid_rois]
+                        roi_slits = [slit for slit, track in valid_rois]
+
+                        # Assign color
+                        color = roi_colors[roi_idx % len(roi_colors)]
+
+                        # Plot ROI with unique color
+                        plt.scatter(
+                            roi_tracks,
+                            roi_slits,
+                            c=color,
+                            s=roi_marker_size,
+                            marker="o",
+                            edgecolors="black",
+                            linewidths=2,
+                            alpha=0.8,
+                            label=f"{roi_name} ({len(valid_rois)})",
+                        )
+
+                        # Optional: Add numbers for each ROI
+                        if roi_show_numbers:
+                            for i, (slit, track) in enumerate(valid_rois, 1):
+                                plt.text(
+                                    track,
+                                    slit + 3,
+                                    str(i),
+                                    ha="center",
+                                    va="bottom",
+                                    fontsize=8,
+                                    fontweight="bold",
+                                    color="black",
+                                    bbox=dict(
+                                        boxstyle="round,pad=0.2",
+                                        facecolor="white",
+                                        alpha=0.8,
+                                    ),
+                                )
+
+        # Backward compatibility: single ROI support
+        elif roi_pixels is not None and len(roi_pixels) > 0:
+            valid_rois = [
+                (slit, track)
+                for slit, track in roi_pixels
+                if 0 <= slit < n_slits and 0 <= track < n_tracks
+            ]
+
+            if valid_rois:
+                roi_tracks = [track for slit, track in valid_rois]
+                roi_slits = [slit for slit, track in valid_rois]
+
+                plt.scatter(
+                    roi_tracks,
+                    roi_slits,
+                    c=roi_colors[0],
+                    s=roi_marker_size,
+                    marker="o",
+                    edgecolors="black",
+                    linewidths=2,
+                    alpha=0.8,
+                    label=f"ROI Pixels ({len(valid_rois)})",
+                )
+
+        # Grid (unchanged)
+        for x in np.arange(0, n_tracks + 1, 50):
+            plt.axvline(x, color="black", linewidth=0.5, alpha=0.3)
+        for y in np.arange(0, n_slits + 1, 50):
+            plt.axhline(y, color="black", linewidth=0.5, alpha=0.3)
+
+        plt.xlabel("Track Index")
+        plt.ylabel("Slit Pixel Index")
+        title = f"RGB Composite - {self.name}\n(R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm)"
+        if use_corrected:
+            title = "Corrected " + title
+        plt.title(title)
+
+        # Smart legend display
+        has_overlays = (
+            (show_file_boundaries and len(self.file_boundaries) > 1)
+            or perimeter_line is not None
+            or roi_collection is not None
+            or (roi_pixels is not None and len(roi_pixels) > 0)
+        )
+        if has_overlays:
+            plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_line_intensity_profile(
+        self,
+        perimeter_line,
+        wavelength=None,
+        use_average=False,
+        use_corrected=False,
+        figsize=(12, 6),
+        line_colors=["red", "blue", "purple", "magenta", "pink"],
+        line_width=2,
+        moving_average_window=1,
+        show_markers=True,
+        marker_size=4,
+        line_labels=None,
+        normalize_intensities=False,  # NEW: Normalize intensity values
+        normalization_method="minmax",  # NEW: 'minmax', 'zscore', or 'mean'
+    ):
+        """
+        Plot intensity profiles with optional intensity normalization for better comparison.
+
+        NEW NORMALIZATION OPTIONS:
+        - normalize_intensities=True: Enable intensity normalization
+        - normalization_method='minmax': Scale to [0,1] range
+        - normalization_method='zscore': Z-score normalization (mean=0, std=1)
+        - normalization_method='mean': Divide by mean (relative to average)
+        """
+
+        # Handle single vs multiple lines
+        if isinstance(perimeter_line[0], (int, float)):
+            lines_to_plot = [perimeter_line]
+        else:
+            lines_to_plot = perimeter_line
+
+        # Validate lines
+        for i, line in enumerate(lines_to_plot, 1):
+            if not (isinstance(line, list) and len(line) == 2):
+                raise ValueError(f"Line {i} must be [(slit1,track1), (slit2,track2)]")
+
+        # Calculate consistent sampling length
+        line_lengths = []
+        for line in lines_to_plot:
+            (slit1, track1), (slit2, track2) = line
+            length = max(abs(track2 - track1), abs(slit2 - slit1)) + 1
+            line_lengths.append(length)
+
+        max_length = max(line_lengths)
+
+        # Get data and wavelength setup
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Wavelength selection
+        if use_average:
+            mean_wl = self.wavelengths.mean()
+            wl_idx = np.argmin(np.abs(self.wavelengths - mean_wl))
+            method = "average"
+            base_ylabel = "Average Intensity"
+        elif wavelength is not None:
+            wl_idx = np.argmin(np.abs(self.wavelengths - wavelength))
+            method = "specific"
+            base_ylabel = f"Intensity at {self.wavelengths[wl_idx]:.1f} nm"
+        else:
+            median_wl = np.median(self.wavelengths)
+            wl_idx = np.argmin(np.abs(self.wavelengths - median_wl))
+            method = "median"
+            base_ylabel = f"Intensity at {self.wavelengths[wl_idx]:.1f} nm"
+
+        # NEW: Adjust ylabel based on normalization
+        if normalize_intensities:
+            if normalization_method == "minmax":
+                ylabel = f"Normalized {base_ylabel} [0-1]"
+            elif normalization_method == "zscore":
+                ylabel = f"Z-Score {base_ylabel}"
+            elif normalization_method == "mean":
+                ylabel = f"Relative {base_ylabel}"
+            else:
+                ylabel = f"Normalized {base_ylabel}"
+        else:
+            ylabel = base_ylabel
+
+        actual_wl = self.wavelengths[wl_idx]
+
+        plt.figure(figsize=figsize)
+        all_results = []
+
+        for line_idx, line in enumerate(lines_to_plot):
+            (slit1, track1), (slit2, track2) = line
+
+            # Validate coordinates
+            for i, (s, t) in enumerate([(slit1, track1), (slit2, track2)], 1):
+                if not (0 <= s < n_slits):
+                    raise ValueError(
+                        f"Line {line_idx+1}, Point {i}: slit {s} out of range [0, {n_slits-1}]"
+                    )
+                if not (0 <= t < n_tracks):
+                    raise ValueError(
+                        f"Line {line_idx+1}, Point {i}: track {t} out of range [0, {n_tracks-1}]"
+                    )
+
+            # Generate consistent sampling points
+            track_indices = np.linspace(track1, track2, max_length, dtype=int)
+            slit_indices = np.linspace(slit1, slit2, max_length, dtype=int)
+
+            # Extract raw intensities
+            intensities = []
+            for track_idx, slit_idx in zip(track_indices, slit_indices):
+                if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
+                    intensity = cube_data[track_idx, slit_idx, wl_idx]
+                    intensities.append(intensity)
+
+            intensities = np.array(intensities)
+
+            # NEW: Apply intensity normalization
+            if normalize_intensities and len(intensities) > 0:
+                if normalization_method == "minmax":
+                    # Scale to [0, 1]
+                    if intensities.max() != intensities.min():
+                        intensities = (intensities - intensities.min()) / (
+                            intensities.max() - intensities.min()
+                        )
+                elif normalization_method == "zscore":
+                    # Z-score normalization (mean=0, std=1)
+                    if intensities.std() != 0:
+                        intensities = (
+                            intensities - intensities.mean()
+                        ) / intensities.std()
+                elif normalization_method == "mean":
+                    # Divide by mean (relative values)
+                    if intensities.mean() != 0:
+                        intensities = intensities / intensities.mean()
+
+            sample_indices = np.arange(len(intensities))
+
+            # Apply smoothing
+            if moving_average_window > 1:
+                if moving_average_window > len(intensities):
+                    moving_average_window = len(intensities)
+
+                window = np.ones(moving_average_window) / moving_average_window
+                smoothed = np.convolve(intensities, window, mode="valid")
+
+                std_devs = []
+                for i in range(len(smoothed)):
+                    window_data = intensities[i : i + moving_average_window]
+                    std_devs.append(np.std(window_data))
+                std_devs = np.array(std_devs)
+
+                half_window = moving_average_window // 2
+                plot_intensities = smoothed
+                plot_sample_indices = sample_indices[
+                    half_window : half_window + len(smoothed)
+                ]
+                has_std = True
+            else:
+                plot_intensities = intensities
+                plot_sample_indices = sample_indices
+                std_devs = None
+                has_std = False
+
+            # Styling and labels
+            color = line_colors[line_idx % len(line_colors)]
+
+            if line_labels and line_idx < len(line_labels):
+                label = line_labels[line_idx]
+            elif len(lines_to_plot) > 1:
+                label = f"Line {line_idx + 1}"
+            else:
+                label = "Smoothed" if has_std else "Raw intensity"
+
+            # Plot the line
+            marker_style = "o" if show_markers else None
+            marker_size_actual = marker_size if show_markers else 0
+
+            plt.plot(
+                plot_sample_indices,
+                plot_intensities,
+                color=color,
+                linewidth=line_width,
+                marker=marker_style,
+                markersize=marker_size_actual,
+                label=label,
+            )
+
+            # Add std dev bands
+            if has_std:
+                plt.fill_between(
+                    plot_sample_indices,
+                    plot_intensities - std_devs,
+                    plot_intensities + std_devs,
+                    color=color,
+                    alpha=0.1,
+                )
+
+            all_results.append(
+                {
+                    "line_index": line_idx + 1,
+                    "start_point": (slit1, track1),
+                    "end_point": (slit2, track2),
+                    "sample_indices": plot_sample_indices,
+                    "intensities": plot_intensities,
+                    "std_deviation": std_devs,
+                    "raw_intensities": intensities,
+                    "normalized": normalize_intensities,
+                    "normalization_method": (
+                        normalization_method if normalize_intensities else None
+                    ),
+                    "color": color,
+                }
+            )
+
+        # Plot formatting
+        plt.xlabel("Sample Index")
+        plt.ylabel(ylabel)
+
+        # Smart title with normalization info
+        if len(lines_to_plot) == 1:
+            title = f"Intensity Profile ({method} wavelength)"
+        else:
+            title = f"Multi-Line Comparison ({len(lines_to_plot)} lines, {method} wavelength)"
+
+        if normalize_intensities:
+            title += f" - {normalization_method.upper()} normalized"
+
+        if moving_average_window > 1:
+            title += f"\nSmoothed with {moving_average_window}-point moving average"
+
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+
+        if len(lines_to_plot) > 1 or has_std:
+            plt.legend()
+
+        # Updated stats
+        norm_info = (
+            f" ({normalization_method} normalized)" if normalize_intensities else ""
+        )
+        stats_text = f"Wavelength: {actual_wl:.1f} nm{norm_info} | Sample points: {max_length} | Lines: {len(lines_to_plot)}"
+        plt.figtext(0.02, 0.01, stats_text, fontsize=9, ha="left")
+
+        plt.subplots_adjust(bottom=0.15)
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            "wavelength": actual_wl,
+            "wavelength_method": method,
+            "smoothing_window": moving_average_window,
+            "number_of_lines": len(lines_to_plot),
+            "sample_points": max_length,
+            "normalized": normalize_intensities,
+            "normalization_method": (
+                normalization_method if normalize_intensities else None
+            ),
+            "lines": all_results,
+        }
+
+    def list_rois(self):
+        """Display all saved ROIs"""
+        if not hasattr(self, "roi_collection") or not self.roi_collection:
+            print("❌ No ROIs saved yet")
+            return
+
+        print(f"\n📂 ROI Collection ({len(self.roi_collection)} ROIs):")
+        print("=" * 50)
+        for i, (name, pixels) in enumerate(self.roi_collection.items(), 1):
+            slits = [s for s, t in pixels]
+            tracks = [t for s, t in pixels]
+            print(f"{i:2d}. '{name}': {len(pixels)} pixels")
+            print(f"     Slit range:  {min(slits):3d} - {max(slits):3d}")
+            print(f"     Track range: {min(tracks):3d} - {max(tracks):3d}")
+
+    def delete_roi(self, roi_name):
+        """Delete a specific ROI"""
+        if not hasattr(self, "roi_collection") or roi_name not in self.roi_collection:
+            print(f"❌ ROI '{roi_name}' not found")
+            return
+
+        pixel_count = len(self.roi_collection[roi_name])
+        del self.roi_collection[roi_name]
+        print(f"🗑️  Deleted ROI '{roi_name}' ({pixel_count} pixels)")
+
+    def export_rois(self, filename=None):
+        """Export ROIs to JSON file"""
+        if not hasattr(self, "roi_collection") or not self.roi_collection:
+            print("❌ No ROIs to export")
+            return
+
+        if filename is None:
+            filename = f"roi_collection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        export_data = {
+            "transect_name": self.name,
+            "export_date": datetime.now().isoformat(),
+            "roi_collection": self.roi_collection,
+        }
+
+        with open(filename, "w") as f:
+            json.dump(export_data, f, indent=2)
+
+        print(f"💾 Exported {len(self.roi_collection)} ROIs to {filename}")
+
+    def import_rois(self, filename):
+        """Import ROIs from JSON file"""
+        try:
+            with open(filename, "r") as f:
+                data = json.load(f)
+
+            if not hasattr(self, "roi_collection"):
+                self.roi_collection = {}
+
+            imported_rois = data["roi_collection"]
+            self.roi_collection.update(imported_rois)
+
+            print(f"📂 Imported {len(imported_rois)} ROIs from {filename}")
+
+        except Exception as e:
+            print(f"❌ Import failed: {e}")
+
+    def plot_interactive_rgb(
+        self,
+        red_wl=654.2,
+        green_wl=560,
+        blue_wl=440.3,
+        normalize=True,
+        use_corrected=False,
+        figsize=(50, 10),
+        roi_name=None,
+        load_existing=True,
+        highlight_color=[1, 0, 0, 0.8],  # Bright red with transparency
+    ):
+        """
+        Interactive RGB with pixel highlighting and right-click deletion.
+
+        CONTROLS:
+        - Left click: Add pixel (prevents duplicates)
+        - Right click: Remove pixel
+        - Close window: Save ROI
+        """
+
+        # ROI management setup
+        if not hasattr(self, "roi_collection"):
+            self.roi_collection = {}
+
+        if roi_name is None:
+            roi_name = input("Enter ROI name: ").strip()
+            if not roi_name:
+                roi_name = f"ROI_{len(self.roi_collection) + 1}"
+
+        # Load existing or start fresh
+        if load_existing and roi_name in self.roi_collection:
+            current_roi = set(self.roi_collection[roi_name])
+            print(f"📂 Loaded '{roi_name}' with {len(current_roi)} pixels")
+        else:
+            current_roi = set()
+            print(f"✨ Creating new ROI '{roi_name}'")
+
+        # RGB data preparation
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        red_idx = np.argmin(np.abs(self.wavelengths - red_wl))
+        green_idx = np.argmin(np.abs(self.wavelengths - green_wl))
+        blue_idx = np.argmin(np.abs(self.wavelengths - blue_wl))
+
+        R = cube_data[:, :, red_idx].T.copy()
+        G = cube_data[:, :, green_idx].T.copy()
+        B = cube_data[:, :, blue_idx].T.copy()
+
+        if normalize:
+            for C in (R, G, B):
+                if C.max() != C.min():
+                    C[:] = (C - C.min()) / (C.max() - C.min())
+
+        rgb_image = np.stack([R, G, B], axis=-1)
+        n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
+
+        # Create plot with overlay
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(
+            rgb_image, aspect="auto", origin="lower", extent=[0, n_tracks, 0, n_slits]
+        )
+
+        # Highlight overlay layer
+        highlight_overlay = np.zeros((n_slits, n_tracks, 4), dtype=np.float32)
+        overlay_im = ax.imshow(
+            highlight_overlay,
+            aspect="auto",
+            origin="lower",
+            extent=[0, n_tracks, 0, n_slits],
+            interpolation="nearest",
+        )
+
+        def update_highlights():
+            """Refresh pixel highlights"""
+            highlight_overlay[:, :, :] = 0
+
+            for slit_idx, track_idx in current_roi:
+                if 0 <= slit_idx < n_slits and 0 <= track_idx < n_tracks:
+                    highlight_overlay[slit_idx, track_idx, :] = highlight_color
+
+            overlay_im.set_array(highlight_overlay)
+            ax.set_title(f"{roi_name}: {len(current_roi)} pixels selected")
+            fig.canvas.draw_idle()
+
+        # Initialize highlights
+        update_highlights()
+
+        def on_click(event):
+            """Handle both adding and removing pixels"""
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return
+
+            # Get pixel coordinates
+            track_idx = int(np.round(event.xdata))
+            slit_idx = int(np.round(event.ydata))
+
+            # Validate bounds
+            if not (0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits):
+                print("⚠️ Click outside valid area")
+                return
+
+            pixel = (slit_idx, track_idx)
+
+            if event.button == 1:  # Left click - ADD pixel
+                if pixel in current_roi:
+                    print(
+                        f"📌 Pixel already selected: (slit={slit_idx}, track={track_idx})"
+                    )
+                else:
+                    current_roi.add(pixel)
+                    print(
+                        f"✅ Added pixel: (slit={slit_idx}, track={track_idx}) - Total: {len(current_roi)}"
+                    )
+
+            elif event.button == 3:  # Right click - REMOVE pixel
+                if pixel in current_roi:
+                    current_roi.remove(pixel)
+                    print(
+                        f"❌ Removed pixel: (slit={slit_idx}, track={track_idx}) - Total: {len(current_roi)}"
+                    )
+                else:
+                    print(f"⚠️ Pixel not selected: (slit={slit_idx}, track={track_idx})")
+
+            # Update display
+            update_highlights()
+
+        def on_close(event):
+            """Save ROI collection"""
+            if current_roi:
+                self.roi_collection[roi_name] = list(current_roi)
+                print(f"💾 Saved ROI '{roi_name}' with {len(current_roi)} pixels")
+            else:
+                print(f"🗑️ No pixels in '{roi_name}'")
+
+        # Event handlers
+        fig.canvas.mpl_connect("button_press_event", on_click)
+        fig.canvas.mpl_connect("close_event", on_close)
+
+        # Grid for better pixel visibility
+        for x in range(0, n_tracks + 1, 50):
+            ax.axvline(x, color="black", linewidth=0.5, alpha=0.2)
+        for y in range(0, n_slits + 1, 50):
+            ax.axhline(y, color="black", linewidth=0.5, alpha=0.2)
+
+        ax.set_xlabel("Track Index")
+        ax.set_ylabel("Slit Pixel Index")
+
+        # Updated instructions
+        instructions = f"""
+        🖱️ PIXEL EDITOR: '{roi_name}'
+        • Left click: Add pixel (red highlight)
+        • Right click: Remove pixel
+        • Close window: Save ROI
+        """
+        fig.text(
+            0.02,
+            0.98,
+            instructions,
+            fontsize=10,
+            ha="left",
+            va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.8),
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+        return list(current_roi)
+
+    def plot_spectrum(
+        self,
+        track_index=None,
+        slit_index=None,
+        roi_pixels=None,
+        roi_name=None,
+        roi_names=None,
+        ylabel="Intensity",  # Will update dynamically
+        use_corrected=False,
+        wavelength_range=None,
+        wavelength_smoothing=1,
+        figsize=(12, 6),
+        colors=[
+            "#FF0000",
+            "#0000FF",
+            "#00FFFF",
+            "#FF00FF",
+            "#800080",
+            "#A52A2A",
+            "#000000",
+            "#FFFF00",
+            "#00FF00",
+            "#B8860B",
+        ],
+        use_inline_labels=True,
+        normalize=False,
+        show_std=True,  # NEW: Control standard deviation bands
+    ):
+        """Enhanced spectrum plotting with optional normalization, inline labels, and std control."""
+
+        cube = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+        data_label = "Corrected" if use_corrected else "Raw"
+
+        if cube is None:
+            print("❌ No data loaded.")
+            return
+
+        # ROI handling logic (unchanged)
+        is_roi_analysis = False
+        rois_to_plot = {}
+
+        if roi_names is not None:
+            if not hasattr(self, "roi_collection"):
+                print("❌ No ROI collection found")
+                return
+
+            if roi_names == "all":
+                rois_to_plot = self.roi_collection.copy()
+            elif isinstance(roi_names, list):
+                for name in roi_names:
+                    if name in self.roi_collection:
+                        rois_to_plot[name] = self.roi_collection[name]
+            is_roi_analysis = True
+
+        elif roi_name is not None:
+            if hasattr(self, "roi_collection") and roi_name in self.roi_collection:
+                rois_to_plot[roi_name] = self.roi_collection[roi_name]
+                is_roi_analysis = True
+            else:
+                print(f"❌ ROI '{roi_name}' not found")
+                return
+
+        elif roi_pixels is not None:
+            rois_to_plot["ROI"] = roi_pixels
+            is_roi_analysis = True
+
+        elif track_index is not None and slit_index is not None:
+            pass
+        else:
+            print("❌ Must specify pixel coordinates or ROI")
+            return
+
+        # Wavelength filtering
+        wavelengths = self.wavelengths
+        if wavelength_range is not None:
+            wl_start, wl_end = wavelength_range
+            wl_mask = (wavelengths >= wl_start) & (wavelengths <= wl_end)
+            wavelengths = wavelengths[wl_mask]
+            range_info = f" ({wl_start}-{wl_end}nm)"
+        else:
+            wl_mask = slice(None)
+            range_info = ""
+
+        def smooth_spectrum(spectrum, window_size):
+            if window_size <= 1:
+                return spectrum
+            if window_size > len(spectrum):
+                window_size = len(spectrum)
+            window = np.ones(window_size) / window_size
+            return np.convolve(spectrum, window, mode="valid")
+
+        # Normalization function (only applies if normalize=True)
+        def normalize_spectrum(spectrum):
+            """Normalize spectrum by dividing by its mean (only if normalize=True)"""
+            if normalize and len(spectrum) > 0:
+                spectrum_mean = np.mean(spectrum)
+                if spectrum_mean != 0:
+                    return spectrum / spectrum_mean
+            return spectrum
+
+        # Dynamic y-label based on normalization
+        if ylabel == "Intensity":  # Only change default label
+            ylabel = "Normalized Intensity" if normalize else "Intensity"
+
+        plt.figure(figsize=figsize)
+
+        if is_roi_analysis:
+            for i, (roi_name_key, roi_pixels_list) in enumerate(rois_to_plot.items()):
+                valid_spectra = []
+
+                for slit_idx, track_idx in roi_pixels_list:
+                    rel_track = track_idx - self.track_offset
+                    if 0 <= rel_track < cube.shape[0] and 0 <= slit_idx < cube.shape[1]:
+                        spectrum = cube[rel_track, slit_idx, :][wl_mask]
+                        valid_spectra.append(spectrum)
+
+                if valid_spectra:
+                    spectra_array = np.array(valid_spectra)
+                    avg_spectrum = np.mean(spectra_array, axis=0)
+                    std_spectrum = np.std(spectra_array, axis=0)
+
+                    # Apply smoothing first
+                    if wavelength_smoothing > 1:
+                        smoothed_avg = smooth_spectrum(
+                            avg_spectrum, wavelength_smoothing
+                        )
+                        smoothed_std = smooth_spectrum(
+                            std_spectrum, wavelength_smoothing
+                        )
+                        half_window = wavelength_smoothing // 2
+                        plot_wavelengths = wavelengths[
+                            half_window : half_window + len(smoothed_avg)
+                        ]
+                        plot_avg = smoothed_avg
+                        plot_std = smoothed_std
+                    else:
+                        plot_wavelengths = wavelengths
+                        plot_avg = avg_spectrum
+                        plot_std = std_spectrum
+
+                    # Apply normalization (only if normalize=True)
+                    plot_avg = normalize_spectrum(plot_avg)
+                    if show_std:  # Only normalize std if we're going to show it
+                        plot_std = normalize_spectrum(plot_std)
+
+                    color = colors[i % len(colors)]
+
+                    # Always plot the main line
+                    plt.plot(plot_wavelengths, plot_avg, color=color, linewidth=2)
+
+                    # NEW: Only show std bands if show_std=True
+                    if show_std:
+                        plt.fill_between(
+                            plot_wavelengths,
+                            plot_avg - plot_std,
+                            plot_avg + plot_std,
+                            color=color,
+                            alpha=0.15,
+                        )
+
+                    if use_inline_labels:
+                        label_x = plot_wavelengths[-1] * 0.95
+                        label_y = plot_avg[-10:].mean()
+
+                        plt.text(
+                            label_x,
+                            label_y,
+                            roi_name_key,
+                            color=color,
+                            fontweight="bold",
+                            fontsize=10,
+                            ha="right",
+                            va="center",
+                            bbox=dict(
+                                boxstyle="round,pad=0.3",
+                                facecolor="white",
+                                alpha=0.8,
+                                edgecolor=color,
+                            ),
+                        )
+
+            title = f"{data_label} ROI Spectra{range_info}"
+            if normalize:
+                title += " (Normalized)"
+            if wavelength_smoothing > 1:
+                title += f" (λ-smooth: {wavelength_smoothing})"
+            title += f"\n({self.name})"
+
+        else:
+            # Single pixel mode
+            rel_track = track_index - self.track_offset
+            spectrum = cube[rel_track, slit_index, :][wl_mask]
+
+            if wavelength_smoothing > 1:
+                smoothed_spectrum = smooth_spectrum(spectrum, wavelength_smoothing)
+                half_window = wavelength_smoothing // 2
+                plot_wavelengths = wavelengths[
+                    half_window : half_window + len(smoothed_spectrum)
+                ]
+                plot_spectrum = smoothed_spectrum
+            else:
+                plot_wavelengths = wavelengths
+                plot_spectrum = spectrum
+
+            # Apply normalization (only if normalize=True)
+            plot_spectrum = normalize_spectrum(plot_spectrum)
+
+            plt.plot(plot_wavelengths, plot_spectrum, color=colors[0], linewidth=2)
+
+            title = f"{data_label} Spectrum"
+            if normalize:
+                title += " (Normalized)"
+            if wavelength_smoothing > 1:
+                title += f" (λ-smooth: {wavelength_smoothing})"
+
+        plt.xlabel("Wavelength (nm)")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+
+        # Force exact wavelength range with no padding
+        if wavelength_range is not None:
+            ax = plt.gca()
+            ax.set_xlim(wavelength_range[0], wavelength_range[1])
+            ax.margins(x=0)
+            ax.autoscale(enable=False, axis="x")
+
+        if not use_inline_labels or not is_roi_analysis:
+            plt.legend()
+
+        plt.tight_layout()
+        plt.show()
 
 
 # ------------------------- convenience -------------------------
