@@ -408,6 +408,9 @@ class CombinedTransectCube:
             None  # Corrected version if illumination correction applied
         )
 
+        # NEW: Persistent color mapping for ROIs (shared across plot functions)
+        self.roi_color_map = {}  # Will auto-populate when plotting ROIs
+
         self._build_combined()
         self._load_full_cube()  # Load the full hyperspectral data
 
@@ -660,6 +663,68 @@ class CombinedTransectCube:
         B = data_cube[:, :, idxB]
 
         return R, G, B
+
+    def _get_roi_color(self, roi_name, default_colors, custom_color_map=None):
+        """
+        Get consistent color for an ROI across all plots.
+        Uses hardcoded colors for specific ROIs, then custom_color_map, then persistent color map, then assigns new color.
+
+        Parameters:
+        -----------
+        roi_name : str
+            Name of the ROI
+        default_colors : list
+            List of default colors to cycle through
+        custom_color_map : dict, optional
+            Custom color mapping for this specific plot
+
+        Returns:
+        --------
+        str : Color code for this ROI
+        """
+        # Hardcoded colors for specific ROIs (always used unless overridden by custom_color_map)
+        HARDCODED_ROI_COLORS = {
+            "single bomb ring": "#1E90FF",  # dodger blue
+            "single bomb inside": "#00FFFF",  # neon cyan blue
+            "double bomb 1": "#FF8C00",  # dark orange
+            "double bomb 2": "#FFD700",  # gold
+            "tripple bomb 1": "#800080",  # purple
+            "tripple bomb 2": "#8A2BE2",  # violet
+            "tripple bomb 3": "#FF00FF",  # bright magenta
+            "all bombs": "#1E90FF",  # blue (group class)
+            "dark bomb": "#000000",  # black
+            "dark spots": "#000000",  # pure black
+            "dark sediment": "#555555",  # medium-dark gray
+            "sediment": "#8B4513",  # brown
+        }
+
+        # Priority 1: Custom color map for this specific plot (allows override)
+        if custom_color_map and roi_name in custom_color_map:
+            return custom_color_map[roi_name]
+
+        # Priority 2: Hardcoded colors for known ROIs
+        if roi_name in HARDCODED_ROI_COLORS:
+            # Save to persistent map for consistency
+            self.roi_color_map[roi_name] = HARDCODED_ROI_COLORS[roi_name]
+            return HARDCODED_ROI_COLORS[roi_name]
+
+        # Priority 3: Persistent color map (already assigned)
+        if roi_name in self.roi_color_map:
+            return self.roi_color_map[roi_name]
+
+        # Priority 4: Assign new color and save it
+        # Find next available color that's not already used
+        used_colors = set(self.roi_color_map.values())
+        for color in default_colors:
+            if color not in used_colors:
+                self.roi_color_map[roi_name] = color
+                return color
+
+        # If all colors used, cycle through again
+        idx = len(self.roi_color_map) % len(default_colors)
+        color = default_colors[idx]
+        self.roi_color_map[roi_name] = color
+        return color
 
     def plot_georef(
         self,
@@ -1036,6 +1101,29 @@ class CombinedTransectCube:
 
         # ========== NEW: ROI collection (from plot_rgb) ==========
         if roi_collection is not None:
+            # Helper function to sort ROIs in display order
+            def sort_rois_by_category(roi_dict):
+                """Sort ROIs: single bombs → double → triple → dark features → sediment"""
+                order_keywords = [
+                    ["single bomb"],
+                    ["double bomb"],
+                    ["tripple bomb"],
+                    ["dark"],
+                    ["sediment"],
+                ]
+
+                def get_sort_key(roi_name):
+                    roi_lower = roi_name.lower()
+                    for idx, keywords in enumerate(order_keywords):
+                        if any(kw in roi_lower for kw in keywords):
+                            return (idx, roi_name)
+                    return (len(order_keywords), roi_name)
+
+                sorted_items = sorted(
+                    roi_dict.items(), key=lambda x: get_sort_key(x[0])
+                )
+                return dict(sorted_items)
+
             # Determine which ROIs to plot
             if roi_collection == "all":
                 if hasattr(self, "roi_collection") and self.roi_collection:
@@ -1046,12 +1134,29 @@ class CombinedTransectCube:
                             "⚠️  No ROI collection found. Use plot_interactive_rgb() first."
                         )
                     rois_to_plot = {}
+            elif isinstance(roi_collection, list):
+                # NEW: Support list of ROI names (like plot_spectrum)
+                if hasattr(self, "roi_collection") and self.roi_collection:
+                    rois_to_plot = {
+                        name: self.roi_collection[name]
+                        for name in roi_collection
+                        if name in self.roi_collection
+                    }
+                else:
+                    if not quiet:
+                        print("⚠️  No ROI collection found.")
+                    rois_to_plot = {}
             elif isinstance(roi_collection, dict):
                 rois_to_plot = roi_collection
             else:
                 if not quiet:
-                    print("❌ roi_collection must be 'all' or a dictionary")
+                    print(
+                        "❌ roi_collection must be 'all', a list of ROI names, or a dictionary"
+                    )
                 rois_to_plot = {}
+
+            # Sort ROIs for consistent legend order
+            rois_to_plot = sort_rois_by_category(rois_to_plot)
 
             # Plot each ROI with different color
             for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
@@ -1070,11 +1175,8 @@ class CombinedTransectCube:
                             roi_y_coords.append(Yp[t, slit])
 
                     if roi_x_coords:
-                        # Assign color: use color_map if provided, otherwise use default list
-                        if roi_color_map and roi_name in roi_color_map:
-                            color = roi_color_map[roi_name]
-                        else:
-                            color = roi_colors[roi_idx % len(roi_colors)]
+                        # NEW: Get consistent color across all plots
+                        color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
 
                         # Plot ROI
                         ax.scatter(
@@ -2990,6 +3092,29 @@ class CombinedTransectCube:
 
         # NEW: Handle multiple ROIs
         if roi_collection is not None:
+            # Helper function to sort ROIs in display order
+            def sort_rois_by_category(roi_dict):
+                """Sort ROIs: single bombs → double → triple → dark features → sediment"""
+                order_keywords = [
+                    ["single bomb"],
+                    ["double bomb"],
+                    ["tripple bomb"],
+                    ["dark"],
+                    ["sediment"],
+                ]
+
+                def get_sort_key(roi_name):
+                    roi_lower = roi_name.lower()
+                    for idx, keywords in enumerate(order_keywords):
+                        if any(kw in roi_lower for kw in keywords):
+                            return (idx, roi_name)
+                    return (len(order_keywords), roi_name)
+
+                sorted_items = sorted(
+                    roi_dict.items(), key=lambda x: get_sort_key(x[0])
+                )
+                return dict(sorted_items)
+
             # Determine which ROIs to plot
             if roi_collection == "all":
                 if hasattr(self, "roi_collection") and self.roi_collection:
@@ -2999,11 +3124,27 @@ class CombinedTransectCube:
                         "⚠️  No ROI collection found. Use plot_interactive_rgb() first."
                     )
                     rois_to_plot = {}
+            elif isinstance(roi_collection, list):
+                # NEW: Support list of ROI names (like plot_spectrum)
+                if hasattr(self, "roi_collection") and self.roi_collection:
+                    rois_to_plot = {
+                        name: self.roi_collection[name]
+                        for name in roi_collection
+                        if name in self.roi_collection
+                    }
+                else:
+                    print("⚠️  No ROI collection found.")
+                    rois_to_plot = {}
             elif isinstance(roi_collection, dict):
                 rois_to_plot = roi_collection
             else:
-                print("❌ roi_collection must be 'all' or a dictionary")
+                print(
+                    "❌ roi_collection must be 'all', a list of ROI names, or a dictionary"
+                )
                 rois_to_plot = {}
+
+            # Sort ROIs for consistent legend order
+            rois_to_plot = sort_rois_by_category(rois_to_plot)
 
             # Plot each ROI with different color
             for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
@@ -3019,11 +3160,8 @@ class CombinedTransectCube:
                         roi_tracks = [track for slit, track in valid_rois]
                         roi_slits = [slit for slit, track in valid_rois]
 
-                        # Assign color: use color_map if provided, otherwise use default list
-                        if roi_color_map and roi_name in roi_color_map:
-                            color = roi_color_map[roi_name]
-                        else:
-                            color = roi_colors[roi_idx % len(roi_colors)]
+                        # NEW: Get consistent color across all plots
+                        color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
 
                         # Plot ROI with unique color
                         plt.scatter(
@@ -3693,6 +3831,17 @@ class CombinedTransectCube:
         del self.roi_collection[roi_name]
         print(f"🗑️  Deleted ROI '{roi_name}' ({pixel_count} pixels)")
 
+    def _ensure_roi_tuples(self):
+        """
+        Internal helper: Ensure all ROI pixels are stored as tuples, not lists.
+        This fixes issues from importing JSON where lists get loaded instead of tuples.
+        """
+        for roi_name, pixels in self.roi_collection.items():
+            # Convert any lists to tuples
+            self.roi_collection[roi_name] = set(
+                tuple(pixel) if isinstance(pixel, list) else pixel for pixel in pixels
+            )
+
     def export_rois(self, filename=None):
         """Export ROIs to JSON file"""
         if not hasattr(self, "roi_collection") or not self.roi_collection:
@@ -3701,6 +3850,9 @@ class CombinedTransectCube:
 
         if filename is None:
             filename = f"roi_collection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        # Ensure all pixels are tuples (fixes any lingering list objects)
+        self._ensure_roi_tuples()
 
         # Convert sets to lists for JSON serialization
         roi_collection_serializable = {
@@ -3713,10 +3865,13 @@ class CombinedTransectCube:
             "roi_collection": roi_collection_serializable,
         }
 
-        with open(filename, "w") as f:
-            json.dump(export_data, f, indent=2)
-
-        print(f"💾 Exported {len(self.roi_collection)} ROIs to {filename}")
+        try:
+            with open(filename, "w") as f:
+                json.dump(export_data, f, indent=2)
+            print(f"💾 Exported {len(self.roi_collection)} ROIs to {filename}")
+        except Exception as e:
+            print(f"❌ Export failed: {e}")
+            print(f"💡 This usually means ROI data is corrupted. Try reimporting ROIs.")
 
     def import_rois(self, filename):
         """Import ROIs from JSON file"""
@@ -3760,6 +3915,9 @@ class CombinedTransectCube:
         --------
         cube.combine_rois(roi_names_to_combine=["sed1", "sed2", "sed3"], new_roi_name="all_sediment")
         """
+        # Ensure all ROIs have tuples (not lists)
+        self._ensure_roi_tuples()
+
         combined_pixels = set()
 
         for roi_name in roi_names_to_combine:
@@ -4025,10 +4183,34 @@ class CombinedTransectCube:
         ],
         color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
         use_inline_labels=True,
-        normalize=False,
+        normalize=False,  # DEPRECATED: Use normalize_method instead (kept for backward compatibility)
+        normalize_method=None,  # NEW: Advanced normalization options
         show_std=True,  # NEW: Control standard deviation bands
+        interpolate_wavelengths=None,  # NEW: List of wavelength indices to interpolate (e.g., [104] for 560nm dip)
+        legend_loc="best",  # NEW: Legend location ('best', 'upper right', 'outside', etc., or None to hide)
     ):
-        """Enhanced spectrum plotting with optional normalization, inline labels, and std control."""
+        """Enhanced spectrum plotting with optional normalization, inline labels, std control, wavelength interpolation, and legend placement.
+
+        Parameters:
+        -----------
+        normalize : bool, optional (DEPRECATED)
+            If True, divides by mean (kept for backward compatibility). Use normalize_method instead.
+
+        normalize_method : str or None, optional
+            Advanced normalization method for spectral offset removal:
+            - None or False: No normalization (default, shows raw/corrected data)
+            - "mean": Divide by mean (simple scaling, preserves amplitude differences)
+            - "mean_center": Subtract mean (removes DC offset, preserves shape) ⭐ Recommended for offset removal
+            - "snv": Standard Normal Variate (removes offset + scale, preserves shape) ⭐ Recommended for spectral comparison
+            - "msc": Multiplicative Scatter Correction (physically meaningful, uses mean spectrum as reference)
+            - "minmax": Min-max scaling to [0,1] (NOT recommended for spectral shape comparison)
+            - "l2": L2 vector normalization (useful for clustering/PCA)
+
+        interpolate_wavelengths : list of int, optional
+            List of wavelength indices to interpolate (replace with linear interpolation from neighbors).
+            Example: [104] will interpolate wavelength 104 (~560nm) from wavelengths 103 and 105.
+            The function will print which wavelengths (nm) are being interpolated.
+        """
 
         cube = (
             self.data_corrected
@@ -4040,6 +4222,33 @@ class CombinedTransectCube:
         if cube is None:
             print("❌ No data loaded.")
             return
+
+        # Helper function to sort ROIs in display order
+        def sort_rois_by_category(roi_dict):
+            """Sort ROIs: single bombs → double → triple → dark features → sediment"""
+            order_keywords = [
+                # Single bombs first
+                ["single bomb"],
+                # Double bombs second
+                ["double bomb"],
+                # Triple bombs third
+                ["tripple bomb"],
+                # Dark features fourth
+                ["dark"],
+                # Sediment last
+                ["sediment"],
+            ]
+
+            def get_sort_key(roi_name):
+                """Return (category_index, roi_name) for sorting"""
+                roi_lower = roi_name.lower()
+                for idx, keywords in enumerate(order_keywords):
+                    if any(kw in roi_lower for kw in keywords):
+                        return (idx, roi_name)
+                return (len(order_keywords), roi_name)  # Unknown ROIs go last
+
+            sorted_items = sorted(roi_dict.items(), key=lambda x: get_sort_key(x[0]))
+            return dict(sorted_items)
 
         # ROI handling logic (unchanged)
         is_roi_analysis = False
@@ -4056,6 +4265,8 @@ class CombinedTransectCube:
                 for name in roi_names:
                     if name in self.roi_collection:
                         rois_to_plot[name] = self.roi_collection[name]
+            # Sort ROIs for consistent legend order
+            rois_to_plot = sort_rois_by_category(rois_to_plot)
             is_roi_analysis = True
 
         elif roi_name is not None:
@@ -4087,6 +4298,56 @@ class CombinedTransectCube:
             wl_mask = slice(None)
             range_info = ""
 
+        # NEW: Wavelength interpolation setup
+        # Print which wavelengths will be interpolated
+        if interpolate_wavelengths is not None and len(interpolate_wavelengths) > 0:
+            print(f"\n🔧 Interpolating {len(interpolate_wavelengths)} wavelength(s):")
+            for wl_idx in interpolate_wavelengths:
+                if 0 <= wl_idx < len(self.wavelengths):
+                    wl_nm = self.wavelengths[wl_idx]
+                    print(f"   • Index {wl_idx}: {wl_nm:.2f} nm")
+                else:
+                    print(
+                        f"   ⚠️  Index {wl_idx} out of range (0-{len(self.wavelengths)-1})"
+                    )
+            print()
+
+        def interpolate_bad_wavelengths(spectrum_2d, bad_indices):
+            """
+            Interpolate specific wavelengths using linear interpolation from neighbors.
+
+            Parameters:
+            -----------
+            spectrum_2d : np.ndarray
+                2D array of shape (n_pixels, n_wavelengths) or 1D array (n_wavelengths,)
+            bad_indices : list of int
+                Wavelength indices to interpolate
+
+            Returns:
+            --------
+            np.ndarray : Spectrum with interpolated values
+            """
+            if bad_indices is None or len(bad_indices) == 0:
+                return spectrum_2d
+
+            spectrum_2d = np.array(spectrum_2d)
+            is_1d = spectrum_2d.ndim == 1
+            if is_1d:
+                spectrum_2d = spectrum_2d[
+                    np.newaxis, :
+                ]  # Make 2D for uniform processing
+
+            result = spectrum_2d.copy()
+
+            for idx in bad_indices:
+                if idx <= 0 or idx >= spectrum_2d.shape[1] - 1:
+                    continue  # Can't interpolate edge wavelengths
+
+                # Linear interpolation from neighbors
+                result[:, idx] = (result[:, idx - 1] + result[:, idx + 1]) / 2.0
+
+            return result[0] if is_1d else result
+
         def smooth_spectrum(spectrum, window_size):
             if window_size <= 1:
                 return spectrum
@@ -4101,18 +4362,133 @@ class CombinedTransectCube:
             ).mean()
             return smoothed.values
 
-        # Normalization function (only applies if normalize=True)
-        def normalize_spectrum(spectrum):
-            """Normalize spectrum by dividing by its mean (only if normalize=True)"""
-            if normalize and len(spectrum) > 0:
+        # Determine which normalization method to use
+        # Handle backward compatibility: normalize=True maps to "mean"
+        if normalize and normalize_method is None:
+            active_normalization = "mean"
+        elif normalize_method:
+            active_normalization = normalize_method
+        else:
+            active_normalization = None
+
+        # Normalization function with multiple methods
+        def normalize_spectrum(spectrum, method=None):
+            """
+            Apply normalization to spectrum using specified method.
+
+            Parameters:
+            -----------
+            spectrum : np.ndarray
+                1D spectrum array
+            method : str or None
+                Normalization method to apply
+
+            Returns:
+            --------
+            np.ndarray : Normalized spectrum
+            """
+            if method is None or len(spectrum) == 0:
+                return spectrum
+
+            spectrum = np.array(spectrum, dtype=float)
+
+            if method == "mean":
+                # Simple mean normalization (divide by mean)
                 spectrum_mean = np.mean(spectrum)
                 if spectrum_mean != 0:
                     return spectrum / spectrum_mean
+                return spectrum
+
+            elif method == "mean_center":
+                # Mean centering (subtract mean) - removes DC offset
+                return spectrum - np.mean(spectrum)
+
+            elif method == "snv":
+                # Standard Normal Variate - removes offset and scale
+                spectrum_mean = np.mean(spectrum)
+                spectrum_std = np.std(spectrum)
+                if spectrum_std > 0:
+                    return (spectrum - spectrum_mean) / spectrum_std
+                return spectrum - spectrum_mean
+
+            elif method == "minmax":
+                # Min-max scaling to [0, 1]
+                spectrum_min = np.min(spectrum)
+                spectrum_max = np.max(spectrum)
+                if spectrum_max > spectrum_min:
+                    return (spectrum - spectrum_min) / (spectrum_max - spectrum_min)
+                return spectrum
+
+            elif method == "l2":
+                # L2 normalization (vector length = 1)
+                norm = np.linalg.norm(spectrum)
+                if norm > 0:
+                    return spectrum / norm
+                return spectrum
+
+            else:
+                print(f"⚠️  Unknown normalization method '{method}', using raw spectrum")
+                return spectrum
+
+        # MSC-specific normalization function (requires reference spectrum)
+        def normalize_spectrum_msc(spectrum, reference):
+            """
+            Multiplicative Scatter Correction.
+            Models each spectrum as: spectrum = a + b * reference
+            Then corrects as: corrected = (spectrum - a) / b
+            """
+            if reference is None or len(spectrum) != len(reference):
+                return spectrum
+
+            # Fit linear model: spectrum = a + b * reference
+            coeffs = np.polyfit(reference, spectrum, 1)
+            b, a = coeffs[0], coeffs[1]  # slope and intercept
+
+            if abs(b) > 1e-10:  # Avoid division by zero
+                return (spectrum - a) / b
             return spectrum
+
+        # MSC requires reference spectrum, compute it once if needed
+        reference_spectrum_msc = None
+        if active_normalization == "msc" and is_roi_analysis:
+            # Compute mean spectrum across all ROIs as reference
+            print("📊 Computing reference spectrum for MSC normalization...")
+            all_spectra_for_ref = []
+            for roi_name_key, roi_pixels_list in rois_to_plot.items():
+                for slit_idx, track_idx in roi_pixels_list:
+                    track_offset = getattr(self, "track_offset", 0)
+                    rel_track = track_idx - track_offset
+                    if 0 <= rel_track < cube.shape[0] and 0 <= slit_idx < cube.shape[1]:
+                        spectrum = cube[rel_track, slit_idx, :]
+                        # Apply interpolation if specified
+                        if interpolate_wavelengths:
+                            spectrum = interpolate_bad_wavelengths(
+                                spectrum[np.newaxis, :], interpolate_wavelengths
+                            )[0]
+                        # Apply wavelength filtering
+                        spectrum = spectrum[wl_mask]
+                        all_spectra_for_ref.append(spectrum)
+
+            if all_spectra_for_ref:
+                reference_spectrum_msc = np.mean(all_spectra_for_ref, axis=0)
+                print(
+                    f"   ✓ Reference computed from {len(all_spectra_for_ref)} spectra"
+                )
 
         # Dynamic y-label based on normalization
         if ylabel == "Intensity":  # Only change default label
-            ylabel = "Normalized Intensity" if normalize else "Intensity"
+            if active_normalization:
+                label_map = {
+                    "mean": "Mean-Normalized Intensity",
+                    "mean_center": "Mean-Centered Intensity",
+                    "snv": "SNV-Normalized Intensity",
+                    "msc": "MSC-Corrected Intensity",
+                    "minmax": "Min-Max Scaled Intensity",
+                    "l2": "L2-Normalized Intensity",
+                }
+                ylabel = label_map.get(active_normalization, "Normalized Intensity")
+            else:
+                ylabel = "Intensity"
 
         plt.figure(figsize=figsize)
 
@@ -4125,11 +4501,20 @@ class CombinedTransectCube:
                     track_offset = getattr(self, "track_offset", 0)
                     rel_track = track_idx - track_offset
                     if 0 <= rel_track < cube.shape[0] and 0 <= slit_idx < cube.shape[1]:
-                        spectrum = cube[rel_track, slit_idx, :][wl_mask]
+                        # Get FULL spectrum first (before wavelength filtering)
+                        spectrum = cube[rel_track, slit_idx, :]
                         valid_spectra.append(spectrum)
 
                 if valid_spectra:
                     spectra_array = np.array(valid_spectra)
+
+                    # NEW: Apply interpolation to remove bad wavelengths (BEFORE wavelength filtering!)
+                    spectra_array = interpolate_bad_wavelengths(
+                        spectra_array, interpolate_wavelengths
+                    )
+
+                    # NOW apply wavelength filtering
+                    spectra_array = spectra_array[:, wl_mask]
                     avg_spectrum = np.mean(spectra_array, axis=0)
                     std_spectrum = np.std(spectra_array, axis=0)
 
@@ -4150,19 +4535,36 @@ class CombinedTransectCube:
                         plot_avg = avg_spectrum
                         plot_std = std_spectrum
 
-                    # Apply normalization (only if normalize=True)
-                    plot_avg = normalize_spectrum(plot_avg)
-                    if show_std:  # Only normalize std if we're going to show it
-                        plot_std = normalize_spectrum(plot_std)
-
-                    # Assign color: use color_map if provided, otherwise use default list
-                    if color_map and roi_name_key in color_map:
-                        color = color_map[roi_name_key]
+                    # Apply normalization
+                    if (
+                        active_normalization == "msc"
+                        and reference_spectrum_msc is not None
+                    ):
+                        plot_avg = normalize_spectrum_msc(
+                            plot_avg, reference_spectrum_msc
+                        )
+                        if show_std:
+                            plot_std = normalize_spectrum_msc(
+                                plot_std, reference_spectrum_msc
+                            )
                     else:
-                        color = colors[i % len(colors)]
+                        plot_avg = normalize_spectrum(plot_avg, active_normalization)
+                        if show_std:
+                            plot_std = normalize_spectrum(
+                                plot_std, active_normalization
+                            )
 
-                    # Always plot the main line
-                    plt.plot(plot_wavelengths, plot_avg, color=color, linewidth=2)
+                    # NEW: Get consistent color across all plots
+                    color = self._get_roi_color(roi_name_key, colors, color_map)
+
+                    # Always plot the main line (with label for legend)
+                    plt.plot(
+                        plot_wavelengths,
+                        plot_avg,
+                        color=color,
+                        linewidth=2,
+                        label=roi_name_key,
+                    )
 
                     # NEW: Only show std bands if show_std=True
                     if show_std:
@@ -4196,8 +4598,8 @@ class CombinedTransectCube:
                         )
 
             title = f"{data_label} ROI Spectra{range_info}"
-            if normalize:
-                title += " (Normalized)"
+            if active_normalization:
+                title += f" ({active_normalization.upper()})"
             if wavelength_smoothing > 1:
                 title += f" (λ-smooth: {wavelength_smoothing})"
             title += f"\n({self.name})"
@@ -4206,7 +4608,14 @@ class CombinedTransectCube:
             # Single pixel mode
             track_offset = getattr(self, "track_offset", 0)
             rel_track = track_index - track_offset
-            spectrum = cube[rel_track, slit_index, :][wl_mask]
+            # Get FULL spectrum first (before wavelength filtering)
+            spectrum = cube[rel_track, slit_index, :]
+
+            # NEW: Apply interpolation to remove bad wavelengths (BEFORE wavelength filtering!)
+            spectrum = interpolate_bad_wavelengths(spectrum, interpolate_wavelengths)
+
+            # NOW apply wavelength filtering
+            spectrum = spectrum[wl_mask]
 
             if wavelength_smoothing > 1:
                 smoothed_spectrum = smooth_spectrum(spectrum, wavelength_smoothing)
@@ -4217,14 +4626,20 @@ class CombinedTransectCube:
                 plot_wavelengths = wavelengths
                 plot_spectrum = spectrum
 
-            # Apply normalization (only if normalize=True)
-            plot_spectrum = normalize_spectrum(plot_spectrum)
+            # Apply normalization (MSC not supported in single-pixel mode)
+            if active_normalization == "msc":
+                print(
+                    "⚠️  MSC normalization not available in single-pixel mode, using SNV instead"
+                )
+                plot_spectrum = normalize_spectrum(plot_spectrum, "snv")
+            else:
+                plot_spectrum = normalize_spectrum(plot_spectrum, active_normalization)
 
             plt.plot(plot_wavelengths, plot_spectrum, color=colors[0], linewidth=2)
 
             title = f"{data_label} Spectrum"
-            if normalize:
-                title += " (Normalized)"
+            if active_normalization:
+                title += f" ({active_normalization.upper()})"
             if wavelength_smoothing > 1:
                 title += f" (λ-smooth: {wavelength_smoothing})"
 
@@ -4240,8 +4655,20 @@ class CombinedTransectCube:
             ax.margins(x=0)
             ax.autoscale(enable=False, axis="x")
 
+        # NEW: Handle legend placement (including "outside" option)
         if not use_inline_labels or not is_roi_analysis:
-            plt.legend()
+            if legend_loc is not None:
+                ax = plt.gca()
+                if legend_loc == "outside":
+                    # Place legend outside the plot area on the right
+                    ax.legend(
+                        loc="center left",
+                        bbox_to_anchor=(1.02, 0.5),
+                        fontsize=9,
+                        framealpha=0.9,
+                    )
+                else:
+                    ax.legend(loc=legend_loc, fontsize=9, framealpha=0.9)
 
         plt.tight_layout()
         plt.show()
