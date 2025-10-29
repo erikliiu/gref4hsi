@@ -696,6 +696,8 @@ class CombinedTransectCube:
             "dark spots": "#000000",  # pure black
             "dark sediment": "#555555",  # medium-dark gray
             "sediment": "#8B4513",  # brown
+            "brown leaf": "#8B4513",  # brown (same as sediment)
+            "yellow leaf": "#FFD700",  # gold/yellow (same as double bomb 2)
         }
 
         # Priority 1: Custom color map for this specific plot (allows override)
