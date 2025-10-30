@@ -1101,47 +1101,60 @@ class MotionAnalyzer(object):
             slider.set_val(frame)
             slider.eventson = True
 
-            fig.canvas.draw_idle()
+            # Don't call draw_idle here - let FuncAnimation handle it
             return (line, *arrow_quivers, timestamp_text, *highlight_lines)
+
+        # --- Animation using FuncAnimation ---
+        def animate(frame):
+            nonlocal current_frame
+            if not anim_running:
+                # If paused, keep showing current frame
+                return update(current_frame)
+            else:
+                current_frame = frame
+                return update(frame)
+
+        anim = FuncAnimation(
+            fig,
+            animate,
+            frames=n_frames,
+            interval=interval,
+            blit=False,
+            repeat=True,
+            cache_frame_data=False,
+        )
 
         # --- Slider callback ---
         def slider_update(val):
+            nonlocal current_frame, anim_running
             frame = int(slider.val)
+            current_frame = frame
+            # Pause animation when slider is manually moved
+            if anim_running:
+                anim.event_source.stop()
+                anim_running = False
+                play_button.label.set_text("Play")
             update(frame)
             fig.canvas.draw_idle()
 
         slider.on_changed(slider_update)
 
         # --- Play/Pause callback ---
-
         def toggle_animation(event):
             nonlocal anim_running
             if anim_running:
                 print("Pausing animation")
-                timer.stop()  # Stop the timer
+                anim.event_source.stop()  # Stop the animation
                 anim_running = False
                 play_button.label.set_text("Play")
             else:
                 print("Resuming animation")
                 anim_running = True
                 play_button.label.set_text("Pause")
-                timer.start()  # Restart the timer
+                anim.event_source.start()  # Restart the animation
             fig.canvas.draw_idle()  # Force a redraw to update the button label
 
         play_button.on_clicked(toggle_animation)
-
-        # --- Animation via timer ---
-        timer = fig.canvas.new_timer(interval=interval)
-
-        def timer_callback():
-            nonlocal current_frame
-            if anim_running:
-                current_frame = (current_frame + 1) % n_frames
-                update(current_frame)
-            # timer.start()  # restart timer
-
-        timer.add_callback(timer_callback)
-        timer.start()
 
         # plt.sh()
 

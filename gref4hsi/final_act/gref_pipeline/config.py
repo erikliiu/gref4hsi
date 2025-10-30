@@ -8,22 +8,17 @@ from pathlib import Path
 # ===== INPUT PATHS =====
 NAV_CSV = r"E:\mjosa_new\navigation_data\nav_data_merged.csv"
 DB_PATH = r"E:\mjosa\29\log_files\LOG_2024-10-29_10-13-32.db3"  # ROS bag database for DVL data
-MBES_GEOTIFF = r"E:\mjosa_new\DTM\geotiff_2.tif"  # the correct one
+# MBES_GEOTIFF = r"E:\mjosa_new\DTM\geotiff_2.tif"  # used for 057
+MBES_GEOTIFF = (
+    r"E:\mjosa_new_oct_2025\anxillary_data\EIVA\all.tif"  # full MBES (used for 028)
+)
 # MBES_GEOTIFF = r"E:\mjosa_new\DTM\104921.tif"  # the fucked one to check orientation
 
 # ===== WORKING FOLDER =====
 # Change this to switch between different datasets
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_1to2"
-WORKING_FOLDER = (
-    # r"E:\mjosa_new_oct_2025\use_gref4hsi\057_completed"  # this is the previous best
-)
-WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_final"  # this is the final version with all 6 .h5 files
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_test"
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_redo"
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_get_stats"
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_final"  # this is the final version with all 6 .h5 files
+WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\028"  # for 028
 
-
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_own_all"
 
 # Derived paths - no need to change these
 H5_FOLDER = WORKING_FOLDER + r"\input"

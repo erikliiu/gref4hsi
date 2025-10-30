@@ -313,14 +313,15 @@ class TransectDataSet:
                 continue
             path = os.path.join(self.folder, fn)
             gf = GeoFile(path, use_corrected=self.use_corrected)
-            if gf.shape is not None and gf.has_georef:
+            if gf.shape is not None:
+                # Load files with radiance data, even if georef is missing
                 self.files[gf.name] = gf
+                if not gf.has_georef:
+                    print(
+                        f"⚠️  {fn}: radiance found but no georef dataset – loaded anyway"
+                    )
             else:
-                # still allow if radiance exists but georef missing?
-                if gf.shape is not None:
-                    print(f"⚠️  {fn}: radiance found but no georef dataset – skipped")
-                else:
-                    print(f"⚠️  {fn}: no radiance cube – skipped")
+                print(f"⚠️  {fn}: no radiance cube – skipped")
 
     def list_files(self):
         print(
@@ -332,7 +333,10 @@ class TransectDataSet:
             print("  (none)")
 
     def select_files(
-        self, names: List[str], normalize_per_file: bool = False
+        self,
+        names: List[str],
+        normalize_per_file: bool = False,
+        load_datacube: str = None,
     ) -> "CombinedTransectCube":
         """
         Select files and combine them into a CombinedTransectCube.
@@ -344,6 +348,10 @@ class TransectDataSet:
         normalize_per_file : bool, default=True
             If True, normalize each file's RGB to [0,1] before combining to avoid
             color discontinuities from different acquisition conditions
+        load_datacube : str, optional
+            Name of saved datacube to load instead of default radiance data.
+            Examples: "dataCube_pseudo_reflectance", "dataCube_normalized_pseudo_reflectance"
+            If None (default), loads standard radiance data (raw or corrected based on use_corrected).
         """
         missing = [n for n in names if n not in self.files]
         if missing:
@@ -352,25 +360,29 @@ class TransectDataSet:
         if not chosen:
             raise ValueError("No valid files selected")
         return CombinedTransectCube(
-            chosen, self.folder, self.use_corrected, normalize_per_file
+            chosen, self.folder, self.use_corrected, normalize_per_file, load_datacube
         )
 
     def select_all_files(
-        self, normalize_per_file: bool = False
+        self, normalize_per_file: bool = False, load_datacube: str = None
     ) -> "CombinedTransectCube":
         return self.select_files(
-            list(self.files.keys()), normalize_per_file=normalize_per_file
+            list(self.files.keys()),
+            normalize_per_file=normalize_per_file,
+            load_datacube=load_datacube,
         )
 
     def select_files_by_pattern(
-        self, pattern: str, normalize_per_file: bool = False
+        self, pattern: str, normalize_per_file: bool = False, load_datacube: str = None
     ) -> "CombinedTransectCube":
         import fnmatch
 
         names = [n for n in self.files if fnmatch.fnmatch(n, pattern)]
         if not names:
             raise ValueError(f"No files match pattern: {pattern}")
-        return self.select_files(names, normalize_per_file=normalize_per_file)
+        return self.select_files(
+            names, normalize_per_file=normalize_per_file, load_datacube=load_datacube
+        )
 
 
 class CombinedTransectCube:
@@ -382,6 +394,7 @@ class CombinedTransectCube:
         folder: str,
         use_corrected: bool,
         normalize_per_file: bool = False,
+        load_datacube: str = None,
     ):
         self.geofiles = geofiles
         self.folder = folder
@@ -389,6 +402,7 @@ class CombinedTransectCube:
         self.normalize_per_file = (
             normalize_per_file  # NEW: normalize each file's RGB independently
         )
+        self.load_datacube = load_datacube  # NEW: custom datacube to load
         self.name = f"Combined_{os.path.basename(folder)}"
         self.file_boundaries = []  # list of dict with start_track etc.
 
@@ -411,7 +425,29 @@ class CombinedTransectCube:
         # NEW: Persistent color mapping for ROIs (shared across plot functions)
         self.roi_color_map = {}  # Will auto-populate when plotting ROIs
 
-        self._build_combined()
+        # Check if all files have georef data
+        all_have_georef = all(gf.has_georef for gf in self.geofiles)
+        some_have_georef = any(gf.has_georef for gf in self.geofiles)
+
+        # Error if mixing files with and without georef
+        if some_have_georef and not all_have_georef:
+            raise ValueError(
+                "Cannot mix files with and without georef data. "
+                "All selected files must be consistent."
+            )
+
+        # Set flag to control which methods are available
+        self.has_georef = all_have_georef
+
+        # Build spatial grids ONLY if georef exists
+        if self.has_georef:
+            self._build_combined()
+        else:
+            print("⚠️  Files have no georef data - skipping spatial grid building")
+            print(
+                "✅ Spectral analysis functions available (plot_spectrum, illumination correction, etc.)"
+            )
+
         self._load_full_cube()  # Load the full hyperspectral data
 
     def _build_combined(self):
@@ -492,45 +528,72 @@ class CombinedTransectCube:
         print("🔄 Loading full hyperspectral cube...")
         cubes = []
 
-        dset_name = (
-            "processed/radiance/dataCube_corrected"
-            if self.use_corrected
-            else "processed/radiance/dataCube"
-        )
+        # Determine which dataset to load
+        if self.load_datacube:
+            # Load custom saved datacube (e.g., "dataCube_pseudo_reflectance")
+            dset_name = f"processed/radiance/{self.load_datacube}"
+            print(f"   📦 Loading custom datacube: {self.load_datacube}")
+        else:
+            # Load standard radiance data
+            dset_name = (
+                "processed/radiance/dataCube_corrected"
+                if self.use_corrected
+                else "processed/radiance/dataCube"
+            )
 
         for gf in self.geofiles:
             print(f"   • Loading {gf.name}...")
             try:
                 with h5py.File(gf.path, "r") as f:
-                    # Try corrected first, fallback to raw
                     if dset_name in f:
                         cube = f[dset_name][()]
-                    elif "processed/radiance/dataCube" in f:
+                    elif not self.load_datacube and "processed/radiance/dataCube" in f:
+                        # Fallback to raw if corrected not found (only for default loading)
                         cube = f["processed/radiance/dataCube"][()]
                     else:
-                        raise KeyError(f"No radiance cube found in {gf.name}")
+                        raise KeyError(f"Dataset '{dset_name}' not found in {gf.name}")
 
                     cubes.append(cube)
             except Exception as e:
                 print(f"      ⚠️  Failed to load: {e}")
-                return  # Exit if we can't load all cubes
+                raise  # Raise error so user knows what went wrong
 
         # Concatenate along track axis
         self.data = np.concatenate(cubes, axis=0)
-        print(f"✅ Loaded full cube: {self.data.shape} (T × S × B)")
+
+        if self.load_datacube:
+            print(
+                f"✅ Loaded custom datacube '{self.load_datacube}': {self.data.shape} (T × S × B)"
+            )
+        else:
+            print(f"✅ Loaded full cube: {self.data.shape} (T × S × B)")
 
     def describe(self):
-        T, S = self.X_ecef.shape
         print(f"\n=== {self.name} ===")
-        print(f"Tracks × Slits: {T} × {S}")
-        print(
-            f"RGB coverage: R/G/B finite ratios "
-            f"{np.isfinite(self.R).mean():.2f}/{np.isfinite(self.G).mean():.2f}/{np.isfinite(self.B).mean():.2f}"
-        )
-        print("\n📋 File boundaries:")
-        for b in self.file_boundaries:
+
+        if self.has_georef:
+            T, S = self.X_ecef.shape
+            print(f"Tracks × Slits: {T} × {S}")
             print(
-                f"  {b['file']}: tracks {b['start_track']}–{b['end_track']} ({b['n_tracks']})"
+                f"RGB coverage: R/G/B finite ratios "
+                f"{np.isfinite(self.R).mean():.2f}/{np.isfinite(self.G).mean():.2f}/{np.isfinite(self.B).mean():.2f}"
+            )
+            print("\n📋 File boundaries:")
+            for b in self.file_boundaries:
+                print(
+                    f"  {b['file']}: tracks {b['start_track']}–{b['end_track']} ({b['n_tracks']})"
+                )
+        else:
+            # No georef data - show datacube info only
+            if self.data is not None:
+                T, S, B = self.data.shape
+                print(f"Datacube shape: {T} tracks × {S} slits × {B} bands")
+                print(
+                    f"Wavelength range: {self.wavelengths[0]:.1f} - {self.wavelengths[-1]:.1f} nm"
+                )
+            print("\n⚠️  No georef data available")
+            print(
+                "✅ Spectral analysis functions available: plot_spectrum, illumination correction, etc."
             )
 
     def adjust_uhi_alignment(self, dx=0.0, dy=0.0):
@@ -730,10 +793,14 @@ class CombinedTransectCube:
 
     def plot_georef(
         self,
-        red_wl=654.2,
-        green_wl=560.0,
-        blue_wl=440.3,
+        # red_wl=654.2,
+        # green_wl=560.0,
+        # blue_wl=440.3,
+        red_wl=620.0,
+        green_wl=565.0,
+        blue_wl=490.0,
         normalize=True,
+        contrast_stretch=None,  # NEW: Contrast enhancement (e.g., 2.0 for 2% linear stretch)
         figsize=(11, 9),
         coordinate_system=None,  # "ECEF", "NED", "LATLON", or None (auto = LATLON)
         use_local_origin=True,  # only used when coordinate_system == "ECEF"
@@ -769,6 +836,17 @@ class CombinedTransectCube:
         roi_legend_loc="best",  # Legend location: 'best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center', 'outside', or None to hide
         roi_legend_markersize=10,  # Size of color markers in legend (default=10)
         roi_legend_marker_border=True,  # Whether to show black border on legend markers
+        # Cartographic options (NEW - map-style features)
+        rotation_deg=0,  # Rotate plot by yaw angle in degrees (counter-clockwise positive)
+        add_scale_bar=False,  # Add scale bar to plot
+        scale_bar_length_m=None,  # Manual scale bar length in meters (auto-calculate if None)
+        scale_bar_position="lower left",  # Position: 'lower left', 'lower right', 'upper left', 'upper right'
+        scale_bar_color="black",  # Color of scale bar
+        scale_bar_fontsize=10,  # Font size for scale bar text
+        add_north_arrow=False,  # Add north arrow to plot
+        north_arrow_position="upper right",  # Position: 'lower left', 'lower right', 'upper left', 'upper right'
+        north_arrow_size=0.08,  # Size of north arrow relative to plot (0.0-1.0)
+        north_arrow_color="black",  # Color of north arrow
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -779,11 +857,61 @@ class CombinedTransectCube:
 
         Parameters
         ----------
+        contrast_stretch : float, optional
+            Apply linear contrast stretch by clipping the darkest and brightest percentiles.
+            Value represents the percentage to clip on each end (e.g., 2.0 for 2% stretch).
+            Common values: 2.0 (standard), 1.0 (subtle), 5.0 (aggressive).
+            If None, no contrast enhancement is applied. Default: None
+
         apply_alignment_shift : bool, optional
             If True and coordinate_system=='NED', applies the alignment shift from
             config (UHI_ALIGNMENT_DX, UHI_ALIGNMENT_DY) to match MBES data.
             Default: False
+
+        rotation_deg : float, optional
+            Rotate the entire plot by this angle in degrees (counter-clockwise positive).
+            Useful for creating map-style visualizations with custom orientations.
+            Default: 0 (no rotation)
+
+        add_scale_bar : bool, optional
+            Add a scale bar to the plot showing distance. Default: False
+
+        scale_bar_length_m : float, optional
+            Manual scale bar length in meters. If None, automatically calculates
+            a "nice" round number (e.g., 100m, 500m, 1km) based on plot size.
+            Default: None (auto)
+
+        scale_bar_position : str, optional
+            Position of scale bar: 'lower left', 'lower right', 'upper left', 'upper right'.
+            Default: 'lower left'
+
+        scale_bar_color : str, optional
+            Color of scale bar and text. Default: 'black'
+
+        scale_bar_fontsize : int, optional
+            Font size for scale bar label. Default: 10
+
+        add_north_arrow : bool, optional
+            Add a north arrow to the plot. Arrow automatically adjusts for rotation_deg.
+            Default: False
+
+        north_arrow_position : str, optional
+            Position of north arrow: 'lower left', 'lower right', 'upper left', 'upper right'.
+            Default: 'upper right'
+
+        north_arrow_size : float, optional
+            Size of north arrow relative to plot height (0.0-1.0). Default: 0.08
+
+        north_arrow_color : str, optional
+            Color of north arrow and label. Default: 'black'
         """
+        # Check if georef data is available
+        if not self.has_georef:
+            raise RuntimeError(
+                "Cannot use plot_georef() - selected files have no georef data. "
+                "Only spectral analysis functions are available (plot_spectrum, illumination correction, etc.)."
+            )
+
         import io, contextlib, warnings
         import numpy as np
         import matplotlib.pyplot as plt
@@ -968,6 +1096,24 @@ class CombinedTransectCube:
         alpha = np.ones((T, S), dtype=np.float64)
         alpha[~(np.isfinite(R) & np.isfinite(G) & np.isfinite(B))] = 0.0
 
+        # Apply contrast stretch if requested
+        if contrast_stretch is not None and contrast_stretch > 0:
+            for i in range(3):  # Apply to R, G, B channels separately
+                channel = RGB[:, :, i]
+                valid_data = channel[np.isfinite(channel)]
+                if len(valid_data) > 0:
+                    # Calculate percentile values
+                    p_low = np.percentile(valid_data, contrast_stretch)
+                    p_high = np.percentile(valid_data, 100 - contrast_stretch)
+
+                    # Clip and stretch to [0, 1]
+                    if p_high > p_low:
+                        channel_stretched = np.clip(channel, p_low, p_high)
+                        channel_stretched = (channel_stretched - p_low) / (
+                            p_high - p_low
+                        )
+                        RGB[:, :, i] = channel_stretched
+
         if coordinate_system.upper() == "LATLON":
             tf_ecef_to_geo = Transformer.from_crs(
                 "EPSG:4978", "EPSG:4979", always_xy=True
@@ -1026,6 +1172,21 @@ class CombinedTransectCube:
             raise ValueError("coordinate_system must be 'LATLON', 'NED', or 'ECEF'")
 
         alpha[~(np.isfinite(Xp) & np.isfinite(Yp))] = 0.0
+
+        # Apply rotation if specified
+        if rotation_deg != 0:
+            # Convert to radians (counter-clockwise positive)
+            theta = np.deg2rad(rotation_deg)
+            cos_theta = np.cos(theta)
+            sin_theta = np.sin(theta)
+
+            # Rotation matrix: [x', y'] = R * [x, y]
+            # R = [[cos, -sin], [sin, cos]]
+            Xp_rot = Xp * cos_theta - Yp * sin_theta
+            Yp_rot = Xp * sin_theta + Yp * cos_theta
+            Xp = Xp_rot
+            Yp = Yp_rot
+
         Xc = np.pad(Xp, ((0, 1), (0, 1)), mode="edge")
         Yc = np.pad(Yp, ((0, 1), (0, 1)), mode="edge")
         RGB[alpha == 0] = np.nan
@@ -1452,6 +1613,212 @@ class CombinedTransectCube:
                     if hasattr(handle, "set_edgecolor"):
                         handle.set_edgecolor("none")
                         handle.set_linewidth(0)
+
+        # ========== Add scale bar if requested ==========
+        if add_scale_bar:
+            from matplotlib.patches import Rectangle
+            from matplotlib.lines import Line2D
+
+            # Get plot coordinate range
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            x_range = xlim[1] - xlim[0]
+            y_range = ylim[1] - ylim[0]
+
+            # Determine scale bar length in plot coordinates
+            if scale_bar_length_m is None:
+                # Auto-calculate nice scale bar length (typically 10-20% of plot width)
+                # For NED/ECEF, coordinates are already in meters
+                # For LATLON, need to estimate meters from degrees
+                if coordinate_system.upper() == "LATLON":
+                    # Rough approximation: 1 degree latitude ≈ 111 km
+                    # Use mean latitude for better estimate
+                    if origin is not None:
+                        mean_lat = origin[0]
+                    else:
+                        mean_lat = np.nanmean(Yp)  # Use mean of plot latitude
+
+                    # Meters per degree longitude varies with latitude
+                    m_per_deg_lon = 111320 * np.cos(np.deg2rad(mean_lat))
+                    m_per_deg_lat = 111320
+
+                    # Estimate plot width in meters
+                    plot_width_m = x_range * m_per_deg_lon
+                    target_length = plot_width_m * 0.15
+                else:
+                    # NED or ECEF - already in meters
+                    plot_width_m = x_range
+                    target_length = plot_width_m * 0.15
+
+                # Debug output
+                if not quiet:
+                    print(f"[Scale Bar Debug]")
+                    print(f"  Coordinate system: {coordinate_system}")
+                    print(f"  Plot x_range: {x_range:.2f}")
+                    print(f"  Plot width in meters: {plot_width_m:.2f} m")
+                    print(f"  Target scale bar length (15%): {target_length:.2f} m")
+
+                # Choose nice round number (powers of 10, 2, or 5)
+                if target_length > 0:
+                    magnitude = 10 ** np.floor(np.log10(target_length))
+                    normalized = target_length / magnitude
+
+                    if normalized < 2:
+                        nice_length = magnitude
+                    elif normalized < 5:
+                        nice_length = 2 * magnitude
+                    else:
+                        nice_length = 5 * magnitude
+
+                    scale_bar_length_m = nice_length
+                else:
+                    # Fallback if something is wrong
+                    scale_bar_length_m = 100.0  # Default 100m
+
+                if not quiet:
+                    print(f"  Final scale bar length: {scale_bar_length_m:.2f} m")
+
+            # Convert scale bar length from meters to plot coordinates
+            if coordinate_system.upper() == "LATLON":
+                if origin is not None:
+                    mean_lat = origin[0]
+                else:
+                    mean_lat = np.nanmean(Yp)
+                m_per_deg_lon = 111320 * np.cos(np.deg2rad(mean_lat))
+                scale_bar_length_plot = scale_bar_length_m / m_per_deg_lon
+            else:
+                # NED or ECEF - already in meters
+                scale_bar_length_plot = scale_bar_length_m
+
+            # Position scale bar
+            margin_x = 0.05 * x_range
+            margin_y = 0.05 * y_range
+
+            if "lower" in scale_bar_position:
+                y_pos = ylim[0] + margin_y
+            else:  # upper
+                y_pos = ylim[1] - margin_y - 0.02 * y_range
+
+            if "left" in scale_bar_position:
+                x_pos = xlim[0] + margin_x
+            else:  # right
+                x_pos = xlim[1] - margin_x - scale_bar_length_plot
+
+            # Draw thicker scale bar
+            ax.plot(
+                [x_pos, x_pos + scale_bar_length_plot],
+                [y_pos, y_pos],
+                color=scale_bar_color,
+                linewidth=4,
+                solid_capstyle="butt",
+                zorder=1000,
+            )
+
+            # Add thicker ticks at ends
+            tick_height = 0.015 * y_range
+            ax.plot(
+                [x_pos, x_pos],
+                [y_pos - tick_height, y_pos + tick_height],
+                color=scale_bar_color,
+                linewidth=4,
+                zorder=1000,
+            )
+            ax.plot(
+                [x_pos + scale_bar_length_plot, x_pos + scale_bar_length_plot],
+                [y_pos - tick_height, y_pos + tick_height],
+                color=scale_bar_color,
+                linewidth=4,
+                zorder=1000,
+            )
+
+            # Add text label (no background)
+            if scale_bar_length_m >= 1000:
+                label_text = f"{scale_bar_length_m/1000:.1f} km"
+            elif scale_bar_length_m >= 1:
+                label_text = f"{int(scale_bar_length_m)} m"
+            else:
+                # For sub-meter lengths, show decimal
+                label_text = f"{scale_bar_length_m:.1f} m"
+
+            ax.text(
+                x_pos + scale_bar_length_plot / 2,
+                y_pos + 0.020 * y_range,
+                label_text,
+                ha="center",
+                va="bottom",
+                fontsize=scale_bar_fontsize,
+                color=scale_bar_color,
+                weight="bold",
+                zorder=1000,
+            )
+
+        # ========== Add north arrow if requested ==========
+        if add_north_arrow:
+            from matplotlib.patches import FancyArrow, FancyArrowPatch, Polygon
+            import matplotlib.patches as mpatches
+
+            # Position north arrow
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            x_range = xlim[1] - xlim[0]
+            y_range = ylim[1] - ylim[0]
+
+            margin_x = 0.05 * x_range
+            margin_y = 0.05 * y_range
+
+            if "lower" in north_arrow_position:
+                y_center = ylim[0] + margin_y + north_arrow_size * y_range / 2
+            else:  # upper
+                y_center = ylim[1] - margin_y - north_arrow_size * y_range / 2
+
+            if "left" in north_arrow_position:
+                x_center = xlim[0] + margin_x + north_arrow_size * x_range / 2
+            else:  # right
+                x_center = xlim[1] - margin_x - north_arrow_size * x_range / 2
+
+            # Calculate arrow dimensions - shorter and thicker
+            arrow_length = north_arrow_size * y_range * 0.5  # Reduced from 0.8 to 0.5
+
+            # North direction in rotated coordinates
+            # If plot is rotated by rotation_deg, north arrow needs to point in opposite direction
+            north_angle_rad = np.deg2rad(
+                -rotation_deg
+            )  # Negative because we rotated the data
+
+            # Arrow start and end points
+            x_start = x_center
+            y_start = y_center - arrow_length / 2
+            dx = arrow_length * np.sin(north_angle_rad)
+            dy = arrow_length * np.cos(north_angle_rad)
+
+            # Draw arrow using FancyArrowPatch - thicker with larger head
+            arrow = FancyArrowPatch(
+                (x_start, y_start),
+                (x_start + dx, y_start + dy),
+                arrowstyle="->",
+                mutation_scale=40,
+                linewidth=4,
+                color=north_arrow_color,
+                zorder=1000,
+            )
+            ax.add_patch(arrow)
+
+            # Add "N" label at arrow tip (no background box)
+            text_offset = arrow_length * 0.20
+            label_x = x_start + dx + text_offset * np.sin(north_angle_rad)
+            label_y = y_start + dy + text_offset * np.cos(north_angle_rad)
+
+            ax.text(
+                label_x,
+                label_y,
+                "N",
+                ha="center",
+                va="center",
+                fontsize=scale_bar_fontsize + 6,
+                color=north_arrow_color,
+                weight="bold",
+                zorder=1000,
+            )
 
         fig.tight_layout()
         plt.show()
@@ -2329,7 +2696,7 @@ class CombinedTransectCube:
         return self.data_corrected
 
     def apply_illumination_correction_v2(
-        self, window_size=1000, strength=1.0, force_recompute=False
+        self, window_size=500, strength=1.0, force_recompute=False
     ):
         """
         V2: Fixed version using pandas rolling median instead of scipy median_filter.
@@ -2729,6 +3096,460 @@ class CombinedTransectCube:
         print(f"✅ Correction deleted successfully")
         return True
 
+    def save_as_pseudo_reflectance(
+        self,
+        interpolate_wavelengths=None,
+        wavelength_smoothing=1,
+        smoothing_method="moving_average",  # NEW: Smoothing method ('moving_average' or 'savgol')
+        savgol_polyorder=2,  # NEW: Polynomial order for Savitzky-Golay filter
+        normalize_method=None,  # NEW: Normalization method (None, 'mean', 'mean_center', 'snv', 'msc', 'minmax', 'l2')
+        track_start=None,  # NEW: Start track index for segment extraction
+        track_end=None,  # NEW: End track index for segment extraction
+        overwrite=False,
+    ):
+        """
+        Save pseudo-reflectance datacube to HDF5 files.
+
+        Pseudo-reflectance = illumination corrected + bad wavelength interpolation + smoothing
+
+        Processing pipeline:
+        1. Start with illumination-corrected data (self.data_corrected)
+        2. Extract segment (if track_start/track_end specified)
+        3. Interpolate bad wavelengths (linear interpolation from neighbors)
+        4. Apply wavelength smoothing (rolling window)
+        5. Apply normalization (if specified, per-pixel)
+        6. Save to HDF5 as 'dataCube_pseudo_reflectance' or 'dataCube_normalized_pseudo_reflectance'
+
+        Parameters:
+        -----------
+        interpolate_wavelengths : list of int, optional
+            List of wavelength indices to interpolate (replace with linear interpolation).
+            Example: [64, 107, 138] will interpolate these band indices.
+
+        wavelength_smoothing : int, default=1
+            Window size for wavelength smoothing.
+            1 = no smoothing, larger values = more smoothing.
+            Applied along wavelength axis for each pixel independently.
+
+        smoothing_method : str, default='moving_average'
+            Smoothing method to use:
+            - "moving_average": Rolling mean (pandas-based, consistent with plot_spectrum)
+            - "savgol": Savitzky-Golay filter (preserves spectral features better)
+
+        savgol_polyorder : int, default=2
+            Polynomial order for Savitzky-Golay filter (only used if smoothing_method='savgol').
+            Typical values: 2 (quadratic) or 3 (cubic). Must be less than wavelength_smoothing.
+
+        normalize_method : str or None, default=None
+            Normalization method to apply to each pixel's spectrum:
+            - None: No normalization (saves as pseudo-reflectance)
+            - "mean": Divide by mean (simple scaling)
+            - "mean_center": Subtract mean (removes DC offset) ⭐ Good for comparison
+            - "snv": Standard Normal Variate (removes offset + scale) ⭐ Good for ML
+            - "msc": Multiplicative Scatter Correction (uses global mean as reference)
+            - "minmax": Min-max scaling to [0,1]
+            - "l2": L2 vector normalization
+            When set, saves to 'dataCube_normalized_pseudo_reflectance' instead.
+
+        track_start : int, optional
+            Starting track index for segment extraction (inclusive).
+            If None, starts from beginning (index 0).
+
+        track_end : int, optional
+            Ending track index for segment extraction (exclusive).
+            If None, goes to end of data.
+
+        overwrite : bool, default=False
+            If True, overwrites existing pseudo-reflectance data.
+            If False and data exists, skips saving.
+
+        Returns:
+        --------
+        np.ndarray : The pseudo-reflectance datacube (T, S, B)
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> # Save entire datacube
+        >>> cube.save_as_pseudo_reflectance(
+        ...     interpolate_wavelengths=[64, 107, 138],  # Bad bands
+        ...     wavelength_smoothing=5,  # Smooth over 5 wavelengths
+        ...     overwrite=False
+        ... )
+        >>> # Save only a segment
+        >>> cube.save_as_pseudo_reflectance(
+        ...     interpolate_wavelengths=[64, 107, 138],
+        ...     wavelength_smoothing=10,
+        ...     track_start=100,  # Start at track 100
+        ...     track_end=500,    # End at track 500
+        ...     overwrite=True
+        ... )
+        >>> # Save normalized datacube for ML/classification
+        >>> cube.save_as_pseudo_reflectance(
+        ...     interpolate_wavelengths=[64, 107, 138],
+        ...     wavelength_smoothing=10,
+        ...     normalize_method="mean_center",  # or "snv" for ML
+        ...     track_start=100,
+        ...     track_end=500,
+        ...     overwrite=True
+        ... )
+        """
+        import h5py
+        import pandas as pd
+
+        # Check if corrected data exists
+        if not hasattr(self, "data_corrected") or self.data_corrected is None:
+            raise RuntimeError(
+                "❌ No illumination-corrected data found. "
+                "Run cube.apply_illumination_correction_v2() first."
+            )
+
+        # Determine dataset path based on normalization
+        if normalize_method:
+            dset_path = "processed/radiance/dataCube_normalized_pseudo_reflectance"
+        else:
+            dset_path = "processed/radiance/dataCube_pseudo_reflectance"
+
+        # Check if already exists
+        if not overwrite:
+            already_exists = True
+            for gf in self.geofiles:
+                try:
+                    with h5py.File(gf.path, "r") as f:
+                        if dset_path not in f:
+                            already_exists = False
+                            break
+                except Exception:
+                    already_exists = False
+                    break
+
+            if already_exists:
+                print(f"✅ Pseudo-reflectance already exists in all files")
+                print(f"   Use overwrite=True to recalculate")
+                return self.data_corrected  # Return existing corrected data
+
+        print("=" * 90)
+        print("🔄 CREATING PSEUDO-REFLECTANCE DATACUBE")
+        print("=" * 90)
+
+        # Handle segment extraction
+        T_total, S, B = self.data_corrected.shape
+        if track_start is None:
+            track_start = 0
+        if track_end is None:
+            track_end = T_total
+
+        # Validate track range
+        if track_start < 0 or track_end > T_total or track_start >= track_end:
+            raise ValueError(
+                f"Invalid track range: track_start={track_start}, track_end={track_end}. "
+                f"Valid range is [0, {T_total})"
+            )
+
+        # Print pipeline info
+        pipeline_steps = []
+        if track_start > 0 or track_end < T_total:
+            pipeline_steps.append("Segment Extraction")
+        else:
+            pipeline_steps.append("Illumination Correction")
+        pipeline_steps.extend(["Interpolation", "Smoothing"])
+        if normalize_method:
+            pipeline_steps.append("Normalization")
+        pipeline_steps.append("Save")
+
+        print(f"   Pipeline: {' → '.join(pipeline_steps)}")
+        if track_start > 0 or track_end < T_total:
+            print(
+                f"   📏 Segment: tracks {track_start} to {track_end} (length={track_end - track_start})"
+            )
+        print()
+
+        # Print parameters
+        if interpolate_wavelengths and len(interpolate_wavelengths) > 0:
+            print(f"   🔧 Interpolating {len(interpolate_wavelengths)} wavelength(s):")
+            for wl_idx in interpolate_wavelengths:
+                if 0 <= wl_idx < len(self.wavelengths):
+                    wl_nm = self.wavelengths[wl_idx]
+                    print(f"      • Index {wl_idx}: {wl_nm:.2f} nm")
+                else:
+                    print(
+                        f"      ⚠️  Index {wl_idx} out of range (0-{len(self.wavelengths)-1})"
+                    )
+        else:
+            print(f"   • No wavelength interpolation")
+
+        if wavelength_smoothing > 1:
+            if smoothing_method == "savgol":
+                print(
+                    f"   🔧 Wavelength smoothing: {smoothing_method} (window={wavelength_smoothing}, polyorder={savgol_polyorder})"
+                )
+            else:
+                print(
+                    f"   🔧 Wavelength smoothing: {smoothing_method} (window={wavelength_smoothing})"
+                )
+        else:
+            print(f"   • No wavelength smoothing")
+
+        if normalize_method:
+            print(f"   🔧 Normalization: {normalize_method}")
+        else:
+            print(f"   • No normalization")
+
+        print()
+
+        # Start with corrected data and extract segment
+        pseudo_reflectance = self.data_corrected[track_start:track_end, :, :].copy()
+        T, S, B = pseudo_reflectance.shape
+
+        # Define normalization function (per-pixel)
+        def normalize_spectrum_pixel(spectrum, method):
+            """Apply normalization to a single pixel's spectrum."""
+            if method is None or len(spectrum) == 0:
+                return spectrum
+
+            spectrum = np.array(spectrum, dtype=float)
+
+            if method == "mean":
+                spectrum_mean = np.mean(spectrum)
+                if spectrum_mean != 0:
+                    return spectrum / spectrum_mean
+                return spectrum
+
+            elif method == "mean_center":
+                return spectrum - np.mean(spectrum)
+
+            elif method == "snv":
+                spectrum_mean = np.mean(spectrum)
+                spectrum_std = np.std(spectrum)
+                if spectrum_std > 0:
+                    return (spectrum - spectrum_mean) / spectrum_std
+                return spectrum - spectrum_mean
+
+            elif method == "minmax":
+                spectrum_min = np.min(spectrum)
+                spectrum_max = np.max(spectrum)
+                if spectrum_max > spectrum_min:
+                    return (spectrum - spectrum_min) / (spectrum_max - spectrum_min)
+                return spectrum
+
+            elif method == "l2":
+                norm = np.linalg.norm(spectrum)
+                if norm > 0:
+                    return spectrum / norm
+                return spectrum
+
+            else:
+                return spectrum
+
+        # Step 1: Interpolate bad wavelengths
+        if interpolate_wavelengths and len(interpolate_wavelengths) > 0:
+            print(f"   Step 1/2: Interpolating bad wavelengths...")
+
+            valid_indices = [
+                idx for idx in interpolate_wavelengths if 0 < idx < B - 1
+            ]  # Can't interpolate edges
+
+            if len(valid_indices) < len(interpolate_wavelengths):
+                skipped = len(interpolate_wavelengths) - len(valid_indices)
+                print(f"      ⚠️  Skipping {skipped} edge wavelength(s)")
+
+            for idx in valid_indices:
+                # Linear interpolation from neighbors
+                pseudo_reflectance[:, :, idx] = (
+                    pseudo_reflectance[:, :, idx - 1]
+                    + pseudo_reflectance[:, :, idx + 1]
+                ) / 2.0
+
+            print(f"      ✓ Interpolated {len(valid_indices)} wavelength(s)")
+        else:
+            print(f"   Step 1/2: Skipped (no interpolation)")
+
+        # Step 2: Wavelength smoothing
+        if wavelength_smoothing > 1:
+            method_label = "SG" if smoothing_method == "savgol" else "MA"
+            if smoothing_method == "savgol":
+                print(
+                    f"   Step 2/2: Smoothing wavelengths ({method_label}, window={wavelength_smoothing}, polyorder={savgol_polyorder})..."
+                )
+            else:
+                print(
+                    f"   Step 2/2: Smoothing wavelengths ({method_label}, window={wavelength_smoothing})..."
+                )
+
+            # Smooth along wavelength axis for each pixel
+            smoothed = np.zeros_like(pseudo_reflectance)
+
+            if smoothing_method == "savgol":
+                # Savitzky-Golay filter
+                from scipy.signal import savgol_filter
+
+                # Ensure window_size is odd (required for savgol)
+                window = wavelength_smoothing
+                if window % 2 == 0:
+                    window += 1
+
+                # Ensure polyorder < window_size
+                polyorder = savgol_polyorder
+                if polyorder >= window:
+                    polyorder = window - 1
+
+                for t in range(T):
+                    for s in range(S):
+                        spectrum = pseudo_reflectance[t, s, :]
+                        # Apply Savitzky-Golay with polynomial extrapolation at edges
+                        smoothed[t, s, :] = savgol_filter(
+                            spectrum, window, polyorder, mode="interp"
+                        )
+
+            else:
+                # Moving average (default)
+                for t in range(T):
+                    for s in range(S):
+                        spectrum = pseudo_reflectance[t, s, :]
+
+                        # Use pandas rolling for consistent behavior with plot_spectrum
+                        series = pd.Series(spectrum)
+                        smoothed_series = series.rolling(
+                            window=wavelength_smoothing, center=True, min_periods=1
+                        ).mean()
+
+                        smoothed[t, s, :] = smoothed_series.values
+
+            pseudo_reflectance = smoothed
+            print(f"      ✓ Smoothing complete")
+        else:
+            print(f"   Step 2/2: Skipped (no smoothing)")
+
+        # Step 3: Normalization (per-pixel)
+        if normalize_method:
+            print(f"   Step 3/3: Normalizing spectra ({normalize_method})...")
+
+            # MSC requires reference spectrum (global mean)
+            if normalize_method == "msc":
+                print(f"      Computing reference spectrum...")
+                reference_spectrum = np.nanmean(pseudo_reflectance, axis=(0, 1))
+
+                normalized = np.zeros_like(pseudo_reflectance)
+                for t in range(T):
+                    for s in range(S):
+                        spectrum = pseudo_reflectance[t, s, :]
+                        # MSC: fit linear model and correct
+                        coeffs = np.polyfit(reference_spectrum, spectrum, 1)
+                        b, a = coeffs[0], coeffs[1]
+                        if abs(b) > 1e-10:
+                            normalized[t, s, :] = (spectrum - a) / b
+                        else:
+                            normalized[t, s, :] = spectrum
+                pseudo_reflectance = normalized
+            else:
+                # Other normalization methods (per-pixel)
+                normalized = np.zeros_like(pseudo_reflectance)
+                for t in range(T):
+                    for s in range(S):
+                        spectrum = pseudo_reflectance[t, s, :]
+                        normalized[t, s, :] = normalize_spectrum_pixel(
+                            spectrum, normalize_method
+                        )
+                pseudo_reflectance = normalized
+
+            print(f"      ✓ Normalization complete")
+        else:
+            print(f"   Step 3/3: Skipped (no normalization)")
+
+        print()
+        print(f"   💾 Saving to HDF5 files...")
+
+        # Map segment indices to files
+        # Build cumulative track offsets for each file
+        file_offsets = [0]
+        for gf in self.geofiles:
+            file_offsets.append(file_offsets[-1] + gf.shape[0])
+
+        # Save to relevant file(s)
+        saved_count = 0
+        segment_offset = 0  # Offset within the pseudo_reflectance array
+
+        for i, gf in enumerate(self.geofiles):
+            file_start = file_offsets[i]
+            file_end = file_offsets[i + 1]
+
+            # Check if this file overlaps with the segment
+            if file_end <= track_start or file_start >= track_end:
+                # No overlap, skip this file
+                continue
+
+            # Calculate the overlap region
+            overlap_start = (
+                max(track_start, file_start) - file_start
+            )  # Relative to file
+            overlap_end = min(track_end, file_end) - file_start  # Relative to file
+            overlap_length = overlap_end - overlap_start
+
+            # Extract the corresponding chunk from pseudo_reflectance
+            data_chunk = pseudo_reflectance[
+                segment_offset : segment_offset + overlap_length, :, :
+            ]
+            segment_offset += overlap_length
+
+            try:
+                with h5py.File(gf.path, "a") as f:
+                    # Remove old dataset if overwriting
+                    if dset_path in f:
+                        del f[dset_path]
+
+                    # Create new dataset
+                    dset = f.create_dataset(
+                        dset_path,
+                        data=data_chunk,
+                        compression="gzip",
+                        compression_opts=4,
+                        dtype=np.float32,
+                    )
+
+                    # Save metadata
+                    if normalize_method:
+                        dset.attrs["description"] = (
+                            "Normalized pseudo-reflectance (illumination corrected + interpolated + smoothed + normalized)"
+                        )
+                        dset.attrs["normalization_method"] = normalize_method
+                    else:
+                        dset.attrs["description"] = (
+                            "Pseudo-reflectance (illumination corrected + interpolated + smoothed)"
+                        )
+                    dset.attrs["interpolate_wavelengths"] = (
+                        str(interpolate_wavelengths)
+                        if interpolate_wavelengths
+                        else "None"
+                    )
+                    dset.attrs["wavelength_smoothing"] = wavelength_smoothing
+                    dset.attrs["smoothing_method"] = smoothing_method
+                    dset.attrs["track_start"] = track_start
+                    dset.attrs["track_end"] = track_end
+                    dset.attrs["segment_length"] = track_end - track_start
+                    if smoothing_method == "savgol":
+                        dset.attrs["savgol_polyorder"] = savgol_polyorder
+
+                    print(
+                        f"      ✓ {gf.name}: {data_chunk.shape} (tracks {overlap_start} to {overlap_end})"
+                    )
+                    saved_count += 1
+
+            except Exception as e:
+                print(f"      ❌ Failed to save {gf.name}: {e}")
+                raise
+
+        print()
+        print("=" * 90)
+        print(f"✅ PSEUDO-REFLECTANCE SAVED")
+        print(f"   Dataset: {dset_path}")
+        print(f"   Shape: {pseudo_reflectance.shape}")
+        print(f"   Files saved: {saved_count}/{len(self.geofiles)}")
+        if track_start > 0 or track_end < T_total:
+            print(f"   Segment: tracks {track_start} to {track_end}")
+        print("=" * 90)
+
+        return pseudo_reflectance
+
     def apply_illumination_correction_method2(self, window_size=1000):
         """
         METHOD 2: Intensity-based correction (preserves color ratios).
@@ -3047,17 +3868,19 @@ class CombinedTransectCube:
             rgb_image, aspect="auto", origin="lower", extent=[0, n_tracks, 0, n_slits]
         )
 
-        # File boundaries (unchanged)
+        # File boundaries
         if show_file_boundaries:
-            for b in self.file_boundaries[1:]:
-                plt.axvline(
-                    b["start_track"],
-                    color="yellow",
-                    linestyle=":",
-                    linewidth=2,
-                    alpha=0.8,
-                    label="File boundary" if b == self.file_boundaries[1] else "",
-                )
+            for i, b in enumerate(self.file_boundaries):
+                # Draw boundary line (skip first one at track 0)
+                if i > 0:
+                    plt.axvline(
+                        b["start_track"],
+                        color="yellow",
+                        linestyle=":",
+                        linewidth=2,
+                        alpha=0.8,
+                        label="File boundary" if i == 1 else "",
+                    )
 
         # Cross-hairs (unchanged)
         if track_index is not None:
@@ -3229,10 +4052,24 @@ class CombinedTransectCube:
 
         plt.xlabel("Track Index")
         plt.ylabel("Slit Pixel Index")
-        title = f"RGB Composite - {self.name}\n(R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm)"
+
+        # Build title with file names
+        file_names = [b["file"] for b in self.file_boundaries]
+        if len(file_names) == 1:
+            files_str = file_names[0]
+        elif len(file_names) <= 3:
+            files_str = ", ".join(file_names)
+        else:
+            files_str = f"{file_names[0]}, {file_names[1]}, ... {file_names[-1]} ({len(file_names)} files)"
+
+        title = f"RGB Composite - {files_str}\n(R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm)"
         if use_corrected:
             title = "Corrected " + title
-        plt.title(title)
+        plt.title(title, fontsize=12, fontweight="bold")
+
+        # Also set the figure window title (for Qt backend)
+        fig = plt.gcf()
+        fig.canvas.manager.set_window_title(f"RGB: {files_str}")
 
         # Smart legend display
         has_overlays = (
@@ -4170,6 +5007,9 @@ class CombinedTransectCube:
         use_corrected=False,
         wavelength_range=None,
         wavelength_smoothing=1,
+        smooth_before_filter=False,  # NEW: Apply smoothing before wavelength filtering
+        smoothing_method="moving_average",  # NEW: Smoothing method ('moving_average' or 'savgol')
+        savgol_polyorder=2,  # NEW: Polynomial order for Savitzky-Golay filter (typically 2 or 3)
         figsize=(12, 6),
         colors=[
             "#FF0000",
@@ -4190,6 +5030,7 @@ class CombinedTransectCube:
         show_std=True,  # NEW: Control standard deviation bands
         interpolate_wavelengths=None,  # NEW: List of wavelength indices to interpolate (e.g., [104] for 560nm dip)
         legend_loc="best",  # NEW: Legend location ('best', 'upper right', 'outside', etc., or None to hide)
+        ylim=None,  # NEW: Y-axis limits - tuple (ymin, ymax) or float for ±range around mean
     ):
         """Enhanced spectrum plotting with optional normalization, inline labels, std control, wavelength interpolation, and legend placement.
 
@@ -4212,6 +5053,28 @@ class CombinedTransectCube:
             List of wavelength indices to interpolate (replace with linear interpolation from neighbors).
             Example: [104] will interpolate wavelength 104 (~560nm) from wavelengths 103 and 105.
             The function will print which wavelengths (nm) are being interpolated.
+
+        smooth_before_filter : bool, optional (default=False)
+            Control whether smoothing happens before or after wavelength range filtering:
+            - False (default): Filter wavelength range first, then smooth → no influence from outside range
+            - True: Smooth full spectrum first, then filter → smoother at edges but includes outside influence
+            Note: Interpolation always happens before filtering (to fix bad wavelengths across full spectrum).
+
+        smoothing_method : str, optional (default='moving_average')
+            Smoothing method to use:
+            - "moving_average": Rolling mean (pandas-based, same as illumination correction V2)
+            - "savgol": Savitzky-Golay filter (polynomial fitting, preserves peaks/valleys better)
+
+        savgol_polyorder : int, optional (default=2)
+            Polynomial order for Savitzky-Golay filter (only used if smoothing_method='savgol').
+            Typical values: 2 (quadratic) or 3 (cubic). Must be less than wavelength_smoothing.
+
+        ylim : float, tuple, or None, optional (default=None)
+            Y-axis (intensity) limits for the plot:
+            - None: Auto-scale (matplotlib default)
+            - float: e.g., 0.2 → sets limits to mean ± 0.2 (reduces apparent volatility)
+            - tuple: (ymin, ymax) → absolute limits
+            Example: ylim=0.2 with mean=1.04 → plot range [0.84, 1.24]
         """
 
         cube = (
@@ -4350,19 +5213,59 @@ class CombinedTransectCube:
 
             return result[0] if is_1d else result
 
-        def smooth_spectrum(spectrum, window_size):
+        def smooth_spectrum(
+            spectrum, window_size, method="moving_average", polyorder=2
+        ):
+            """
+            Smooth spectrum using specified method.
+
+            Parameters:
+            -----------
+            spectrum : np.ndarray
+                1D spectrum array
+            window_size : int
+                Window size for smoothing
+            method : str
+                'moving_average' or 'savgol'
+            polyorder : int
+                Polynomial order for Savitzky-Golay (only used if method='savgol')
+
+            Returns:
+            --------
+            np.ndarray : Smoothed spectrum
+            """
             if window_size <= 1:
                 return spectrum
             if window_size > len(spectrum):
                 window_size = len(spectrum)
-            # Use pandas rolling for proper alignment - same as illumination correction V2
-            import pandas as pd
 
-            series = pd.Series(spectrum)
-            smoothed = series.rolling(
-                window=window_size, center=True, min_periods=1
-            ).mean()
-            return smoothed.values
+            if method == "savgol":
+                # Savitzky-Golay filter
+                from scipy.signal import savgol_filter
+
+                # Ensure window_size is odd (required for savgol)
+                if window_size % 2 == 0:
+                    window_size += 1
+
+                # Ensure polyorder < window_size
+                if polyorder >= window_size:
+                    polyorder = window_size - 1
+
+                # Apply Savitzky-Golay with polynomial extrapolation at edges
+                smoothed = savgol_filter(
+                    spectrum, window_size, polyorder, mode="interp"
+                )
+                return smoothed
+
+            else:
+                # Moving average (default) - Use pandas rolling for proper alignment
+                import pandas as pd
+
+                series = pd.Series(spectrum)
+                smoothed = series.rolling(
+                    window=window_size, center=True, min_periods=1
+                ).mean()
+                return smoothed.values
 
         # Determine which normalization method to use
         # Handle backward compatibility: normalize=True maps to "mean"
@@ -4515,27 +5418,51 @@ class CombinedTransectCube:
                         spectra_array, interpolate_wavelengths
                     )
 
-                    # NOW apply wavelength filtering
-                    spectra_array = spectra_array[:, wl_mask]
-                    avg_spectrum = np.mean(spectra_array, axis=0)
-                    std_spectrum = np.std(spectra_array, axis=0)
-
-                    # Apply smoothing first
-                    if wavelength_smoothing > 1:
-                        smoothed_avg = smooth_spectrum(
-                            avg_spectrum, wavelength_smoothing
-                        )
-                        smoothed_std = smooth_spectrum(
-                            std_spectrum, wavelength_smoothing
-                        )
-                        # pandas rolling with center=True keeps the same length, no trimming needed
-                        plot_wavelengths = wavelengths
-                        plot_avg = smoothed_avg
-                        plot_std = smoothed_std
-                    else:
+                    # Control smoothing order based on smooth_before_filter parameter
+                    if smooth_before_filter and wavelength_smoothing > 1:
+                        # OPTION 1: Smooth BEFORE filtering (smooth full spectrum)
+                        for i in range(spectra_array.shape[0]):
+                            spectra_array[i, :] = smooth_spectrum(
+                                spectra_array[i, :],
+                                wavelength_smoothing,
+                                smoothing_method,
+                                savgol_polyorder,
+                            )
+                        # Then filter wavelength range
+                        spectra_array = spectra_array[:, wl_mask]
+                        avg_spectrum = np.mean(spectra_array, axis=0)
+                        std_spectrum = np.std(spectra_array, axis=0)
                         plot_wavelengths = wavelengths
                         plot_avg = avg_spectrum
                         plot_std = std_spectrum
+                    else:
+                        # OPTION 2 (DEFAULT): Filter BEFORE smoothing
+                        # Apply wavelength filtering first
+                        spectra_array = spectra_array[:, wl_mask]
+                        avg_spectrum = np.mean(spectra_array, axis=0)
+                        std_spectrum = np.std(spectra_array, axis=0)
+
+                        # Then apply smoothing
+                        if wavelength_smoothing > 1:
+                            smoothed_avg = smooth_spectrum(
+                                avg_spectrum,
+                                wavelength_smoothing,
+                                smoothing_method,
+                                savgol_polyorder,
+                            )
+                            smoothed_std = smooth_spectrum(
+                                std_spectrum,
+                                wavelength_smoothing,
+                                smoothing_method,
+                                savgol_polyorder,
+                            )
+                            plot_wavelengths = wavelengths
+                            plot_avg = smoothed_avg
+                            plot_std = smoothed_std
+                        else:
+                            plot_wavelengths = wavelengths
+                            plot_avg = avg_spectrum
+                            plot_std = std_spectrum
 
                     # Apply normalization
                     if (
@@ -4603,7 +5530,11 @@ class CombinedTransectCube:
             if active_normalization:
                 title += f" ({active_normalization.upper()})"
             if wavelength_smoothing > 1:
-                title += f" (λ-smooth: {wavelength_smoothing})"
+                smooth_label = "SG" if smoothing_method == "savgol" else "MA"
+                if smoothing_method == "savgol":
+                    title += f" ({smooth_label}: w={wavelength_smoothing}, p={savgol_polyorder})"
+                else:
+                    title += f" ({smooth_label}: {wavelength_smoothing})"
             title += f"\n({self.name})"
 
         else:
@@ -4616,17 +5547,32 @@ class CombinedTransectCube:
             # NEW: Apply interpolation to remove bad wavelengths (BEFORE wavelength filtering!)
             spectrum = interpolate_bad_wavelengths(spectrum, interpolate_wavelengths)
 
-            # NOW apply wavelength filtering
-            spectrum = spectrum[wl_mask]
-
-            if wavelength_smoothing > 1:
-                smoothed_spectrum = smooth_spectrum(spectrum, wavelength_smoothing)
-                # pandas rolling with center=True keeps the same length, no trimming needed
+            # Control smoothing order based on smooth_before_filter parameter
+            if smooth_before_filter and wavelength_smoothing > 1:
+                # OPTION 1: Smooth BEFORE filtering (smooth full spectrum)
+                smoothed_spectrum = smooth_spectrum(
+                    spectrum, wavelength_smoothing, smoothing_method, savgol_polyorder
+                )
+                # Then filter wavelength range
+                plot_spectrum = smoothed_spectrum[wl_mask]
                 plot_wavelengths = wavelengths
-                plot_spectrum = smoothed_spectrum
             else:
-                plot_wavelengths = wavelengths
-                plot_spectrum = spectrum
+                # OPTION 2 (DEFAULT): Filter BEFORE smoothing
+                # Apply wavelength filtering first
+                spectrum = spectrum[wl_mask]
+
+                if wavelength_smoothing > 1:
+                    smoothed_spectrum = smooth_spectrum(
+                        spectrum,
+                        wavelength_smoothing,
+                        smoothing_method,
+                        savgol_polyorder,
+                    )
+                    plot_wavelengths = wavelengths
+                    plot_spectrum = smoothed_spectrum
+                else:
+                    plot_wavelengths = wavelengths
+                    plot_spectrum = spectrum
 
             # Apply normalization (MSC not supported in single-pixel mode)
             if active_normalization == "msc":
@@ -4643,7 +5589,11 @@ class CombinedTransectCube:
             if active_normalization:
                 title += f" ({active_normalization.upper()})"
             if wavelength_smoothing > 1:
-                title += f" (λ-smooth: {wavelength_smoothing})"
+                smooth_label = "SG" if smoothing_method == "savgol" else "MA"
+                if smoothing_method == "savgol":
+                    title += f" ({smooth_label}: w={wavelength_smoothing}, p={savgol_polyorder})"
+                else:
+                    title += f" ({smooth_label}: {wavelength_smoothing})"
 
         plt.xlabel("Wavelength (nm)")
         plt.ylabel(ylabel)
@@ -4656,6 +5606,23 @@ class CombinedTransectCube:
             ax.set_xlim(wavelength_range[0], wavelength_range[1])
             ax.margins(x=0)
             ax.autoscale(enable=False, axis="x")
+
+        # NEW: Handle y-axis limits
+        if ylim is not None:
+            ax = plt.gca()
+            if isinstance(ylim, (int, float)):
+                # Single value: set range to mean ± ylim
+                # Get current y data to calculate mean
+                lines = ax.get_lines()
+                if lines:
+                    all_ydata = []
+                    for line in lines:
+                        all_ydata.extend(line.get_ydata())
+                    mean_y = np.mean(all_ydata)
+                    ax.set_ylim(mean_y - ylim, mean_y + ylim)
+            elif isinstance(ylim, (tuple, list)) and len(ylim) == 2:
+                # Tuple: absolute limits
+                ax.set_ylim(ylim[0], ylim[1])
 
         # NEW: Handle legend placement (including "outside" option)
         if not use_inline_labels or not is_roi_analysis:

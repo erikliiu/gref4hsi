@@ -80,7 +80,7 @@ helper.plot_live_3d_highlighted(
     "2024-10-29",
     transect_dict=transect_dict_uhi,
     invert_depth=True,
-    interval=0.1,
+    interval=100,  # milliseconds per frame (100ms = 10 frames per second)
     # xyz_file=xyz_file,
 )
 
