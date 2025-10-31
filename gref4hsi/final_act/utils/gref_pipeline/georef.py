@@ -802,7 +802,7 @@ class CombinedTransectCube:
         normalize=True,
         contrast_stretch=None,  # NEW: Contrast enhancement (e.g., 2.0 for 2% linear stretch)
         figsize=(11, 9),
-        coordinate_system=None,  # "ECEF", "NED", "LATLON", or None (auto = LATLON)
+        coordinate_system="NED",  # "ECEF", "NED", "LATLON", or None (auto = LATLON)
         use_local_origin=True,  # only used when coordinate_system == "ECEF"
         origin=None,  # (lat, lon, h); required for NED/ECEF, ignored for LATLON
         show_file_boundaries=True,
@@ -1677,6 +1677,12 @@ class CombinedTransectCube:
 
                 if not quiet:
                     print(f"  Final scale bar length: {scale_bar_length_m:.2f} m")
+            else:
+                # User specified scale bar length - use it directly
+                if not quiet:
+                    print(
+                        f"[Scale Bar] Using user-specified length: {scale_bar_length_m:.2f} m"
+                    )
 
             # Convert scale bar length from meters to plot coordinates
             if coordinate_system.upper() == "LATLON":
@@ -1714,8 +1720,8 @@ class CombinedTransectCube:
                 zorder=1000,
             )
 
-            # Add thicker ticks at ends
-            tick_height = 0.015 * y_range
+            # Add smaller ticks at ends
+            tick_height = 0.008 * y_range  # Smaller ticks
             ax.plot(
                 [x_pos, x_pos],
                 [y_pos - tick_height, y_pos + tick_height],
@@ -4813,9 +4819,9 @@ class CombinedTransectCube:
 
     def plot_interactive_rgb(
         self,
-        red_wl=654.2,
-        green_wl=560,
-        blue_wl=440.3,
+        red_wl=620.0,
+        green_wl=565.0,
+        blue_wl=490.0,
         normalize=True,
         use_corrected=False,
         figsize=(50, 10),
@@ -4941,14 +4947,34 @@ class CombinedTransectCube:
                         f"✅ Added pixel: (slit={slit_idx}, track={track_idx}) - Total: {len(current_roi)}"
                     )
 
-            elif event.button == 3:  # Right click - REMOVE pixel
+            elif event.button == 3:  # Right click - REMOVE nearest pixel (within 10 pixels)
                 if pixel in current_roi:
+                    # Exact match - delete it
                     current_roi.remove(pixel)
                     print(
                         f"❌ Removed pixel: (slit={slit_idx}, track={track_idx}) - Total: {len(current_roi)}"
                     )
                 else:
-                    print(f"⚠️ Pixel not selected: (slit={slit_idx}, track={track_idx})")
+                    # Find nearest pixel within 10-pixel radius
+                    min_dist = float('inf')
+                    nearest_pixel = None
+                    max_radius = 10  # Don't delete across the map
+                    
+                    for roi_pixel in current_roi:
+                        roi_slit, roi_track = roi_pixel
+                        dist = np.sqrt((roi_slit - slit_idx)**2 + (roi_track - track_idx)**2)
+                        if dist < min_dist and dist <= max_radius:
+                            min_dist = dist
+                            nearest_pixel = roi_pixel
+                    
+                    if nearest_pixel is not None:
+                        current_roi.remove(nearest_pixel)
+                        print(
+                            f"❌ Removed nearest pixel: (slit={nearest_pixel[0]}, track={nearest_pixel[1]}) "
+                            f"[distance: {min_dist:.1f} pixels] - Total: {len(current_roi)}"
+                        )
+                    else:
+                        print(f"⚠️ No pixel within 10 pixels of click: (slit={slit_idx}, track={track_idx})")
 
             # Update display
             update_highlights()
@@ -5638,6 +5664,2031 @@ class CombinedTransectCube:
                     )
                 else:
                     ax.legend(loc=legend_loc, fontsize=9, framealpha=0.9)
+
+        plt.tight_layout()
+        plt.show()
+
+    # ==================== SVM CLASSIFICATION METHODS ====================
+
+    def train_svm(
+        self,
+        roi_collection,
+        class_names=None,
+        svm_kernel="rbf",
+        svm_C=None,
+        svm_gamma=None,
+        optimize_params=True,
+        cv_folds=5,
+        use_corrected=True,
+        quiet=False,
+    ):
+        """
+        Train an SVM classifier using ROI pixels as training data.
+
+        Args:
+            roi_collection: Can be:
+                           - List of ROI names (strings) → looks up in cube.roi_collection
+                           - Dict of {roi_name: [(slit, track), ...]} ROI pixels
+                           Each ROI name becomes a class label
+            class_names: Optional list to map ROI names to class labels. If None, uses ROI names
+            svm_kernel: SVM kernel type ('rbf', 'linear', 'poly')
+            svm_C: Regularization parameter. If None and optimize_params=True, will be optimized
+            svm_gamma: Kernel coefficient. If None and optimize_params=True, will be optimized
+            optimize_params: If True, uses GridSearchCV to find best C and gamma
+            cv_folds: Number of cross-validation folds for optimization
+            use_corrected: Use corrected data (data_corrected) or raw data
+            quiet: Suppress output messages
+
+        Returns:
+            dict with training results including trained model and accuracy scores
+
+        Example:
+            # After loading ROIs: cube.import_rois("my_rois.json")
+
+            # Option 1: Pass list of ROI names (like plot_georef!)
+            training_rois = ["sediment", "water", "vegetation"]
+            results = cube.train_svm(
+                roi_collection=training_rois,
+                optimize_params=True
+            )
+
+            # Option 2: Pass entire roi_collection dict
+            results = cube.train_svm(
+                roi_collection=cube.roi_collection,
+                optimize_params=True
+            )
+        """
+        from sklearn.svm import SVC
+        from sklearn.model_selection import GridSearchCV, cross_val_score
+        from sklearn.preprocessing import LabelEncoder
+        from sklearn.metrics import classification_report, confusion_matrix
+        import time
+
+        if not quiet:
+            print("=" * 60)
+            print("🤖 SVM TRAINING")
+            print("=" * 60)
+
+        # Handle roi_collection input (list of names OR dict)
+        if isinstance(roi_collection, list):
+            # User passed a list of ROI names → look them up in cube.roi_collection
+            if not hasattr(self, "roi_collection") or not self.roi_collection:
+                raise ValueError(
+                    "No ROI collection found. Load ROIs first with cube.import_rois() "
+                    "or use plot_interactive_rgb()"
+                )
+
+            # Build dict from list of names
+            roi_dict = {}
+            for roi_name in roi_collection:
+                if roi_name in self.roi_collection:
+                    roi_dict[roi_name] = self.roi_collection[roi_name]
+                else:
+                    print(
+                        f"⚠️  Warning: ROI '{roi_name}' not found in collection, skipping"
+                    )
+
+            if not roi_dict:
+                raise ValueError(
+                    f"None of the specified ROIs {roi_collection} were found in cube.roi_collection"
+                )
+
+            roi_collection = roi_dict
+        elif not isinstance(roi_collection, dict):
+            raise TypeError(
+                "roi_collection must be either a list of ROI names or a dict of "
+                "{roi_name: [(slit, track), ...]}}"
+            )
+
+        # Get data
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        if cube_data is None:
+            raise ValueError("No data loaded. Load a datacube first.")
+
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Prepare training data
+        X_train = []
+        y_train = []
+        class_pixel_counts = {}
+
+        for roi_name, roi_pixels in roi_collection.items():
+            if not quiet:
+                print(f"\n📍 Processing ROI: '{roi_name}'")
+
+            valid_count = 0
+            for slit_idx, track_idx in roi_pixels:
+                # Convert to relative track index
+                rel_track = track_idx - self.track_offset
+
+                if 0 <= rel_track < n_tracks and 0 <= slit_idx < n_slits:
+                    spectrum = cube_data[rel_track, slit_idx, :]
+                    X_train.append(spectrum)
+                    y_train.append(roi_name)
+                    valid_count += 1
+
+            class_pixel_counts[roi_name] = valid_count
+            if not quiet:
+                print(f"   ✅ {valid_count} valid pixels")
+
+        X_train = np.array(X_train)
+        y_train = np.array(y_train)
+
+        if not quiet:
+            print(f"\n📊 Training Data Summary:")
+            print(f"   Total samples: {len(X_train)}")
+            print(f"   Number of classes: {len(class_pixel_counts)}")
+            print(f"   Features (wavelengths): {X_train.shape[1]}")
+            for class_name, count in class_pixel_counts.items():
+                print(f"   - {class_name}: {count} pixels")
+
+        # Encode labels
+        le = LabelEncoder()
+        y_train_encoded = le.fit_transform(y_train)
+
+        # Parameter optimization
+        start_time = time.time()
+
+        if optimize_params and (svm_C is None or svm_gamma is None):
+            if not quiet:
+                print(f"\n🔍 Optimizing SVM parameters (kernel={svm_kernel})...")
+                print(f"   Testing C and gamma combinations...")
+
+            param_grid = {
+                "C": [0.1, 1, 10, 100, 1000],
+                "gamma": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1, "scale", "auto"],
+            }
+
+            grid_search = GridSearchCV(
+                SVC(kernel=svm_kernel),
+                param_grid,
+                cv=cv_folds,
+                scoring="accuracy",
+                n_jobs=-1,
+                verbose=0 if quiet else 1,
+            )
+
+            grid_search.fit(X_train, y_train_encoded)
+
+            best_C = grid_search.best_params_["C"]
+            best_gamma = grid_search.best_params_["gamma"]
+
+            if not quiet:
+                print(f"   ✅ Best C: {best_C}")
+                print(f"   ✅ Best gamma: {best_gamma}")
+                print(f"   ✅ Best CV accuracy: {grid_search.best_score_:.3f}")
+
+            svm_model = grid_search.best_estimator_
+        else:
+            # Use provided or default parameters
+            if svm_C is None:
+                svm_C = 1000
+            if svm_gamma is None:
+                svm_gamma = 1e-6
+
+            if not quiet:
+                print(f"\n🔧 Training SVM with:")
+                print(f"   Kernel: {svm_kernel}")
+                print(f"   C: {svm_C}")
+                print(f"   Gamma: {svm_gamma}")
+
+            svm_model = SVC(kernel=svm_kernel, C=svm_C, gamma=svm_gamma)
+            svm_model.fit(X_train, y_train_encoded)
+
+            # Cross-validation score
+            cv_scores = cross_val_score(
+                svm_model, X_train, y_train_encoded, cv=cv_folds
+            )
+            if not quiet:
+                print(
+                    f"   ✅ CV accuracy: {cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})"
+                )
+
+        training_time = time.time() - start_time
+
+        # Training accuracy
+        y_train_pred = svm_model.predict(X_train)
+        train_accuracy = np.mean(y_train_pred == y_train_encoded)
+
+        if not quiet:
+            print(f"\n⏱️  Training time: {training_time:.2f} seconds")
+            print(f"🎯 Training accuracy: {train_accuracy:.3f}")
+
+            # Confusion matrix
+            print("\n📈 Confusion Matrix:")
+            cm = confusion_matrix(y_train_encoded, y_train_pred)
+            print(cm)
+
+            print("\n📊 Classification Report:")
+            print(
+                classification_report(
+                    y_train_encoded, y_train_pred, target_names=le.classes_
+                )
+            )
+
+        # Store model and metadata
+        self.svm_model = svm_model
+        self.svm_label_encoder = le
+        self.svm_class_names = (
+            class_names if class_names else list(roi_collection.keys())
+        )
+        self.svm_training_data = {
+            "X_train": X_train,
+            "y_train": y_train,
+            "y_train_encoded": y_train_encoded,
+            "class_pixel_counts": class_pixel_counts,
+        }
+
+        results = {
+            "model": svm_model,
+            "label_encoder": le,
+            "training_accuracy": train_accuracy,
+            "training_time": training_time,
+            "class_names": self.svm_class_names,
+            "n_samples": len(X_train),
+            "n_features": X_train.shape[1],
+            "class_pixel_counts": class_pixel_counts,
+            "parameters": {
+                "C": svm_model.C,
+                "gamma": svm_model.gamma,
+                "kernel": svm_kernel,
+            },
+        }
+
+        if not quiet:
+            print("\n✅ SVM training complete!")
+            print("=" * 60)
+
+        return results
+
+    def classify_svm(
+        self,
+        track_start=None,
+        track_end=None,
+        use_corrected=True,
+        save_to_h5=True,
+        dataset_name="svm_classification",
+        quiet=False,
+    ):
+        """
+        Classify a segment of the datacube using the trained SVM model.
+
+        Args:
+            track_start: Start track index for classification (None = start of data)
+            track_end: End track index for classification (None = end of data)
+            use_corrected: Use corrected data or raw data
+            save_to_h5: Save classification results to H5 file
+            dataset_name: Name of dataset to save in H5 file
+            quiet: Suppress output messages
+
+        Returns:
+            dict with classification results including predicted labels and probabilities
+
+        Example:
+            # After training with train_svm()
+            results = cube.classify_svm(
+                track_start=config.UHI_TRACK_RANGE_5[0],
+                track_end=config.UHI_TRACK_RANGE_5[1]
+            )
+        """
+        import time
+
+        if not hasattr(self, "svm_model"):
+            raise ValueError("No trained SVM model found. Run train_svm() first.")
+
+        if not quiet:
+            print("=" * 60)
+            print("🎯 SVM CLASSIFICATION")
+            print("=" * 60)
+
+        # Get data
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        if cube_data is None:
+            raise ValueError("No data loaded.")
+
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Handle track range
+        if track_start is None:
+            track_start = self.track_offset
+        if track_end is None:
+            track_end = self.track_offset + n_tracks
+
+        rel_start = track_start - self.track_offset
+        rel_end = track_end - self.track_offset
+
+        rel_start = max(0, min(rel_start, n_tracks))
+        rel_end = max(0, min(rel_end, n_tracks))
+
+        if not quiet:
+            print(f"\n📍 Classification segment:")
+            print(f"   Track range: {track_start} to {track_end}")
+            print(f"   Relative indices: {rel_start} to {rel_end}")
+            print(f"   Segment size: {rel_end - rel_start} tracks × {n_slits} slits")
+
+        # Extract segment
+        segment_data = cube_data[rel_start:rel_end, :, :]
+        segment_shape = segment_data.shape
+
+        if not quiet:
+            print(f"\n🔄 Classifying {segment_shape[0] * segment_shape[1]} pixels...")
+
+        start_time = time.time()
+
+        # Reshape for classification
+        X_classify = segment_data.reshape(-1, n_wavelengths)
+
+        # Classify
+        y_pred_encoded = self.svm_model.predict(X_classify)
+        y_pred = self.svm_label_encoder.inverse_transform(y_pred_encoded)
+
+        # Reshape back to image
+        classification_map = y_pred.reshape(segment_shape[0], segment_shape[1])
+        classification_map_encoded = y_pred_encoded.reshape(
+            segment_shape[0], segment_shape[1]
+        )
+
+        classification_time = time.time() - start_time
+
+        if not quiet:
+            print(f"   ✅ Classification complete in {classification_time:.2f} seconds")
+
+            # Class distribution
+            print(f"\n📊 Classification Results:")
+            unique, counts = np.unique(y_pred, return_counts=True)
+            for class_name, count in zip(unique, counts):
+                percentage = (count / len(y_pred)) * 100
+                print(f"   - {class_name}: {count} pixels ({percentage:.1f}%)")
+
+        # Save to H5
+        if save_to_h5:
+            for file_data in self.file_list:
+                file_track_start = file_data["start_track"]
+                file_track_end = file_data["end_track"]
+
+                if track_end <= file_track_start or track_start >= file_track_end:
+                    continue
+
+                seg_start_in_file = max(0, track_start - file_track_start)
+                seg_end_in_file = min(
+                    file_track_end - file_track_start, track_end - file_track_start
+                )
+
+                map_start = max(0, file_track_start - track_start)
+                map_end = map_start + (seg_end_in_file - seg_start_in_file)
+
+                file_classification = classification_map_encoded[map_start:map_end, :]
+
+                try:
+                    with h5py.File(file_data["filepath"], "a") as f:
+                        ds_path = f"processed/{dataset_name}"
+
+                        if ds_path in f:
+                            del f[ds_path]
+
+                        f.create_dataset(
+                            ds_path,
+                            data=file_classification,
+                            compression="gzip",
+                            compression_opts=4,
+                        )
+
+                        # Save class names as attributes
+                        f[ds_path].attrs["class_names"] = self.svm_class_names
+                        f[ds_path].attrs["track_start"] = track_start
+                        f[ds_path].attrs["track_end"] = track_end
+
+                    if not quiet:
+                        print(f"   💾 Saved to: {file_data['name']} → {ds_path}")
+
+                except Exception as e:
+                    print(f"   ⚠️  Could not save to {file_data['name']}: {e}")
+
+        # Store results
+        self.svm_classification_map = classification_map
+        self.svm_classification_map_encoded = classification_map_encoded
+        self.svm_classification_range = (track_start, track_end)
+
+        results = {
+            "classification_map": classification_map,
+            "classification_map_encoded": classification_map_encoded,
+            "class_names": self.svm_class_names,
+            "track_range": (track_start, track_end),
+            "classification_time": classification_time,
+            "n_pixels": len(y_pred),
+            "class_distribution": dict(zip(unique, counts)),
+        }
+
+        if not quiet:
+            print("\n✅ Classification complete!")
+            print("=" * 60)
+
+        return results
+
+    def _create_grid_groups_for_sediment(
+        self,
+        roi_pixels,
+        n_tracks,
+        n_slits,
+        tile_size_slit,
+        tile_size_track,
+        min_pixels,
+        quiet=False,
+    ):
+        """
+        Create grid-based groups for sediment ROIs.
+        
+        Divides the datacube into regular grid tiles and assigns each pixel to its tile.
+        Tiles with <min_pixels are merged to neighboring tiles.
+        
+        Args:
+            roi_pixels: List of (slit, track) tuples
+            n_tracks: Total tracks in datacube
+            n_slits: Total slits in datacube
+            tile_size_slit: Grid tile size in slit direction
+            tile_size_track: Grid tile size in track direction
+            min_pixels: Minimum pixels per tile
+            quiet: Suppress output
+            
+        Returns:
+            pixel_groups: Array of group IDs for each pixel
+        """
+        from scipy.spatial.distance import cdist
+        
+        # Assign each pixel to a grid tile
+        pixel_groups = np.zeros(len(roi_pixels), dtype=int)
+        tile_to_group_id = {}
+        group_id_counter = 0
+        
+        # First pass: assign pixels to grid tiles
+        for i, (slit_idx, track_idx) in enumerate(roi_pixels):
+            tile_row = track_idx // tile_size_track
+            tile_col = slit_idx // tile_size_slit
+            tile_key = (tile_row, tile_col)
+            
+            if tile_key not in tile_to_group_id:
+                tile_to_group_id[tile_key] = group_id_counter
+                group_id_counter += 1
+            
+            pixel_groups[i] = tile_to_group_id[tile_key]
+        
+        # Calculate group sizes
+        unique_groups = np.unique(pixel_groups)
+        group_sizes = {gid: np.sum(pixel_groups == gid) for gid in unique_groups}
+        
+        # Find small groups that need merging
+        small_groups = [gid for gid, size in group_sizes.items() if size < min_pixels]
+        large_groups = [gid for gid, size in group_sizes.items() if size >= min_pixels]
+        
+        if small_groups and large_groups:
+            # Get tile coordinates for each group
+            group_to_tile = {v: k for k, v in tile_to_group_id.items()}
+            
+            for small_gid in small_groups:
+                small_tile = group_to_tile[small_gid]
+                small_row, small_col = small_tile
+                
+                # Find neighboring tiles (8-connectivity)
+                neighbors = []
+                for dr in [-1, 0, 1]:
+                    for dc in [-1, 0, 1]:
+                        if dr == 0 and dc == 0:
+                            continue
+                        neighbor_tile = (small_row + dr, small_col + dc)
+                        if neighbor_tile in tile_to_group_id:
+                            neighbor_gid = tile_to_group_id[neighbor_tile]
+                            if neighbor_gid in large_groups:
+                                neighbors.append(neighbor_gid)
+                
+                if neighbors:
+                    # Merge to first valid neighbor
+                    merge_target = neighbors[0]
+                    pixel_groups[pixel_groups == small_gid] = merge_target
+                    if not quiet:
+                        print(f"      Merged small tile {small_tile} ({group_sizes[small_gid]} px) → neighbor tile")
+                else:
+                    # No neighbors - try to find closest large group
+                    if large_groups:
+                        # Calculate distance to all large group centroids
+                        small_pixels = np.array(roi_pixels)[pixel_groups == small_gid]
+                        small_centroid = np.mean(small_pixels, axis=0).reshape(1, -1)
+                        
+                        large_centroids = []
+                        for large_gid in large_groups:
+                            large_pixels = np.array(roi_pixels)[pixel_groups == large_gid]
+                            large_centroid = np.mean(large_pixels, axis=0)
+                            large_centroids.append(large_centroid)
+                        
+                        large_centroids = np.array(large_centroids)
+                        distances = cdist(small_centroid, large_centroids)[0]
+                        nearest_idx = np.argmin(distances)
+                        merge_target = large_groups[nearest_idx]
+                        
+                        pixel_groups[pixel_groups == small_gid] = merge_target
+                        if not quiet:
+                            print(f"      Merged isolated tile {small_tile} ({group_sizes[small_gid]} px) → nearest large tile")
+        
+        return pixel_groups
+
+    def _create_spatial_groups(
+        self,
+        roi_pixels_per_class,
+        datacube_shape,
+        closing_radius=3,
+        dbscan_eps=10,
+        dbscan_min_samples=20,
+        min_group_size=20,
+        use_grid_for_sediment=True,  # 🔥 NEW: Use grid for sediment
+        sediment_grid_tile_slit=100,  # 🔥 NEW: Grid tile size in slit direction
+        sediment_grid_tile_track=200,  # 🔥 NEW: Grid tile size in track direction
+        sediment_min_group_size=10,  # 🔥 NEW: Min pixels for sediment grid tiles
+        quiet=False,
+    ):
+        """
+        Create spatial groups from ROI pixels to prevent data leakage in CV.
+        
+        For each class, spatially cluster pixels into groups so that CV can split by group
+        (keeping all pixels from same spatial region together).
+        
+        Special handling for sediment: Uses grid-based grouping instead of connected components
+        to avoid creating one giant group.
+        
+        Args:
+            roi_pixels_per_class: Dict {class_name: [(slit, track), ...]}
+            datacube_shape: Tuple (n_tracks, n_slits, n_wavelengths)
+            closing_radius: Morphological closing radius for bombs/dark (default: 3)
+            dbscan_eps: DBSCAN epsilon parameter (default: 10)
+            dbscan_min_samples: DBSCAN min_samples (default: 20)
+            min_group_size: Minimum pixels per group for bombs/dark (default: 20)
+            use_grid_for_sediment: Use grid grouping for training_sediment (default: True)
+            sediment_grid_tile_slit: Grid tile size in slit direction (default: 100)
+            sediment_grid_tile_track: Grid tile size in track direction (default: 200)
+            sediment_min_group_size: Min pixels for sediment tiles (default: 10)
+            quiet: Suppress output
+            
+        Returns:
+            groups_list: List of group IDs aligned with flattened pixel list
+            group_names: List of unique group names
+        """
+        from scipy.ndimage import binary_closing, label
+        from scipy.spatial.distance import cdist
+        
+        n_tracks, n_slits = datacube_shape[0], datacube_shape[1]
+        
+        all_groups = []
+        group_counter = {}
+        
+        if not quiet:
+            print(f"\n🔬 Creating spatial groups for CV...")
+            print(f"   Settings: closing_radius={closing_radius}, min_group_size={min_group_size}")
+            if use_grid_for_sediment:
+                print(f"   Sediment grid: {sediment_grid_tile_slit}(slit) × {sediment_grid_tile_track}(track) px, min={sediment_min_group_size}")
+        
+        for class_name, roi_pixels in roi_pixels_per_class.items():
+            if len(roi_pixels) == 0:
+                continue
+            
+            # 🔥 SPECIAL CASE: Grid-based grouping for training_sediment
+            if use_grid_for_sediment and class_name == "training_sediment":
+                pixel_groups = self._create_grid_groups_for_sediment(
+                    roi_pixels,
+                    n_tracks,
+                    n_slits,
+                    sediment_grid_tile_slit,
+                    sediment_grid_tile_track,
+                    sediment_min_group_size,
+                    quiet
+                )
+                method = "grid"
+                
+                # Count groups and assign names
+                # Note: _create_grid_groups_for_sediment already handles min size merging
+                unique_groups = np.unique(pixel_groups[pixel_groups >= 0])
+                group_info = {}
+                for group_id in unique_groups:
+                    group_mask = pixel_groups == group_id
+                    group_size = np.sum(group_mask)
+                    # Don't recheck min_group_size - grid function already merged small tiles
+                    group_info[group_id] = {'size': group_size, 'pixels': group_mask}
+                
+                # Assign sequential group names
+                if class_name not in group_counter:
+                    group_counter[class_name] = 0
+                
+                final_group_names = []
+                group_mapping = {}
+                for group_id in sorted(group_info.keys()):
+                    group_counter[class_name] += 1
+                    group_name = f"sed#{group_counter[class_name]:02d}"
+                    group_mapping[group_id] = group_name
+                    final_group_names.append(group_name)
+                
+                # Assign group names to pixels
+                for i, group_id in enumerate(pixel_groups):
+                    if group_id in group_mapping:
+                        all_groups.append(group_mapping[group_id])
+                    else:
+                        all_groups.append(f"{class_name}_dropped")
+                
+                if not quiet:
+                    print(f"   {class_name}: {len(roi_pixels)} pixels → {len(group_info)} groups via {method}")
+                    for gname in final_group_names[:5]:  # Show first 5
+                        gid = [k for k, v in group_mapping.items() if v == gname][0]
+                        print(f"      {gname}: {group_info[gid]['size']} pixels")
+                    if len(final_group_names) > 5:
+                        print(f"      ... and {len(final_group_names) - 5} more groups")
+                
+                continue  # Skip normal processing for sediment
+                
+            # Create binary mask (for bombs/dark - normal processing)
+            mask = np.zeros((n_tracks, n_slits), dtype=bool)
+            for slit_idx, track_idx in roi_pixels:
+                if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
+                    mask[track_idx, slit_idx] = True
+            
+            # Try connected components with morphological closing
+            try:
+                from scipy.ndimage import generate_binary_structure
+                struct = generate_binary_structure(2, 2)  # 8-connectivity
+                
+                # Morphological closing to merge nearby pixels
+                if closing_radius > 0:
+                    from scipy.ndimage import binary_dilation
+                    for _ in range(closing_radius):
+                        mask = binary_dilation(mask, structure=struct)
+                    for _ in range(closing_radius):
+                        mask = binary_closing(mask, structure=struct)
+                
+                # Connected components
+                labeled_mask, n_components = label(mask, structure=struct)
+                
+                # Extract group labels for each ROI pixel
+                pixel_groups = []
+                for slit_idx, track_idx in roi_pixels:
+                    if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
+                        group_id = labeled_mask[track_idx, slit_idx]
+                        pixel_groups.append(group_id)
+                    else:
+                        pixel_groups.append(-1)  # Invalid
+                
+                pixel_groups = np.array(pixel_groups)
+                method = "connected_components"
+                
+            except Exception as e:
+                # Fallback to DBSCAN
+                if not quiet:
+                    print(f"   ⚠️  Connected components failed for '{class_name}', using DBSCAN")
+                
+                try:
+                    from sklearn.cluster import DBSCAN
+                    
+                    # Get pixel coordinates
+                    coords = np.array(roi_pixels)  # Shape: (n_pixels, 2) = (slit, track)
+                    
+                    # DBSCAN clustering
+                    clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples, metric='euclidean')
+                    pixel_groups = clustering.fit_predict(coords)
+                    
+                    method = "DBSCAN"
+                    
+                except Exception as e2:
+                    # Final fallback: treat entire ROI as one group
+                    if not quiet:
+                        print(f"   ⚠️  DBSCAN also failed for '{class_name}', using single group")
+                    pixel_groups = np.zeros(len(roi_pixels), dtype=int)
+                    method = "single_group"
+            
+            # Filter and rename groups
+            unique_groups = np.unique(pixel_groups[pixel_groups >= 0])
+            
+            # Calculate group sizes and centroids
+            group_info = {}
+            for group_id in unique_groups:
+                group_mask = pixel_groups == group_id
+                group_size = np.sum(group_mask)
+                
+                if group_size >= min_group_size:
+                    # Calculate centroid
+                    group_pixels = np.array(roi_pixels)[group_mask]
+                    centroid = np.mean(group_pixels, axis=0)
+                    group_info[group_id] = {
+                        'size': group_size,
+                        'centroid': centroid,
+                        'pixels': group_mask
+                    }
+            
+            # Handle small groups: merge to nearest large group of same class
+            small_groups = [gid for gid in unique_groups if gid not in group_info]
+            if small_groups and group_info:
+                large_group_centroids = np.array([info['centroid'] for info in group_info.values()])
+                large_group_ids = list(group_info.keys())
+                
+                for small_gid in small_groups:
+                    small_mask = pixel_groups == small_gid
+                    small_pixels = np.array(roi_pixels)[small_mask]
+                    small_centroid = np.mean(small_pixels, axis=0).reshape(1, -1)
+                    
+                    # Find nearest large group
+                    distances = cdist(small_centroid, large_group_centroids)[0]
+                    nearest_idx = np.argmin(distances)
+                    nearest_gid = large_group_ids[nearest_idx]
+                    
+                    # Merge: assign small group pixels to nearest group
+                    pixel_groups[small_mask] = nearest_gid
+                    group_info[nearest_gid]['size'] += np.sum(small_mask)
+            
+            # Assign group names
+            if class_name not in group_counter:
+                group_counter[class_name] = 0
+            
+            final_group_names = []
+            group_mapping = {}
+            
+            for group_id in sorted(group_info.keys()):
+                group_counter[class_name] += 1
+                
+                # Create readable group names
+                if 'bomb' in class_name.lower():
+                    group_name = f"bomb#{group_counter[class_name]}"
+                elif 'dark' in class_name.lower():
+                    group_name = f"dark#{chr(64 + group_counter[class_name])}"  # A, B, C, ...
+                elif 'sediment' in class_name.lower() or 'sed' in class_name.lower():
+                    group_name = f"sed#{group_counter[class_name]:02d}"
+                else:
+                    group_name = f"{class_name}_grp{group_counter[class_name]}"
+                
+                group_mapping[group_id] = group_name
+                final_group_names.append(group_name)
+            
+            # Assign group names to pixels
+            for i, group_id in enumerate(pixel_groups):
+                if group_id in group_mapping:
+                    all_groups.append(group_mapping[group_id])
+                else:
+                    # Dropped pixel (too small group, no merge possible)
+                    all_groups.append(f"{class_name}_dropped")
+            
+            if not quiet:
+                print(f"   {class_name}: {len(roi_pixels)} pixels → {len(group_info)} groups via {method}")
+                for gname in final_group_names:
+                    gid = [k for k, v in group_mapping.items() if v == gname][0]
+                    print(f"      {gname}: {group_info[gid]['size']} pixels")
+        
+        return all_groups, list(set(all_groups))
+
+    def train_svm_with_cv(
+        self,
+        training_rois,
+        segment_start,
+        segment_end,
+        wavelength_range=None,
+        cv_folds=5,
+        use_corrected=True,
+        svm_kernel="rbf",
+        optimize_params=True,
+        svm_C=1.0,
+        svm_gamma="scale",
+        use_spatial_groups=True,  # 🔥 NEW: Use spatial clustering for groups
+        closing_radius=3,  # 🔥 NEW: Morphological closing radius (bombs/dark)
+        min_group_size=20,  # 🔥 NEW: Minimum pixels per group (bombs/dark)
+        use_grid_for_sediment=True,  # 🔥 NEW: Use grid for sediment instead of clustering
+        sediment_grid_tile_slit=100,  # 🔥 NEW: Grid tile size in slit direction
+        sediment_grid_tile_track=200,  # 🔥 NEW: Grid tile size in track direction
+        sediment_min_group_size=10,  # 🔥 NEW: Min pixels for sediment tiles
+        subsample_per_group=None,  # 🔥 NEW: Max pixels per group (None = no limit)
+        use_sample_weights=False,  # 🔥 NEW: Weight pixels by 1/group_size
+        quiet=False,
+    ):
+        """
+        Train SVM classifier with K-fold cross-validation on ROI pixels OUTSIDE the segment.
+
+        This method:
+        1. Extracts training pixels from ROIs that are OUTSIDE [segment_start, segment_end]
+        2. Performs K-fold cross-validation to evaluate model performance
+        3. Trains a final SVM model on ALL outside pixels
+        4. Returns the trained model + CV metrics + filtered ROI coordinates
+
+        Args:
+            training_rois: List of ROI names to use for training (e.g., ["training_dark", "training_sediment"])
+            segment_start: Start track index of segment (pixels outside this will be used for training)
+            segment_end: End track index of segment (pixels outside this will be used for training)
+            wavelength_range: Tuple (min_wl, max_wl) to restrict wavelengths used (e.g., (500, 650))
+                             If None, uses all wavelengths
+            cv_folds: Number of folds for cross-validation (default: 5)
+            use_corrected: Use corrected data (True) or raw data (False)
+            svm_kernel: SVM kernel ('rbf', 'linear', 'poly', 'sigmoid')
+            optimize_params: If True, use GridSearchCV to find best C and gamma
+            svm_C: SVM penalty parameter (used if optimize_params=False)
+            svm_gamma: SVM kernel coefficient (used if optimize_params=False)
+            quiet: Suppress progress messages
+
+        Returns:
+            dict with keys:
+                - 'model': Trained SVM model (SVC object)
+                - 'label_encoder': LabelEncoder for class names
+                - 'class_names': List of class names
+                - 'cv_results': Dict with per-fold metrics
+                    - 'accuracy': List of accuracy per fold
+                    - 'precision': List of precision per fold (macro avg)
+                    - 'recall': List of recall per fold (macro avg)
+                    - 'f1': List of F1 per fold (macro avg)
+                    - 'confusion_matrices': List of confusion matrices per fold
+                - 'cv_mean_metrics': Dict with mean metrics across folds
+                    - 'accuracy_mean', 'accuracy_std'
+                    - 'precision_mean', 'precision_std'
+                    - 'recall_mean', 'recall_std'
+                    - 'f1_mean', 'f1_std'
+                - 'best_params': Dict with best C and gamma (if optimize_params=True)
+                - 'training_pixels_per_class': Dict with pixel counts per class
+                - 'filtered_training_rois': Dict with ROI coordinates actually used (for visualization)
+                - 'filtered_pixels_outside': Number of pixels kept (outside segment)
+                - 'filtered_pixels_inside': Number of pixels rejected (inside segment)
+        """
+        from sklearn.svm import SVC
+        from sklearn.preprocessing import LabelEncoder
+        from sklearn.model_selection import GridSearchCV, GroupKFold  # 🔥 CHANGED: Removed StratifiedKFold, added GroupKFold
+        from sklearn.metrics import (
+            confusion_matrix,
+            classification_report,
+            accuracy_score,
+            precision_recall_fscore_support,
+        )
+        import time
+
+        if not quiet:
+            print("=" * 60)
+            print("🤖 SVM TRAINING WITH CROSS-VALIDATION")
+            print("=" * 60)
+
+        # Convert list of ROI names to dict
+        if isinstance(training_rois, list):
+            roi_dict = {}
+            for roi_name in training_rois:
+                if roi_name in self.roi_collection:
+                    roi_dict[roi_name] = self.roi_collection[roi_name]
+                else:
+                    print(f"⚠️  Warning: ROI '{roi_name}' not found in roi_collection")
+            training_rois = roi_dict
+
+        if not training_rois:
+            raise ValueError("No valid training ROIs provided")
+
+        # Get datacube
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        if cube_data is None:
+            raise ValueError(
+                "No data loaded. Call cube.load_data() or cube.apply_illumination_correction_v2() first."
+            )
+
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Filter wavelengths if range specified
+        if wavelength_range is not None:
+            wl_min, wl_max = wavelength_range
+            wl_mask = (self.wavelengths >= wl_min) & (self.wavelengths <= wl_max)
+            wl_indices = np.where(wl_mask)[0]
+            cube_data = cube_data[:, :, wl_indices]
+            wavelengths_used = self.wavelengths[wl_indices]
+            n_wavelengths = len(wl_indices)
+            
+            if not quiet:
+                print(f"\n� Wavelength filtering:")
+                print(f"   Range: {wl_min} - {wl_max} nm")
+                print(f"   Wavelengths used: {n_wavelengths} (from {len(self.wavelengths)})")
+        else:
+            wl_indices = np.arange(len(self.wavelengths))
+            wavelengths_used = self.wavelengths
+
+        if not quiet:
+            print(f"\n�📦 Datacube shape: {cube_data.shape}")
+            print(f"📏 Using data: {'corrected' if use_corrected else 'raw'}")
+            print(f"🎯 Segment range: tracks {segment_start} to {segment_end}")
+            print(f"📍 Training ROIs: {list(training_rois.keys())}")
+
+        # Store wavelength info for classification
+        self.svm_wavelength_indices = wl_indices
+        self.svm_wavelengths = wavelengths_used
+
+        # Extract training pixels OUTSIDE segment
+        X_train = []
+        y_train = []
+        training_pixel_counts = {}
+        filtered_training_rois = {}
+        filtered_training_rois_for_grouping = {}  # Track which pixels are kept per class
+        pixels_kept_outside = 0
+        pixels_rejected_inside = 0
+
+        if not quiet:
+            print(f"\n🔍 Filtering ROI pixels...")
+
+        for class_name, roi_pixels in training_rois.items():
+            class_pixels = []
+            filtered_pixels = []
+
+            for slit_idx, track_idx in roi_pixels:  # ROIs stored as (slit, track)
+                # Check if pixel is OUTSIDE segment
+                if track_idx < segment_start or track_idx > segment_end:
+                    # Valid training pixel (outside segment)
+                    if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
+                        spectrum = cube_data[track_idx, slit_idx, :]
+                        class_pixels.append(spectrum)
+                        filtered_pixels.append(
+                            (slit_idx, track_idx)
+                        )  # Store as (slit, track)
+                        pixels_kept_outside += 1
+                else:
+                    # Pixel is inside segment - reject it
+                    pixels_rejected_inside += 1
+
+            if len(class_pixels) > 0:
+                X_train.extend(class_pixels)
+                y_train.extend([class_name] * len(class_pixels))
+                training_pixel_counts[class_name] = len(class_pixels)
+                filtered_training_rois[class_name] = filtered_pixels
+                filtered_training_rois_for_grouping[class_name] = filtered_pixels  # For spatial clustering
+
+                if not quiet:
+                    print(
+                        f"   {class_name}: {len(class_pixels)} pixels (rejected {len(roi_pixels) - len(class_pixels)} inside segment)"
+                    )
+            else:
+                print(
+                    f"   ⚠️  Warning: No valid training pixels for class '{class_name}' outside segment!"
+                )
+
+        if not X_train:
+            raise ValueError("No training pixels found outside segment!")
+
+        X_train = np.array(X_train)
+        y_train = np.array(y_train)
+
+        if not quiet:
+            print(
+                f"\n✅ Training data: {X_train.shape[0]} pixels, {X_train.shape[1]} wavelengths"
+            )
+            print(f"   Kept (outside segment): {pixels_kept_outside}")
+            print(f"   Rejected (inside segment): {pixels_rejected_inside}")
+
+        # Create spatial groups for CV
+        if use_spatial_groups:
+            groups, unique_group_names = self._create_spatial_groups(
+                filtered_training_rois_for_grouping,
+                cube_data.shape,
+                closing_radius=closing_radius,
+                min_group_size=min_group_size,
+                use_grid_for_sediment=use_grid_for_sediment,  # 🔥 NEW
+                sediment_grid_tile_slit=sediment_grid_tile_slit,  # 🔥 NEW
+                sediment_grid_tile_track=sediment_grid_tile_track,  # 🔥 NEW
+                sediment_min_group_size=sediment_min_group_size,  # 🔥 NEW
+                quiet=quiet,
+            )
+            groups = np.array(groups)
+        else:
+            # Simple grouping by class name (old behavior - not recommended)
+            groups = y_train.copy()
+            if not quiet:
+                print(f"\n⚠️  Using simple class-based grouping (spatial_groups=False)")
+
+        # Subsample per group if requested (prevent large groups from dominating)
+        if subsample_per_group is not None:
+            if not quiet:
+                print(f"\n✂️  Subsampling: max {subsample_per_group} pixels per group...")
+            
+            keep_indices = []
+            for group_name in np.unique(groups):
+                group_mask = groups == group_name
+                group_indices = np.where(group_mask)[0]
+                
+                if len(group_indices) > subsample_per_group:
+                    # Randomly sample subsample_per_group pixels
+                    np.random.seed(42)
+                    sampled_indices = np.random.choice(group_indices, subsample_per_group, replace=False)
+                    keep_indices.extend(sampled_indices)
+                    if not quiet:
+                        print(f"   {group_name}: {len(group_indices)} → {subsample_per_group} pixels")
+                else:
+                    keep_indices.extend(group_indices)
+            
+            keep_indices = np.array(keep_indices)
+            X_train = X_train[keep_indices]
+            y_train = y_train[keep_indices]
+            groups = groups[keep_indices]
+            
+            if not quiet:
+                print(f"   Total: {len(keep_indices)} pixels after subsampling")
+        
+        # Calculate sample weights if requested (weight by 1/group_size)
+        sample_weights = None
+        if use_sample_weights:
+            if not quiet:
+                print(f"\n⚖️  Using sample weights: weight = 1 / group_size")
+            
+            sample_weights = np.zeros(len(groups))
+            for group_name in np.unique(groups):
+                group_mask = groups == group_name
+                group_size = np.sum(group_mask)
+                sample_weights[group_mask] = 1.0 / group_size
+            
+            # Normalize so weights sum to number of samples
+            sample_weights = sample_weights * len(sample_weights) / np.sum(sample_weights)
+            
+            if not quiet:
+                print(f"   Weight range: {sample_weights.min():.3f} - {sample_weights.max():.3f}")
+
+        # Encode labels
+        le = LabelEncoder()
+        y_train_encoded = le.fit_transform(y_train)
+        class_names = le.classes_.tolist()
+
+        if not quiet:
+            print(f"\n📊 Final training data:")
+            print(f"   Classes: {class_names}")
+            print(f"   Total pixels: {len(X_train)}")
+            print(f"   Unique spatial groups: {len(np.unique(groups))}")
+            print(f"   Group names: {sorted(np.unique(groups).tolist())}")
+
+        # Adjust cv_folds to number of unique groups (can't have more folds than groups)
+        n_groups = len(np.unique(groups))
+        if cv_folds > n_groups:
+            if not quiet:
+                print(f"\n⚠️  WARNING: Requested {cv_folds} folds but only {n_groups} ROI groups available")
+                print(f"   Reducing to {n_groups}-fold CV (Leave-One-Group-Out)")
+            cv_folds = n_groups
+
+        # Cross-validation with GROUPED folds (prevent data leakage)
+        if not quiet:
+            print(f"\n🔄 Performing {cv_folds}-fold GROUPED cross-validation...")
+
+        try:
+            from sklearn.model_selection import StratifiedGroupKFold
+            sgkf = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+            cv_splitter = sgkf
+            if not quiet:
+                print(f"   ✅ Using StratifiedGroupKFold (maintains class distribution + grouping)")
+        except ImportError:
+            from sklearn.model_selection import GroupKFold
+            gkf = GroupKFold(n_splits=cv_folds)
+            cv_splitter = gkf
+            if not quiet:
+                print(f"   ⚠️  StratifiedGroupKFold not available, using GroupKFold (grouping only)")
+
+        cv_accuracy = []
+        cv_precision = []
+        cv_recall = []
+        cv_f1 = []
+        cv_confusion_matrices = []
+
+        for fold_idx, (train_idx, val_idx) in enumerate(
+            cv_splitter.split(X_train, y_train_encoded, groups=groups)  # 🔥 NEW: Pass groups
+        ):
+            X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+            y_fold_train, y_fold_val = (
+                y_train_encoded[train_idx],
+                y_train_encoded[val_idx],
+            )
+            groups_fold_train = groups[train_idx]
+            groups_fold_val = groups[val_idx]
+
+            # 🔥 NEW: Verify no ROI overlap between train/val (data leakage check)
+            train_roi_set = set(groups_fold_train)
+            val_roi_set = set(groups_fold_val)
+            overlap = train_roi_set & val_roi_set
+            
+            # Class distribution
+            from collections import Counter
+            train_counts = Counter(y_train[train_idx])
+            val_counts = Counter(y_train[val_idx])
+            
+            # Check if all classes present in validation
+            val_classes = set(val_counts.keys())
+            all_classes = set(class_names)
+            missing_classes = all_classes - val_classes
+            
+            if not quiet:
+                print(f"\n   📂 Fold {fold_idx + 1}/{cv_folds}:")
+                print(f"      Train groups: {sorted(train_roi_set)}")
+                print(f"      Val groups:   {sorted(val_roi_set)}")
+                
+                if overlap:
+                    print(f"      ❌ OVERLAP DETECTED: {overlap} (DATA LEAKAGE!)")
+                else:
+                    print(f"      ✅ No overlap (clean split)")
+                
+                print(f"      Train samples: {dict(train_counts)}")
+                print(f"      Val samples:   {dict(val_counts)}")
+                
+                if missing_classes:
+                    print(f"      ⚠️  MISSING CLASSES IN VAL: {missing_classes}")
+
+            # Train SVM on this fold
+            if optimize_params:
+                param_grid = {
+                    "C": [0.1, 1, 10, 100, 1000],
+                    "gamma": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1, "scale", "auto"],
+                }
+                # 🔥 NEW: Use GroupKFold for inner CV in GridSearchCV, but only if enough groups
+                n_train_groups = len(train_roi_set)
+                if n_train_groups >= 3:
+                    # Use GroupKFold for inner CV (grouped splitting)
+                    inner_cv = GroupKFold(n_splits=min(3, n_train_groups))
+                    grid_search = GridSearchCV(
+                        SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                        param_grid,
+                        cv=inner_cv,
+                        scoring="f1_macro",
+                        n_jobs=-1,
+                    )
+                    grid_search.fit(X_fold_train, y_fold_train, groups=groups_fold_train)
+                else:
+                    # Not enough groups for inner CV - use simple train/val split (no inner CV)
+                    if not quiet:
+                        print(f"      ⚠️  Only {n_train_groups} groups in training - skipping inner CV, using default params")
+                    grid_search = GridSearchCV(
+                        SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                        param_grid,
+                        cv=2,  # Minimum CV splits
+                        scoring="f1_macro",
+                        n_jobs=-1,
+                    )
+                    grid_search.fit(X_fold_train, y_fold_train)  # No groups for inner CV
+                fold_model = grid_search.best_estimator_
+            else:
+                fold_model = SVC(
+                    kernel=svm_kernel, C=svm_C, gamma=svm_gamma, class_weight="balanced", random_state=42  # 🔥 NEW: class_weight="balanced"
+                )
+                fold_model.fit(X_fold_train, y_fold_train)
+
+            # Predict on validation set
+            y_fold_pred = fold_model.predict(X_fold_val)
+
+            # Calculate metrics
+            fold_accuracy = accuracy_score(y_fold_val, y_fold_pred)
+            fold_precision, fold_recall, fold_f1, _ = precision_recall_fscore_support(
+                y_fold_val, y_fold_pred, average="macro", zero_division=0
+            )
+            fold_cm = confusion_matrix(y_fold_val, y_fold_pred)
+
+            cv_accuracy.append(fold_accuracy)
+            cv_precision.append(fold_precision)
+            cv_recall.append(fold_recall)
+            cv_f1.append(fold_f1)
+            cv_confusion_matrices.append(fold_cm)
+
+            if not quiet:
+                print(
+                    f"      📊 Results: Accuracy={fold_accuracy:.3f}, Precision={fold_precision:.3f}, Recall={fold_recall:.3f}, F1={fold_f1:.3f}"
+                )
+
+        # Calculate mean CV metrics
+        cv_mean_metrics = {
+            "accuracy_mean": np.mean(cv_accuracy),
+            "accuracy_std": np.std(cv_accuracy),
+            "precision_mean": np.mean(cv_precision),
+            "precision_std": np.std(cv_precision),
+            "recall_mean": np.mean(cv_recall),
+            "recall_std": np.std(cv_recall),
+            "f1_mean": np.mean(cv_f1),
+            "f1_std": np.std(cv_f1),
+        }
+
+        if not quiet:
+            print(f"\n📊 Cross-Validation Results (mean ± std):")
+            print(
+                f"   Accuracy:  {cv_mean_metrics['accuracy_mean']:.3f} ± {cv_mean_metrics['accuracy_std']:.3f}"
+            )
+            print(
+                f"   Precision: {cv_mean_metrics['precision_mean']:.3f} ± {cv_mean_metrics['precision_std']:.3f}"
+            )
+            print(
+                f"   Recall:    {cv_mean_metrics['recall_mean']:.3f} ± {cv_mean_metrics['recall_std']:.3f}"
+            )
+            print(
+                f"   F1 Score:  {cv_mean_metrics['f1_mean']:.3f} ± {cv_mean_metrics['f1_std']:.3f}"
+            )
+
+        # Train final model on ALL training data
+        if not quiet:
+            print(f"\n🏋️  Training final SVM on all {len(X_train)} training pixels...")
+
+        start_time = time.time()
+
+        if optimize_params:
+            param_grid = {
+                "C": [0.1, 1, 10, 100, 1000],
+                "gamma": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1, "scale", "auto"],
+            }
+            # 🔥 NEW: Use GroupKFold for inner CV in final GridSearchCV
+            n_unique_groups = len(np.unique(groups))
+            if n_unique_groups >= 3:
+                final_inner_cv = GroupKFold(n_splits=min(3, n_unique_groups))
+                grid_search = GridSearchCV(
+                    SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                    param_grid,
+                    cv=final_inner_cv,
+                    scoring="f1_macro",
+                    n_jobs=-1,
+                )
+                grid_search.fit(X_train, y_train_encoded, groups=groups)
+            else:
+                # Not enough groups - use standard CV (falls back to pixel-level for hyperparameter tuning only)
+                if not quiet:
+                    print(f"   ⚠️  Only {n_unique_groups} ROI groups - using pixel-level CV for hyperparameter tuning")
+                grid_search = GridSearchCV(
+                    SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                    param_grid,
+                    cv=3,
+                    scoring="f1_macro",
+                    n_jobs=-1,
+                )
+                grid_search.fit(X_train, y_train_encoded)
+            final_model = grid_search.best_estimator_
+            best_params = grid_search.best_params_
+
+            if not quiet:
+                print(
+                    f"   Best parameters: C={best_params['C']}, gamma={best_params['gamma']}"
+                )
+        else:
+            final_model = SVC(
+                kernel=svm_kernel, C=svm_C, gamma=svm_gamma, class_weight="balanced", random_state=42  # 🔥 NEW: class_weight="balanced"
+            )
+            final_model.fit(X_train, y_train_encoded)
+            best_params = {"C": svm_C, "gamma": svm_gamma}
+
+        training_time = time.time() - start_time
+
+        # Store model in cube
+        self.svm_model = final_model
+        self.svm_label_encoder = le
+        self.svm_class_names = class_names
+        self.svm_training_segment = (segment_start, segment_end)
+        
+        # Store spatial groups for visualization
+        if use_spatial_groups:
+            # Create spatial_groups_roi_collection for plotting
+            spatial_groups_roi = {}
+            for i, (pixel, group_name) in enumerate(zip(filtered_training_rois_for_grouping, groups)):
+                if group_name not in spatial_groups_roi:
+                    spatial_groups_roi[group_name] = []
+                # Get the actual pixel coordinate from filtered_training_rois
+                # Need to reconstruct which pixel this is
+                pass
+            
+            # Better approach: reconstruct from groups array
+            spatial_groups_roi_collection = {}
+            pixel_idx = 0
+            for class_name, class_pixels in filtered_training_rois.items():
+                for pixel_coord in class_pixels:
+                    if pixel_idx < len(groups):
+                        group_name = groups[pixel_idx]
+                        if group_name not in spatial_groups_roi_collection:
+                            spatial_groups_roi_collection[group_name] = []
+                        spatial_groups_roi_collection[group_name].append(pixel_coord)
+                        pixel_idx += 1
+            
+            self.svm_spatial_groups = spatial_groups_roi_collection
+        else:
+            self.svm_spatial_groups = None
+
+        if not quiet:
+            print(f"   ✅ Training complete in {training_time:.2f} seconds")
+            print("\n✅ SVM training with cross-validation complete!")
+            print("=" * 60)
+
+        return {
+            "model": final_model,
+            "label_encoder": le,
+            "class_names": class_names,
+            "cv_results": {
+                "accuracy": cv_accuracy,
+                "precision": cv_precision,
+                "recall": cv_recall,
+                "f1": cv_f1,
+                "confusion_matrices": cv_confusion_matrices,
+            },
+            "cv_mean_metrics": cv_mean_metrics,
+            "best_params": best_params,
+            "training_pixels_per_class": training_pixel_counts,
+            "filtered_training_rois": filtered_training_rois,
+            "spatial_groups_roi_collection": spatial_groups_roi_collection if use_spatial_groups else None,  # 🔥 NEW
+            "filtered_pixels_outside": pixels_kept_outside,
+            "filtered_pixels_inside": pixels_rejected_inside,
+            "training_time": training_time,
+        }
+
+    def classify_segment_with_validation(
+        self,
+        segment_start,
+        segment_end,
+        validation_rois,
+        validation_class_mapping=None,
+        use_corrected=True,
+        save_to_h5=True,
+        dataset_name="svm_classification_validated",
+        quiet=False,
+    ):
+        """
+        Classify segment pixels and evaluate using validation ROIs INSIDE the segment.
+
+        This method:
+        1. Classifies all pixels in [segment_start, segment_end] using trained SVM
+        2. Extracts validation pixels from ROIs that are INSIDE the segment
+        3. Computes confusion matrix and per-class metrics on validation pixels
+        4. Returns classification map + validation metrics + filtered validation ROI coordinates
+
+        Args:
+            segment_start: Start track index of segment to classify
+            segment_end: End track index of segment to classify
+            validation_rois: List of ROI names for validation (e.g., ["sediment", "dark spots", "all bombs"])
+            validation_class_mapping: Dict mapping validation ROI names to training class names
+                                     (e.g., {"sediment": "training_sediment", "dark spots": "training_dark"})
+                                     If None, assumes validation ROI names match training class names
+            use_corrected: Use corrected data (True) or raw data (False)
+            save_to_h5: Save classification map to H5 files
+            dataset_name: Name of dataset in H5 file
+            quiet: Suppress progress messages
+
+        Returns:
+            dict with keys:
+                - 'classification_map': 2D array of class names (track x slit)
+                - 'classification_map_encoded': 2D array of class indices (track x slit)
+                - 'class_names': List of class names
+                - 'track_range': Tuple (segment_start, segment_end)
+                - 'validation_metrics': Dict with validation results
+                    - 'confusion_matrix': 3×3 confusion matrix
+                    - 'accuracy': Overall accuracy on validation pixels
+                    - 'precision_per_class': Dict of precision per class
+                    - 'recall_per_class': Dict of recall per class
+                    - 'f1_per_class': Dict of F1 per class
+                    - 'support_per_class': Dict of pixel counts per class
+                - 'filtered_validation_rois': Dict with ROI coordinates actually used (for visualization)
+                - 'validation_pixels_inside': Number of validation pixels kept (inside segment)
+                - 'validation_pixels_outside': Number of validation pixels rejected (outside segment)
+        """
+        from sklearn.metrics import (
+            confusion_matrix,
+            classification_report,
+            accuracy_score,
+            precision_recall_fscore_support,
+        )
+        import time
+
+        if not quiet:
+            print("=" * 60)
+            print("🎯 SEGMENT CLASSIFICATION WITH VALIDATION")
+            print("=" * 60)
+
+        # Check if model is trained
+        if not hasattr(self, "svm_model"):
+            raise ValueError(
+                "No SVM model found. Train a model first using train_svm_with_cv()"
+            )
+
+        # Get datacube
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        if cube_data is None:
+            raise ValueError(
+                "No data loaded. Call cube.load_data() or cube.apply_illumination_correction_v2() first."
+            )
+
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Apply same wavelength filtering as training
+        if hasattr(self, 'svm_wavelength_indices'):
+            cube_data = cube_data[:, :, self.svm_wavelength_indices]
+            if not quiet:
+                print(f"\n📊 Using wavelength subset: {len(self.svm_wavelength_indices)} wavelengths")
+
+        if not quiet:
+            print(f"\n📦 Datacube shape: {cube_data.shape}")
+            print(f"📏 Using data: {'corrected' if use_corrected else 'raw'}")
+            print(f"🎯 Segment range: tracks {segment_start} to {segment_end}")
+
+        # Extract segment
+        if not quiet:
+            print(f"\n🔪 Extracting segment...")
+
+        segment_data = cube_data[segment_start : segment_end + 1, :, :]
+        segment_shape = segment_data.shape
+
+        if not quiet:
+            print(f"   Segment shape: {segment_shape}")
+
+        # Classify segment
+        total_pixels = segment_shape[0] * segment_shape[1]
+        if not quiet:
+            print(f"\n🤖 Classifying {total_pixels} pixels...")
+
+        start_time = time.time()
+
+        X_classify = segment_data.reshape(-1, segment_data.shape[2])
+        
+        # Classify with progress bar (batch processing for better visualization)
+        batch_size = 10000  # Classify 10k pixels at a time
+        n_batches = int(np.ceil(len(X_classify) / batch_size))
+        y_pred_encoded = np.zeros(len(X_classify), dtype=int)
+        
+        if not quiet:
+            from tqdm import tqdm
+            progress_bar = tqdm(total=len(X_classify), desc="   Classifying", unit="pixels", ncols=100)
+        
+        for i in range(n_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(X_classify))
+            batch = X_classify[start_idx:end_idx]
+            y_pred_encoded[start_idx:end_idx] = self.svm_model.predict(batch)
+            
+            if not quiet:
+                progress_bar.update(len(batch))
+        
+        if not quiet:
+            progress_bar.close()
+        
+        y_pred = self.svm_label_encoder.inverse_transform(y_pred_encoded)
+
+        classification_map = y_pred.reshape(segment_shape[0], segment_shape[1])
+        classification_map_encoded = y_pred_encoded.reshape(
+            segment_shape[0], segment_shape[1]
+        )
+
+        classification_time = time.time() - start_time
+
+        if not quiet:
+            print(f"   ✅ Classification complete in {classification_time:.2f} seconds")
+
+            # Class distribution
+            unique, counts = np.unique(y_pred, return_counts=True)
+            print(f"\n📊 Classification distribution:")
+            for class_name, count in zip(unique, counts):
+                percentage = (count / len(y_pred)) * 100
+                print(f"   {class_name}: {count} pixels ({percentage:.1f}%)")
+
+        # Validation on inside-segment ROIs
+        if validation_rois:
+            if not quiet:
+                print(f"\n✅ Validating on ROIs inside segment...")
+
+            # Convert list to dict
+            if isinstance(validation_rois, list):
+                val_roi_dict = {}
+                for roi_name in validation_rois:
+                    if roi_name in self.roi_collection:
+                        val_roi_dict[roi_name] = self.roi_collection[roi_name]
+                    else:
+                        print(f"   ⚠️  Warning: Validation ROI '{roi_name}' not found")
+                validation_rois = val_roi_dict
+
+            # Extract validation pixels INSIDE segment
+            X_val = []
+            y_val_true = []
+            filtered_validation_rois = {}
+            val_pixels_inside = 0
+            val_pixels_outside = 0
+
+            for roi_name, roi_pixels in validation_rois.items():
+                # Map validation ROI name to training class name
+                if validation_class_mapping and roi_name in validation_class_mapping:
+                    class_name = validation_class_mapping[roi_name]
+                else:
+                    class_name = roi_name  # Assume same name
+
+                # Check if this class was in training
+                if class_name not in self.svm_class_names:
+                    print(
+                        f"   ⚠️  Warning: ROI '{roi_name}' maps to class '{class_name}' which was not in training. Skipping."
+                    )
+                    continue
+
+                class_pixels = []
+                filtered_pixels = []
+
+                for slit_idx, track_idx in roi_pixels:  # ROIs stored as (slit, track)
+                    # Check if pixel is INSIDE segment
+                    if segment_start <= track_idx <= segment_end:
+                        if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
+                            spectrum = cube_data[track_idx, slit_idx, :]
+                            class_pixels.append(spectrum)
+                            filtered_pixels.append(
+                                (slit_idx, track_idx)
+                            )  # Store as (slit, track)
+                            y_val_true.append(class_name)  # Use mapped class name
+                            val_pixels_inside += 1
+                    else:
+                        # Pixel is outside segment - reject it
+                        val_pixels_outside += 1
+
+                if len(class_pixels) > 0:
+                    X_val.extend(class_pixels)
+                    filtered_validation_rois[roi_name] = (
+                        filtered_pixels  # Store with original ROI name
+                    )
+
+                    if not quiet:
+                        display_name = (
+                            f"{roi_name} → {class_name}"
+                            if validation_class_mapping
+                            and roi_name in validation_class_mapping
+                            else class_name
+                        )
+                        print(
+                            f"   {display_name}: {len(class_pixels)} validation pixels (rejected {len(roi_pixels) - len(class_pixels)} outside segment)"
+                        )
+                else:
+                    print(
+                        f"   ⚠️  Warning: No validation pixels for '{class_name}' inside segment!"
+                    )
+
+            if X_val:
+                X_val = np.array(X_val)
+                y_val_true = np.array(y_val_true)
+
+                # Predict on validation pixels
+                y_val_pred_encoded = self.svm_model.predict(X_val)
+                y_val_pred = self.svm_label_encoder.inverse_transform(
+                    y_val_pred_encoded
+                )
+
+                # Compute metrics
+                val_accuracy = accuracy_score(y_val_true, y_val_pred)
+                val_cm = confusion_matrix(
+                    y_val_true, y_val_pred, labels=self.svm_class_names
+                )
+
+                # Per-class metrics
+                precision, recall, f1, support = precision_recall_fscore_support(
+                    y_val_true,
+                    y_val_pred,
+                    labels=self.svm_class_names,
+                    zero_division=0,
+                )
+
+                val_metrics = {
+                    "confusion_matrix": val_cm,
+                    "accuracy": val_accuracy,
+                    "precision_per_class": dict(zip(self.svm_class_names, precision)),
+                    "recall_per_class": dict(zip(self.svm_class_names, recall)),
+                    "f1_per_class": dict(zip(self.svm_class_names, f1)),
+                    "support_per_class": dict(zip(self.svm_class_names, support)),
+                }
+
+                if not quiet:
+                    print(f"\n📈 Validation Results:")
+                    print(f"   Overall Accuracy: {val_accuracy:.3f}")
+                    print(f"\n   Confusion Matrix:")
+                    print(f"   Classes: {self.svm_class_names}")
+                    print(val_cm)
+                    print(f"\n   Per-Class Metrics:")
+                    for class_name in self.svm_class_names:
+                        print(
+                            f"   {class_name}: P={val_metrics['precision_per_class'][class_name]:.3f}, "
+                            f"R={val_metrics['recall_per_class'][class_name]:.3f}, "
+                            f"F1={val_metrics['f1_per_class'][class_name]:.3f}, "
+                            f"Support={val_metrics['support_per_class'][class_name]}"
+                        )
+            else:
+                val_metrics = None
+                filtered_validation_rois = {}
+                val_pixels_inside = 0
+                if not quiet:
+                    print(f"   ⚠️  No validation pixels found inside segment")
+        else:
+            val_metrics = None
+            filtered_validation_rois = {}
+            val_pixels_inside = 0
+            val_pixels_outside = 0
+
+        # Save to H5
+        if save_to_h5:
+            if not quiet:
+                print(f"\n💾 Saving classification to H5 files...")
+
+            for geofile in self.geofiles:
+                try:
+                    with h5py.File(geofile.path, "a") as f:
+                        ds_path = f"processed/{dataset_name}"
+
+                        if ds_path in f:
+                            del f[ds_path]
+
+                        ds = f.create_dataset(
+                            ds_path,
+                            data=classification_map_encoded,
+                            compression="gzip",
+                        )
+                        ds.attrs["class_names"] = self.svm_class_names
+                        ds.attrs["track_start"] = segment_start
+                        ds.attrs["track_end"] = segment_end
+
+                        if not quiet:
+                            print(
+                                f"   💾 Saved to: {geofile.name} → {ds_path}"
+                            )
+
+                except Exception as e:
+                    print(f"   ⚠️  Could not save to {geofile.name}: {e}")
+
+        # Store results
+        self.svm_classification_map = classification_map
+        self.svm_classification_map_encoded = classification_map_encoded
+        self.svm_classification_range = (segment_start, segment_end)
+        self.svm_validation_class_mapping = validation_class_mapping  # Store mapping for plotting colors
+
+        results = {
+            "classification_map": classification_map,
+            "classification_map_encoded": classification_map_encoded,
+            "class_names": self.svm_class_names,
+            "track_range": (segment_start, segment_end),
+            "classification_time": classification_time,
+            "validation_metrics": val_metrics,
+            "filtered_validation_rois": filtered_validation_rois,
+            "validation_pixels_inside": val_pixels_inside,
+            "validation_pixels_outside": val_pixels_outside,
+        }
+
+        if not quiet:
+            print("\n✅ Classification and validation complete!")
+            print("=" * 60)
+
+        return results
+
+    def plot_classification_map(
+        self,
+        coordinate_system="NED",
+        figsize=(30, 10),
+        cmap="tab10",
+        show_legend=True,
+        quiet=True,
+    ):
+        """
+        Plot the classified map with class colors.
+
+        Args:
+            coordinate_system: 'NED', 'ECEF', or 'LATLON'
+            figsize: Figure size (width, height)
+            cmap: Colormap for classes
+            show_legend: Show legend with class names
+            quiet: Suppress plot_georef debug output
+
+        Example:
+            cube.plot_classification_map(coordinate_system="NED", figsize=(40, 10))
+        """
+        if not hasattr(self, "svm_classification_map_encoded"):
+            raise ValueError(
+                "No classification results found. Run classify_svm() first."
+            )
+
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+
+        track_start, track_end = self.svm_classification_range
+
+        # Get georeferencing info (reuse plot_georef logic)
+        # Note: track_start and track_end are absolute indices
+        # ECEF arrays are 2D: (tracks, slits)
+        X_ecef = self.X_ecef[track_start:track_end+1, :]
+        Y_ecef = self.Y_ecef[track_start:track_end+1, :]
+        Z_ecef = self.Z_ecef[track_start:track_end+1, :]
+
+        # Transform coordinates based on coordinate system
+        if coordinate_system.upper() == "LATLON":
+            from pyproj import Transformer
+            tf_ecef_to_geo = Transformer.from_crs(
+                "EPSG:4978", "EPSG:4979", always_xy=True
+            )
+            lon, lat, height = tf_ecef_to_geo.transform(X_ecef, Y_ecef, Z_ecef)
+            Xp, Yp = lon, lat
+            xlabel, ylabel = "Longitude (°)", "Latitude (°)"
+        elif coordinate_system.upper() == "NED":
+            # Get origin from config
+            if (
+                "config" in globals()
+                and hasattr(config, "LAT0")
+                and hasattr(config, "LON0")
+            ):
+                lat0 = float(config.LAT0)
+                lon0 = float(config.LON0)
+                h0 = float(getattr(config, "H0", 0.0))
+            else:
+                lat0, lon0, h0 = 60.8011575, 10.7122345, 0.0
+            
+            N, E, D = _ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, lat0, lon0, h0)
+            Xp, Yp = E, N
+            xlabel = f"East (m) from {lat0}°, {lon0}°"
+            ylabel = "North (m)"
+        elif coordinate_system.upper() == "ECEF":
+            Xp, Yp = X_ecef, Y_ecef
+            xlabel, ylabel = "ECEF X (m)", "ECEF Y (m)"
+        else:
+            raise ValueError("coordinate_system must be 'LATLON', 'NED', or 'ECEF'")
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Get classification map
+        class_map = self.svm_classification_map_encoded
+
+        # Create colormap and display labels
+        n_classes = len(self.svm_class_names)
+        colors = []
+        display_labels = []
+        
+        # Use validation_class_mapping to find correct validation ROI colors
+        # The mapping is: {"validation_roi_name": "training_class_name"}
+        # We need reverse: {"training_class_name": "validation_roi_name"}
+        reverse_mapping = {}
+        if hasattr(self, 'svm_validation_class_mapping') and self.svm_validation_class_mapping:
+            reverse_mapping = {v: k for k, v in self.svm_validation_class_mapping.items()}
+        
+        for class_name in self.svm_class_names:
+            # Create better display label: "Classified: Sediment" instead of "training_sediment"
+            if class_name.startswith("training_"):
+                clean_name = class_name.replace("training_", "").replace("_", " ").title()
+            else:
+                clean_name = class_name.replace("_", " ").title()
+            display_labels.append(f"Classified: {clean_name}")
+            
+            color_found = False
+            
+            # Priority 1: Use validation ROI color via reverse mapping
+            # E.g., training_sediment → sediment, training_dark → "dark spots"
+            if class_name in reverse_mapping:
+                validation_roi_name = reverse_mapping[class_name]
+                if validation_roi_name in self.roi_color_map:
+                    colors.append(self.roi_color_map[validation_roi_name])
+                    color_found = True
+            
+            # Priority 2: Training ROI color
+            if not color_found and class_name in self.roi_color_map:
+                colors.append(self.roi_color_map[class_name])
+                color_found = True
+            
+            # Priority 3: Fallback to default colors
+            if not color_found:
+                if isinstance(cmap, str):
+                    base_cmap = plt.cm.get_cmap(cmap, n_classes)
+                    colors.append(base_cmap(len(colors)))
+                else:
+                    colors.append(cmap[len(colors)] if len(colors) < len(cmap) else 'gray')
+
+        cmap_discrete = ListedColormap(colors[:n_classes])
+
+        # Plot
+        im = ax.pcolormesh(
+            Xp,
+            Yp,
+            class_map,
+            cmap=cmap_discrete,
+            shading="auto",
+            vmin=0,
+            vmax=n_classes - 1,
+        )
+
+        # Legend with improved labels
+        if show_legend:
+            from matplotlib.patches import Patch
+
+            legend_elements = [
+                Patch(facecolor=colors[i], label=display_labels[i])
+                for i in range(n_classes)
+            ]
+            ax.legend(
+                handles=legend_elements,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                fontsize=12,
+                framealpha=0.9,
+            )
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(
+            f"SVM Classification Map - {self.name}\n{coordinate_system} coordinates"
+        )
+        ax.set_aspect("equal")
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_classification_overlay(
+        self,
+        red_wl=654.2,
+        green_wl=560,
+        blue_wl=440.3,
+        coordinate_system="NED",
+        use_corrected=True,
+        figsize=(30, 10),
+        alpha=0.5,
+        cmap="tab10",
+        show_legend=True,
+        quiet=True,
+    ):
+        """
+        Plot RGB image with semi-transparent classification overlay.
+
+        Args:
+            red_wl, green_wl, blue_wl: Wavelengths for RGB
+            coordinate_system: 'NED', 'ECEF', or 'LATLON'
+            use_corrected: Use corrected data for RGB
+            figsize: Figure size
+            alpha: Transparency of classification overlay (0=transparent, 1=opaque)
+            cmap: Colormap for classes
+            show_legend: Show legend
+            quiet: Suppress debug output
+
+        Example:
+            cube.plot_classification_overlay(
+                coordinate_system="NED",
+                alpha=0.6,
+                figsize=(40, 10)
+            )
+        """
+        if not hasattr(self, "svm_classification_map_encoded"):
+            raise ValueError(
+                "No classification results found. Run classify_svm() first."
+            )
+
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+
+        track_start, track_end = self.svm_classification_range
+
+        # Get data
+        cube_data = (
+            self.data_corrected
+            if (use_corrected and hasattr(self, "data_corrected"))
+            else self.data
+        )
+
+        n_tracks, n_slits, n_wavelengths = cube_data.shape
+
+        # Get segment (track_start and track_end are absolute indices)
+        segment_data = cube_data[track_start:track_end+1, :, :]
+
+        # Create RGB (no transpose - keep as tracks x slits x wavelength)
+        red_idx = np.argmin(np.abs(self.wavelengths - red_wl))
+        green_idx = np.argmin(np.abs(self.wavelengths - green_wl))
+        blue_idx = np.argmin(np.abs(self.wavelengths - blue_wl))
+
+        R = segment_data[:, :, red_idx].copy()
+        G = segment_data[:, :, green_idx].copy()
+        B = segment_data[:, :, blue_idx].copy()
+
+        # Normalize
+        for C in (R, G, B):
+            if C.max() != C.min():
+                C[:] = (C - C.min()) / (C.max() - C.min())
+
+        # RGB should be (T, S, 3) for pcolormesh
+        RGB = np.dstack([R, G, B])
+
+        # Get coordinates (absolute indices, ECEF arrays are 2D: tracks x slits)
+        X_ecef = self.X_ecef[track_start:track_end+1, :]
+        Y_ecef = self.Y_ecef[track_start:track_end+1, :]
+        Z_ecef = self.Z_ecef[track_start:track_end+1, :]
+
+        # Transform coordinates based on coordinate system
+        if coordinate_system.upper() == "LATLON":
+            from pyproj import Transformer
+            tf_ecef_to_geo = Transformer.from_crs(
+                "EPSG:4978", "EPSG:4979", always_xy=True
+            )
+            lon, lat, height = tf_ecef_to_geo.transform(X_ecef, Y_ecef, Z_ecef)
+            Xp, Yp = lon, lat
+            xlabel, ylabel = "Longitude (°)", "Latitude (°)"
+        elif coordinate_system.upper() == "NED":
+            # Get origin from config
+            if (
+                "config" in globals()
+                and hasattr(config, "LAT0")
+                and hasattr(config, "LON0")
+            ):
+                lat0 = float(config.LAT0)
+                lon0 = float(config.LON0)
+                h0 = float(getattr(config, "H0", 0.0))
+            else:
+                lat0, lon0, h0 = 60.8011575, 10.7122345, 0.0
+            
+            N, E, D = _ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, lat0, lon0, h0)
+            Xp, Yp = E, N
+            xlabel = f"East (m) from {lat0}°, {lon0}°"
+            ylabel = "North (m)"
+        elif coordinate_system.upper() == "ECEF":
+            Xp, Yp = X_ecef, Y_ecef
+            xlabel, ylabel = "ECEF X (m)", "ECEF Y (m)"
+        else:
+            raise ValueError("coordinate_system must be 'LATLON', 'NED', or 'ECEF'")
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Pad coordinates for pcolormesh (needs cell edges)
+        Xc = np.pad(Xp, ((0, 1), (0, 1)), mode="edge")
+        Yc = np.pad(Yp, ((0, 1), (0, 1)), mode="edge")
+
+        # Plot RGB as background using pcolormesh (same as plot_georef)
+        ax.pcolormesh(Xc, Yc, RGB, shading="flat")
+
+        # Plot classification overlay
+        class_map = self.svm_classification_map_encoded
+        n_classes = len(self.svm_class_names)
+
+        # Use same colors and labels as classification map
+        colors = []
+        display_labels = []
+        
+        # Use validation_class_mapping to find correct validation ROI colors
+        reverse_mapping = {}
+        if hasattr(self, 'svm_validation_class_mapping') and self.svm_validation_class_mapping:
+            reverse_mapping = {v: k for k, v in self.svm_validation_class_mapping.items()}
+        
+        for class_name in self.svm_class_names:
+            # Create better display label: "Classified: Sediment" instead of "training_sediment"
+            if class_name.startswith("training_"):
+                clean_name = class_name.replace("training_", "").replace("_", " ").title()
+            else:
+                clean_name = class_name.replace("_", " ").title()
+            display_labels.append(f"Classified: {clean_name}")
+            
+            color_found = False
+            
+            # Priority 1: Use validation ROI color via reverse mapping
+            if class_name in reverse_mapping:
+                validation_roi_name = reverse_mapping[class_name]
+                if validation_roi_name in self.roi_color_map:
+                    colors.append(self.roi_color_map[validation_roi_name])
+                    color_found = True
+            
+            # Priority 2: Training ROI color
+            if not color_found and class_name in self.roi_color_map:
+                colors.append(self.roi_color_map[class_name])
+                color_found = True
+            
+            # Priority 3: Fallback to default colors
+            if not color_found:
+                if isinstance(cmap, str):
+                    base_cmap = plt.cm.get_cmap(cmap, n_classes)
+                    colors.append(base_cmap(len(colors)))
+                else:
+                    colors.append(cmap[len(colors)] if len(colors) < len(cmap) else 'gray')
+
+        # Create overlay with alpha
+        cmap_overlay = ListedColormap(colors[:n_classes])
+
+        # Plot classification overlay using same padded coordinates
+        ax.pcolormesh(
+            Xc,
+            Yc,
+            class_map,
+            cmap=cmap_overlay,
+            shading="flat",
+            vmin=0,
+            vmax=n_classes - 1,
+            alpha=alpha,
+        )
+
+        # Legend with improved labels
+        if show_legend:
+            from matplotlib.patches import Patch
+
+            legend_elements = [
+                Patch(facecolor=colors[i], alpha=alpha, label=display_labels[i])
+                for i in range(n_classes)
+            ]
+            ax.legend(
+                handles=legend_elements,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                fontsize=12,
+                framealpha=0.9,
+            )
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(
+            f"RGB + Classification Overlay - {self.name}\n"
+            f"(R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm, α={alpha})"
+        )
+        ax.set_aspect("equal")
 
         plt.tight_layout()
         plt.show()

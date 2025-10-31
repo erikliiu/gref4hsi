@@ -16,8 +16,8 @@ MBES_GEOTIFF = (
 
 # ===== WORKING FOLDER =====
 # Change this to switch between different datasets
-# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_final"  # this is the final version with all 6 .h5 files
-WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\028"  # for 028
+WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\057_final"  # this is the final version with all 6 .h5 files
+# WORKING_FOLDER = r"E:\mjosa_new_oct_2025\use_gref4hsi\028"  # for 028
 
 
 # Derived paths - no need to change these
