@@ -709,13 +709,14 @@ class CombinedTransectCube:
 
     def _extract_rgb_from_cube(self, data_cube, Rnm, Gnm, Bnm):
         """Extract RGB channels from a full data cube (T, S, B) by wavelength."""
-        # Get wavelengths from first file (assume all files have same wavelengths)
-        gf = self.geofiles[0]
+        # Use self.wavelengths (updated by apply_wavelength_filter) instead of geofile
+        # This ensures RGB extraction works after wavelength cropping
+        wl = self.wavelengths
 
-        # Find band indices
-        idxR = gf._band_index(Rnm)
-        idxG = gf._band_index(Gnm)
-        idxB = gf._band_index(Bnm)
+        # Find closest wavelength indices
+        idxR = np.argmin(np.abs(wl - Rnm)) if wl is not None and len(wl) > 0 else None
+        idxG = np.argmin(np.abs(wl - Gnm)) if wl is not None and len(wl) > 0 else None
+        idxB = np.argmin(np.abs(wl - Bnm)) if wl is not None and len(wl) > 0 else None
 
         if idxR is None or idxG is None or idxB is None:
             raise RuntimeError(f"Requested wavelengths not available")
@@ -761,6 +762,20 @@ class CombinedTransectCube:
             "sediment": "#8B4513",  # brown
             "brown leaf": "#8B4513",  # brown (same as sediment)
             "yellow leaf": "#FFD700",  # gold/yellow (same as double bomb 2)
+            # 🔥 Training ROIs (base colors)
+            "training_bombs": "#FF0000",  # red
+            "training_dark": "#000000",  # black
+            "training_sediment": "#8B4513",  # brown (same as sediment)
+            # 🔥 Classification output (same colors as training_*)
+            "classified_bombs": "#FF0000",  # red (same as training_bombs)
+            "classified_dark": "#000000",  # black (same as training_dark)
+            "classified_sediment": "#8B4513",  # brown (same as training_sediment)
+            # 🔥 Filtered classes (distinct colors for visibility)
+            "filtered_bombs": "#0000FF",  # blue
+            "filtered_dark": "#FFFF00",  # yellow
+            "filtered_sediment": "#D2B48C",  # tan (lighter brown)
+            # 🔥 Merged class for validation
+            "new_sediment": "#8B4513",  # brown (same as training_sediment)
         }
 
         # Priority 1: Custom color map for this specific plot (allows override)
@@ -3102,6 +3117,385 @@ class CombinedTransectCube:
         print(f"✅ Correction deleted successfully")
         return True
 
+    # ============================================================================
+    # 🔥 NEW: Spectral Pre-processing Functions (In-Memory Only)
+    # ============================================================================
+
+    def apply_wavelength_interpolation(self, interpolate_wavelengths=None, quiet=False):
+        """
+        Interpolate bad wavelengths by replacing them with linear interpolation from neighbors.
+
+        This permanently modifies data_corrected (in memory only, not saved to disk).
+        Useful for fixing known bad wavelengths (e.g., sensor artifacts, atmospheric absorption).
+
+        Parameters:
+        -----------
+        interpolate_wavelengths : list of int, optional
+            List of wavelength INDICES to interpolate (e.g., [64, 107, 138]).
+            Each index will be replaced with the average of its neighboring wavelengths.
+            If None or empty, no interpolation is performed.
+        quiet : bool, default=False
+            If True, suppresses progress messages
+
+        Returns:
+        --------
+        np.ndarray : The interpolated datacube (T, S, B)
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> cube.apply_wavelength_interpolation(interpolate_wavelengths=[64, 107, 138])
+        >>> # Wavelengths at indices 64, 107, 138 are now interpolated from neighbors
+        """
+        if self.data_corrected is None:
+            raise ValueError(
+                "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        if interpolate_wavelengths is None or len(interpolate_wavelengths) == 0:
+            if not quiet:
+                print("⚠️  No wavelengths to interpolate (list is empty)")
+            return self.data_corrected
+
+        if not quiet:
+            print("=" * 60)
+            print("🔧 WAVELENGTH INTERPOLATION")
+            print("=" * 60)
+            print(f"📊 Datacube shape: {self.data_corrected.shape}")
+            print(f"🎯 Interpolating {len(interpolate_wavelengths)} wavelength(s)")
+
+        T, S, B = self.data_corrected.shape
+
+        # Validate indices
+        valid_indices = []
+        for idx in interpolate_wavelengths:
+            if idx < 1 or idx >= B - 1:
+                if not quiet:
+                    print(f"   ⚠️  Skipping index {idx} (out of valid range [1, {B-2}])")
+            else:
+                valid_indices.append(idx)
+                wl_value = (
+                    self.wavelengths[idx] if hasattr(self, "wavelengths") else idx
+                )
+                if not quiet:
+                    print(
+                        f"   🔧 Index {idx} ({wl_value:.1f} nm) → interpolated from neighbors"
+                    )
+
+        if len(valid_indices) == 0:
+            if not quiet:
+                print("   ⚠️  No valid indices to interpolate")
+            return self.data_corrected
+
+        # Apply linear interpolation for each bad wavelength
+        for idx in valid_indices:
+            # Replace with average of left and right neighbors
+            self.data_corrected[:, :, idx] = (
+                self.data_corrected[:, :, idx - 1] + self.data_corrected[:, :, idx + 1]
+            ) / 2.0
+
+        if not quiet:
+            print(f"\n✅ Interpolation complete!")
+            print(f"   {len(valid_indices)} wavelength(s) interpolated")
+            print("=" * 60)
+
+        return self.data_corrected
+
+    def apply_wavelength_filter(self, wavelength_range=(490, 680), quiet=False):
+        """
+        Filter datacube to only include specified wavelength range.
+
+        This permanently modifies data_corrected (in memory only, not saved to disk)
+        by cropping the wavelength dimension. All subsequent operations will only
+        use the filtered wavelength range.
+
+        Parameters:
+        -----------
+        wavelength_range : tuple of (min_wl, max_wl)
+            Wavelength range in nanometers to keep (e.g., (490, 680))
+        quiet : bool, default=False
+            If True, suppresses progress messages
+
+        Returns:
+        --------
+        np.ndarray : The filtered datacube (T, S, filtered_B)
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> cube.apply_wavelength_filter(wavelength_range=(490, 680))
+        >>> # Now data_corrected only contains wavelengths 490-680 nm
+        >>> cube.train_svm_with_cv(...)  # No wavelength_range parameter needed!
+        """
+        if self.data_corrected is None:
+            raise ValueError(
+                "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        wl_min, wl_max = wavelength_range
+        wl_mask = (self.wavelengths >= wl_min) & (self.wavelengths <= wl_max)
+        wl_indices = np.where(wl_mask)[0]
+
+        if len(wl_indices) == 0:
+            raise ValueError(f"No wavelengths found in range {wl_min}-{wl_max} nm")
+
+        if not quiet:
+            print("=" * 60)
+            print("🔪 WAVELENGTH FILTERING")
+            print("=" * 60)
+            print(f"📊 Original wavelengths: {len(self.wavelengths)}")
+            print(f"🎯 Target range: {wl_min}-{wl_max} nm")
+            print(f"✂️  Filtered wavelengths: {len(wl_indices)}")
+            print(
+                f"📉 Range: {self.wavelengths[wl_indices[0]]:.1f} - {self.wavelengths[wl_indices[-1]]:.1f} nm"
+            )
+
+        # Crop datacube to wavelength range
+        self.data_corrected = self.data_corrected[:, :, wl_indices].copy()
+
+        # Update wavelengths array
+        self.wavelengths = self.wavelengths[wl_indices].copy()
+
+        if not quiet:
+            print(f"\n✅ Datacube shape after filtering: {self.data_corrected.shape}")
+            print(f"   Memory: {self.data_corrected.nbytes / (1024**3):.2f} GB")
+            print("=" * 60)
+
+        return self.data_corrected
+
+    def apply_spectral_normalization(self, method="l2", quiet=False):
+        """
+        Normalize each pixel's spectrum using specified method.
+
+        This permanently modifies data_corrected (in memory only, not saved to disk).
+        Normalization is applied to ALL wavelengths currently in the datacube.
+        Use apply_wavelength_filter() first if you want to normalize only a specific range.
+
+        Parameters:
+        -----------
+        method : str
+            Normalization method:
+            - "l2": L2 vector normalization (unit length) ⭐ Recommended for SVM
+            - "mean": Divide by mean (simple scaling)
+            - "mean_center": Subtract mean (removes DC offset)
+            - "snv": Standard Normal Variate (removes offset + scale)
+            - "msc": Multiplicative Scatter Correction (uses global mean as reference)
+            - "minmax": Min-max scaling to [0,1]
+        quiet : bool, default=False
+            If True, suppresses progress messages
+
+        Returns:
+        --------
+        np.ndarray : The normalized datacube (T, S, B)
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> cube.apply_wavelength_filter(wavelength_range=(490, 680))  # Optional: filter first
+        >>> cube.apply_spectral_normalization(method="l2")  # Normalize
+        >>> cube.train_svm_with_cv(...)  # Train on normalized spectra
+        """
+        if self.data_corrected is None:
+            raise ValueError(
+                "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        if not quiet:
+            print("=" * 60)
+            print(f"📐 SPECTRAL NORMALIZATION: {method.upper()}")
+            print("=" * 60)
+            print(f"📊 Datacube shape: {self.data_corrected.shape}")
+            print(
+                f"🌊 Wavelengths: {len(self.wavelengths)} ({self.wavelengths[0]:.1f} - {self.wavelengths[-1]:.1f} nm)"
+            )
+
+        T, S, B = self.data_corrected.shape
+
+        # Reshape to (n_pixels, n_wavelengths) for easier processing
+        spectra = self.data_corrected.reshape(-1, B)
+
+        if method == "l2":
+            # L2 normalization: scale each spectrum to unit length
+            norms = np.linalg.norm(spectra, axis=1, keepdims=True)
+            norms[norms == 0] = 1  # Avoid division by zero
+            spectra_normalized = spectra / norms
+
+        elif method == "mean":
+            # Divide by mean
+            means = np.mean(spectra, axis=1, keepdims=True)
+            means[means == 0] = 1
+            spectra_normalized = spectra / means
+
+        elif method == "mean_center":
+            # Subtract mean (removes DC offset)
+            means = np.mean(spectra, axis=1, keepdims=True)
+            spectra_normalized = spectra - means
+
+        elif method == "snv":
+            # Standard Normal Variate: (x - mean) / std
+            means = np.mean(spectra, axis=1, keepdims=True)
+            stds = np.std(spectra, axis=1, keepdims=True)
+            stds[stds == 0] = 1  # Avoid division by zero
+            spectra_normalized = (spectra - means) / stds
+
+        elif method == "msc":
+            # Multiplicative Scatter Correction: use global mean as reference
+            reference = np.mean(spectra, axis=0, keepdims=True)  # Mean spectrum
+            means = np.mean(spectra, axis=1, keepdims=True)
+            stds = np.std(spectra, axis=1, keepdims=True)
+            stds[stds == 0] = 1
+            ref_mean = np.mean(reference)
+            ref_std = np.std(reference)
+            spectra_normalized = (spectra - means) * (ref_std / stds) + ref_mean
+
+        elif method == "minmax":
+            # Min-max scaling to [0, 1]
+            mins = np.min(spectra, axis=1, keepdims=True)
+            maxs = np.max(spectra, axis=1, keepdims=True)
+            ranges = maxs - mins
+            ranges[ranges == 0] = 1
+            spectra_normalized = (spectra - mins) / ranges
+
+        else:
+            raise ValueError(
+                f"Unknown normalization method: {method}. "
+                f"Choose from: l2, mean, mean_center, snv, msc, minmax"
+            )
+
+        # Reshape back to (T, S, B)
+        self.data_corrected = spectra_normalized.reshape(T, S, B).astype(np.float32)
+
+        if not quiet:
+            print(f"\n✅ Normalization complete!")
+            print(f"   Method: {method}")
+            print(
+                f"   Value range: [{self.data_corrected.min():.4f}, {self.data_corrected.max():.4f}]"
+            )
+            print("=" * 60)
+
+        return self.data_corrected
+
+    def apply_spectral_smoothing(
+        self, wavelength_smoothing=10, method="savgol", savgol_polyorder=2, quiet=False
+    ):
+        """
+        Smooth each pixel's spectrum along the wavelength axis.
+
+        This permanently modifies data_corrected (in memory only, not saved to disk).
+        Smoothing is applied to ALL wavelengths currently in the datacube.
+
+        Parameters:
+        -----------
+        wavelength_smoothing : int
+            Window size for smoothing (must be odd for savgol)
+            Larger values = more smoothing
+        method : str, default="savgol"
+            Smoothing method:
+            - "savgol": Savitzky-Golay filter (preserves peaks/valleys)
+            - "moving_average": Simple rolling mean
+        savgol_polyorder : int, default=2
+            Polynomial order for Savitzky-Golay filter (2 or 3)
+            Only used if method="savgol"
+        quiet : bool, default=False
+            If True, suppresses progress messages
+
+        Returns:
+        --------
+        np.ndarray : The smoothed datacube (T, S, B)
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> cube.apply_wavelength_filter(wavelength_range=(490, 680))
+        >>> cube.apply_spectral_normalization(method="l2")
+        >>> cube.apply_spectral_smoothing(wavelength_smoothing=10, method="savgol")
+        >>> cube.train_svm_with_cv(...)  # Train on normalized+smoothed spectra
+        """
+        if self.data_corrected is None:
+            raise ValueError(
+                "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        if wavelength_smoothing <= 1:
+            if not quiet:
+                print("⚠️  wavelength_smoothing <= 1, no smoothing applied")
+            return self.data_corrected
+
+        if not quiet:
+            print("=" * 60)
+            print(f"🌊 SPECTRAL SMOOTHING: {method.upper()}")
+            print("=" * 60)
+            print(f"📊 Datacube shape: {self.data_corrected.shape}")
+            print(f"🪟 Window size: {wavelength_smoothing}")
+            if method == "savgol":
+                print(f"📐 Polynomial order: {savgol_polyorder}")
+
+        T, S, B = self.data_corrected.shape
+
+        if method == "savgol":
+            from scipy.signal import savgol_filter
+
+            # Ensure window size is odd
+            if wavelength_smoothing % 2 == 0:
+                wavelength_smoothing += 1
+                if not quiet:
+                    print(
+                        f"   ⚠️  Adjusted window to odd number: {wavelength_smoothing}"
+                    )
+
+            # Ensure polyorder < window_size
+            if savgol_polyorder >= wavelength_smoothing:
+                savgol_polyorder = wavelength_smoothing - 1
+                if not quiet:
+                    print(f"   ⚠️  Adjusted polyorder to: {savgol_polyorder}")
+
+            # Apply savgol filter along wavelength axis
+            self.data_corrected = savgol_filter(
+                self.data_corrected,
+                window_length=wavelength_smoothing,
+                polyorder=savgol_polyorder,
+                axis=2,  # Wavelength axis
+            ).astype(np.float32)
+
+        elif method == "moving_average":
+            import pandas as pd
+            from tqdm import tqdm
+
+            # Apply rolling mean along wavelength axis for each pixel
+            smoothed = np.zeros_like(self.data_corrected)
+
+            # Progress bar over temporal dimension
+            for t in tqdm(
+                range(T), desc="Smoothing spectra (moving average)", disable=quiet
+            ):
+                for s in range(S):
+                    spectrum = pd.Series(self.data_corrected[t, s, :])
+                    smoothed_spectrum = spectrum.rolling(
+                        window=wavelength_smoothing, center=True, min_periods=1
+                    ).mean()
+                    smoothed[t, s, :] = smoothed_spectrum.values
+
+            self.data_corrected = smoothed.astype(np.float32)
+
+        else:
+            raise ValueError(
+                f"Unknown smoothing method: {method}. "
+                f"Choose from: savgol, moving_average"
+            )
+
+        if not quiet:
+            print(f"\n✅ Smoothing complete!")
+            print(f"   Method: {method}")
+            if method == "savgol":
+                print(
+                    f"   Window: {wavelength_smoothing}, Polyorder: {savgol_polyorder}"
+                )
+            else:
+                print(f"   Window: {wavelength_smoothing}")
+            print("=" * 60)
+
+        return self.data_corrected
+
     def save_as_pseudo_reflectance(
         self,
         interpolate_wavelengths=None,
@@ -4947,7 +5341,9 @@ class CombinedTransectCube:
                         f"✅ Added pixel: (slit={slit_idx}, track={track_idx}) - Total: {len(current_roi)}"
                     )
 
-            elif event.button == 3:  # Right click - REMOVE nearest pixel (within 10 pixels)
+            elif (
+                event.button == 3
+            ):  # Right click - REMOVE nearest pixel (within 10 pixels)
                 if pixel in current_roi:
                     # Exact match - delete it
                     current_roi.remove(pixel)
@@ -4956,17 +5352,19 @@ class CombinedTransectCube:
                     )
                 else:
                     # Find nearest pixel within 10-pixel radius
-                    min_dist = float('inf')
+                    min_dist = float("inf")
                     nearest_pixel = None
                     max_radius = 10  # Don't delete across the map
-                    
+
                     for roi_pixel in current_roi:
                         roi_slit, roi_track = roi_pixel
-                        dist = np.sqrt((roi_slit - slit_idx)**2 + (roi_track - track_idx)**2)
+                        dist = np.sqrt(
+                            (roi_slit - slit_idx) ** 2 + (roi_track - track_idx) ** 2
+                        )
                         if dist < min_dist and dist <= max_radius:
                             min_dist = dist
                             nearest_pixel = roi_pixel
-                    
+
                     if nearest_pixel is not None:
                         current_roi.remove(nearest_pixel)
                         print(
@@ -4974,7 +5372,9 @@ class CombinedTransectCube:
                             f"[distance: {min_dist:.1f} pixels] - Total: {len(current_roi)}"
                         )
                     else:
-                        print(f"⚠️ No pixel within 10 pixels of click: (slit={slit_idx}, track={track_idx})")
+                        print(
+                            f"⚠️ No pixel within 10 pixels of click: (slit={slit_idx}, track={track_idx})"
+                        )
 
             # Update display
             update_highlights()
@@ -6107,10 +6507,10 @@ class CombinedTransectCube:
     ):
         """
         Create grid-based groups for sediment ROIs.
-        
+
         Divides the datacube into regular grid tiles and assigns each pixel to its tile.
         Tiles with <min_pixels are merged to neighboring tiles.
-        
+
         Args:
             roi_pixels: List of (slit, track) tuples
             n_tracks: Total tracks in datacube
@@ -6119,45 +6519,45 @@ class CombinedTransectCube:
             tile_size_track: Grid tile size in track direction
             min_pixels: Minimum pixels per tile
             quiet: Suppress output
-            
+
         Returns:
             pixel_groups: Array of group IDs for each pixel
         """
         from scipy.spatial.distance import cdist
-        
+
         # Assign each pixel to a grid tile
         pixel_groups = np.zeros(len(roi_pixels), dtype=int)
         tile_to_group_id = {}
         group_id_counter = 0
-        
+
         # First pass: assign pixels to grid tiles
         for i, (slit_idx, track_idx) in enumerate(roi_pixels):
             tile_row = track_idx // tile_size_track
             tile_col = slit_idx // tile_size_slit
             tile_key = (tile_row, tile_col)
-            
+
             if tile_key not in tile_to_group_id:
                 tile_to_group_id[tile_key] = group_id_counter
                 group_id_counter += 1
-            
+
             pixel_groups[i] = tile_to_group_id[tile_key]
-        
+
         # Calculate group sizes
         unique_groups = np.unique(pixel_groups)
         group_sizes = {gid: np.sum(pixel_groups == gid) for gid in unique_groups}
-        
+
         # Find small groups that need merging
         small_groups = [gid for gid, size in group_sizes.items() if size < min_pixels]
         large_groups = [gid for gid, size in group_sizes.items() if size >= min_pixels]
-        
+
         if small_groups and large_groups:
             # Get tile coordinates for each group
             group_to_tile = {v: k for k, v in tile_to_group_id.items()}
-            
+
             for small_gid in small_groups:
                 small_tile = group_to_tile[small_gid]
                 small_row, small_col = small_tile
-                
+
                 # Find neighboring tiles (8-connectivity)
                 neighbors = []
                 for dr in [-1, 0, 1]:
@@ -6169,35 +6569,41 @@ class CombinedTransectCube:
                             neighbor_gid = tile_to_group_id[neighbor_tile]
                             if neighbor_gid in large_groups:
                                 neighbors.append(neighbor_gid)
-                
+
                 if neighbors:
                     # Merge to first valid neighbor
                     merge_target = neighbors[0]
                     pixel_groups[pixel_groups == small_gid] = merge_target
                     if not quiet:
-                        print(f"      Merged small tile {small_tile} ({group_sizes[small_gid]} px) → neighbor tile")
+                        print(
+                            f"      Merged small tile {small_tile} ({group_sizes[small_gid]} px) → neighbor tile"
+                        )
                 else:
                     # No neighbors - try to find closest large group
                     if large_groups:
                         # Calculate distance to all large group centroids
                         small_pixels = np.array(roi_pixels)[pixel_groups == small_gid]
                         small_centroid = np.mean(small_pixels, axis=0).reshape(1, -1)
-                        
+
                         large_centroids = []
                         for large_gid in large_groups:
-                            large_pixels = np.array(roi_pixels)[pixel_groups == large_gid]
+                            large_pixels = np.array(roi_pixels)[
+                                pixel_groups == large_gid
+                            ]
                             large_centroid = np.mean(large_pixels, axis=0)
                             large_centroids.append(large_centroid)
-                        
+
                         large_centroids = np.array(large_centroids)
                         distances = cdist(small_centroid, large_centroids)[0]
                         nearest_idx = np.argmin(distances)
                         merge_target = large_groups[nearest_idx]
-                        
+
                         pixel_groups[pixel_groups == small_gid] = merge_target
                         if not quiet:
-                            print(f"      Merged isolated tile {small_tile} ({group_sizes[small_gid]} px) → nearest large tile")
-        
+                            print(
+                                f"      Merged isolated tile {small_tile} ({group_sizes[small_gid]} px) → nearest large tile"
+                            )
+
         return pixel_groups
 
     def _create_spatial_groups(
@@ -6216,13 +6622,13 @@ class CombinedTransectCube:
     ):
         """
         Create spatial groups from ROI pixels to prevent data leakage in CV.
-        
+
         For each class, spatially cluster pixels into groups so that CV can split by group
         (keeping all pixels from same spatial region together).
-        
+
         Special handling for sediment: Uses grid-based grouping instead of connected components
         to avoid creating one giant group.
-        
+
         Args:
             roi_pixels_per_class: Dict {class_name: [(slit, track), ...]}
             datacube_shape: Tuple (n_tracks, n_slits, n_wavelengths)
@@ -6235,29 +6641,33 @@ class CombinedTransectCube:
             sediment_grid_tile_track: Grid tile size in track direction (default: 200)
             sediment_min_group_size: Min pixels for sediment tiles (default: 10)
             quiet: Suppress output
-            
+
         Returns:
             groups_list: List of group IDs aligned with flattened pixel list
             group_names: List of unique group names
         """
         from scipy.ndimage import binary_closing, label
         from scipy.spatial.distance import cdist
-        
+
         n_tracks, n_slits = datacube_shape[0], datacube_shape[1]
-        
+
         all_groups = []
         group_counter = {}
-        
+
         if not quiet:
             print(f"\n🔬 Creating spatial groups for CV...")
-            print(f"   Settings: closing_radius={closing_radius}, min_group_size={min_group_size}")
+            print(
+                f"   Settings: closing_radius={closing_radius}, min_group_size={min_group_size}"
+            )
             if use_grid_for_sediment:
-                print(f"   Sediment grid: {sediment_grid_tile_slit}(slit) × {sediment_grid_tile_track}(track) px, min={sediment_min_group_size}")
-        
+                print(
+                    f"   Sediment grid: {sediment_grid_tile_slit}(slit) × {sediment_grid_tile_track}(track) px, min={sediment_min_group_size}"
+                )
+
         for class_name, roi_pixels in roi_pixels_per_class.items():
             if len(roi_pixels) == 0:
                 continue
-            
+
             # 🔥 SPECIAL CASE: Grid-based grouping for training_sediment
             if use_grid_for_sediment and class_name == "training_sediment":
                 pixel_groups = self._create_grid_groups_for_sediment(
@@ -6267,10 +6677,10 @@ class CombinedTransectCube:
                     sediment_grid_tile_slit,
                     sediment_grid_tile_track,
                     sediment_min_group_size,
-                    quiet
+                    quiet,
                 )
                 method = "grid"
-                
+
                 # Count groups and assign names
                 # Note: _create_grid_groups_for_sediment already handles min size merging
                 unique_groups = np.unique(pixel_groups[pixel_groups >= 0])
@@ -6279,12 +6689,12 @@ class CombinedTransectCube:
                     group_mask = pixel_groups == group_id
                     group_size = np.sum(group_mask)
                     # Don't recheck min_group_size - grid function already merged small tiles
-                    group_info[group_id] = {'size': group_size, 'pixels': group_mask}
-                
+                    group_info[group_id] = {"size": group_size, "pixels": group_mask}
+
                 # Assign sequential group names
                 if class_name not in group_counter:
                     group_counter[class_name] = 0
-                
+
                 final_group_names = []
                 group_mapping = {}
                 for group_id in sorted(group_info.keys()):
@@ -6292,46 +6702,50 @@ class CombinedTransectCube:
                     group_name = f"sed#{group_counter[class_name]:02d}"
                     group_mapping[group_id] = group_name
                     final_group_names.append(group_name)
-                
+
                 # Assign group names to pixels
                 for i, group_id in enumerate(pixel_groups):
                     if group_id in group_mapping:
                         all_groups.append(group_mapping[group_id])
                     else:
                         all_groups.append(f"{class_name}_dropped")
-                
+
                 if not quiet:
-                    print(f"   {class_name}: {len(roi_pixels)} pixels → {len(group_info)} groups via {method}")
+                    print(
+                        f"   {class_name}: {len(roi_pixels)} pixels → {len(group_info)} groups via {method}"
+                    )
                     for gname in final_group_names[:5]:  # Show first 5
                         gid = [k for k, v in group_mapping.items() if v == gname][0]
                         print(f"      {gname}: {group_info[gid]['size']} pixels")
                     if len(final_group_names) > 5:
                         print(f"      ... and {len(final_group_names) - 5} more groups")
-                
+
                 continue  # Skip normal processing for sediment
-                
+
             # Create binary mask (for bombs/dark - normal processing)
             mask = np.zeros((n_tracks, n_slits), dtype=bool)
             for slit_idx, track_idx in roi_pixels:
                 if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
                     mask[track_idx, slit_idx] = True
-            
+
             # Try connected components with morphological closing
             try:
                 from scipy.ndimage import generate_binary_structure
+
                 struct = generate_binary_structure(2, 2)  # 8-connectivity
-                
+
                 # Morphological closing to merge nearby pixels
                 if closing_radius > 0:
                     from scipy.ndimage import binary_dilation
+
                     for _ in range(closing_radius):
                         mask = binary_dilation(mask, structure=struct)
                     for _ in range(closing_radius):
                         mask = binary_closing(mask, structure=struct)
-                
+
                 # Connected components
                 labeled_mask, n_components = label(mask, structure=struct)
-                
+
                 # Extract group labels for each ROI pixel
                 pixel_groups = []
                 for slit_idx, track_idx in roi_pixels:
@@ -6340,96 +6754,110 @@ class CombinedTransectCube:
                         pixel_groups.append(group_id)
                     else:
                         pixel_groups.append(-1)  # Invalid
-                
+
                 pixel_groups = np.array(pixel_groups)
                 method = "connected_components"
-                
+
             except Exception as e:
                 # Fallback to DBSCAN
                 if not quiet:
-                    print(f"   ⚠️  Connected components failed for '{class_name}', using DBSCAN")
-                
+                    print(
+                        f"   ⚠️  Connected components failed for '{class_name}', using DBSCAN"
+                    )
+
                 try:
                     from sklearn.cluster import DBSCAN
-                    
+
                     # Get pixel coordinates
-                    coords = np.array(roi_pixels)  # Shape: (n_pixels, 2) = (slit, track)
-                    
+                    coords = np.array(
+                        roi_pixels
+                    )  # Shape: (n_pixels, 2) = (slit, track)
+
                     # DBSCAN clustering
-                    clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples, metric='euclidean')
+                    clustering = DBSCAN(
+                        eps=dbscan_eps,
+                        min_samples=dbscan_min_samples,
+                        metric="euclidean",
+                    )
                     pixel_groups = clustering.fit_predict(coords)
-                    
+
                     method = "DBSCAN"
-                    
+
                 except Exception as e2:
                     # Final fallback: treat entire ROI as one group
                     if not quiet:
-                        print(f"   ⚠️  DBSCAN also failed for '{class_name}', using single group")
+                        print(
+                            f"   ⚠️  DBSCAN also failed for '{class_name}', using single group"
+                        )
                     pixel_groups = np.zeros(len(roi_pixels), dtype=int)
                     method = "single_group"
-            
+
             # Filter and rename groups
             unique_groups = np.unique(pixel_groups[pixel_groups >= 0])
-            
+
             # Calculate group sizes and centroids
             group_info = {}
             for group_id in unique_groups:
                 group_mask = pixel_groups == group_id
                 group_size = np.sum(group_mask)
-                
+
                 if group_size >= min_group_size:
                     # Calculate centroid
                     group_pixels = np.array(roi_pixels)[group_mask]
                     centroid = np.mean(group_pixels, axis=0)
                     group_info[group_id] = {
-                        'size': group_size,
-                        'centroid': centroid,
-                        'pixels': group_mask
+                        "size": group_size,
+                        "centroid": centroid,
+                        "pixels": group_mask,
                     }
-            
+
             # Handle small groups: merge to nearest large group of same class
             small_groups = [gid for gid in unique_groups if gid not in group_info]
             if small_groups and group_info:
-                large_group_centroids = np.array([info['centroid'] for info in group_info.values()])
+                large_group_centroids = np.array(
+                    [info["centroid"] for info in group_info.values()]
+                )
                 large_group_ids = list(group_info.keys())
-                
+
                 for small_gid in small_groups:
                     small_mask = pixel_groups == small_gid
                     small_pixels = np.array(roi_pixels)[small_mask]
                     small_centroid = np.mean(small_pixels, axis=0).reshape(1, -1)
-                    
+
                     # Find nearest large group
                     distances = cdist(small_centroid, large_group_centroids)[0]
                     nearest_idx = np.argmin(distances)
                     nearest_gid = large_group_ids[nearest_idx]
-                    
+
                     # Merge: assign small group pixels to nearest group
                     pixel_groups[small_mask] = nearest_gid
-                    group_info[nearest_gid]['size'] += np.sum(small_mask)
-            
+                    group_info[nearest_gid]["size"] += np.sum(small_mask)
+
             # Assign group names
             if class_name not in group_counter:
                 group_counter[class_name] = 0
-            
+
             final_group_names = []
             group_mapping = {}
-            
+
             for group_id in sorted(group_info.keys()):
                 group_counter[class_name] += 1
-                
+
                 # Create readable group names
-                if 'bomb' in class_name.lower():
+                if "bomb" in class_name.lower():
                     group_name = f"bomb#{group_counter[class_name]}"
-                elif 'dark' in class_name.lower():
-                    group_name = f"dark#{chr(64 + group_counter[class_name])}"  # A, B, C, ...
-                elif 'sediment' in class_name.lower() or 'sed' in class_name.lower():
+                elif "dark" in class_name.lower():
+                    group_name = (
+                        f"dark#{chr(64 + group_counter[class_name])}"  # A, B, C, ...
+                    )
+                elif "sediment" in class_name.lower() or "sed" in class_name.lower():
                     group_name = f"sed#{group_counter[class_name]:02d}"
                 else:
                     group_name = f"{class_name}_grp{group_counter[class_name]}"
-                
+
                 group_mapping[group_id] = group_name
                 final_group_names.append(group_name)
-            
+
             # Assign group names to pixels
             for i, group_id in enumerate(pixel_groups):
                 if group_id in group_mapping:
@@ -6437,13 +6865,15 @@ class CombinedTransectCube:
                 else:
                     # Dropped pixel (too small group, no merge possible)
                     all_groups.append(f"{class_name}_dropped")
-            
+
             if not quiet:
-                print(f"   {class_name}: {len(roi_pixels)} pixels → {len(group_info)} groups via {method}")
+                print(
+                    f"   {class_name}: {len(roi_pixels)} pixels → {len(group_info)} groups via {method}"
+                )
                 for gname in final_group_names:
                     gid = [k for k, v in group_mapping.items() if v == gname][0]
                     print(f"      {gname}: {group_info[gid]['size']} pixels")
-        
+
         return all_groups, list(set(all_groups))
 
     def train_svm_with_cv(
@@ -6467,6 +6897,9 @@ class CombinedTransectCube:
         sediment_min_group_size=10,  # 🔥 NEW: Min pixels for sediment tiles
         subsample_per_group=None,  # 🔥 NEW: Max pixels per group (None = no limit)
         use_sample_weights=False,  # 🔥 NEW: Weight pixels by 1/group_size
+        class_weight_dict=None,  # 🔥 NEW: Custom class weights (e.g., {"training_bombs": 2.0})
+        add_brightness_feature=False,  # 🔥 NEW: Add brightness (mean intensity) as feature
+        use_intensity_only=False,  # 🔥 NEW: Use only mean intensity instead of full spectrum
         quiet=False,
     ):
         """
@@ -6490,6 +6923,8 @@ class CombinedTransectCube:
             optimize_params: If True, use GridSearchCV to find best C and gamma
             svm_C: SVM penalty parameter (used if optimize_params=False)
             svm_gamma: SVM kernel coefficient (used if optimize_params=False)
+            add_brightness_feature: Add mean intensity as additional feature (default: False)
+            use_intensity_only: Use ONLY mean intensity (ignore spectrum). Cannot be True if add_brightness_feature=True (default: False)
             quiet: Suppress progress messages
 
         Returns:
@@ -6516,7 +6951,10 @@ class CombinedTransectCube:
         """
         from sklearn.svm import SVC
         from sklearn.preprocessing import LabelEncoder
-        from sklearn.model_selection import GridSearchCV, GroupKFold  # 🔥 CHANGED: Removed StratifiedKFold, added GroupKFold
+        from sklearn.model_selection import (
+            GridSearchCV,
+            GroupKFold,
+        )  # 🔥 CHANGED: Removed StratifiedKFold, added GroupKFold
         from sklearn.metrics import (
             confusion_matrix,
             classification_report,
@@ -6525,10 +6963,25 @@ class CombinedTransectCube:
         )
         import time
 
+        # 🔥 Validation: Cannot use both intensity_only and add_brightness_feature
+        if use_intensity_only and add_brightness_feature:
+            raise ValueError(
+                "Cannot use both use_intensity_only=True and add_brightness_feature=True. "
+                "When using intensity-only mode, the feature IS the mean intensity."
+            )
+
         if not quiet:
             print("=" * 60)
             print("🤖 SVM TRAINING WITH CROSS-VALIDATION")
             print("=" * 60)
+            if use_intensity_only:
+                print(
+                    "💡 MODE: Intensity-only classification (mean intensity as single feature)"
+                )
+            elif add_brightness_feature:
+                print("💡 MODE: Spectral + brightness feature")
+            else:
+                print("💡 MODE: Standard spectral classification")
 
         # Convert list of ROI names to dict
         if isinstance(training_rois, list):
@@ -6565,11 +7018,13 @@ class CombinedTransectCube:
             cube_data = cube_data[:, :, wl_indices]
             wavelengths_used = self.wavelengths[wl_indices]
             n_wavelengths = len(wl_indices)
-            
+
             if not quiet:
                 print(f"\n� Wavelength filtering:")
                 print(f"   Range: {wl_min} - {wl_max} nm")
-                print(f"   Wavelengths used: {n_wavelengths} (from {len(self.wavelengths)})")
+                print(
+                    f"   Wavelengths used: {n_wavelengths} (from {len(self.wavelengths)})"
+                )
         else:
             wl_indices = np.arange(len(self.wavelengths))
             wavelengths_used = self.wavelengths
@@ -6579,17 +7034,29 @@ class CombinedTransectCube:
             print(f"📏 Using data: {'corrected' if use_corrected else 'raw'}")
             print(f"🎯 Segment range: tracks {segment_start} to {segment_end}")
             print(f"📍 Training ROIs: {list(training_rois.keys())}")
+            if add_brightness_feature:
+                print(
+                    f"💡 Brightness feature: ENABLED (mean of wavelength-filtered spectrum)"
+                )
 
         # Store wavelength info for classification
         self.svm_wavelength_indices = wl_indices
         self.svm_wavelengths = wavelengths_used
+        self.svm_add_brightness_feature = (
+            add_brightness_feature  # Store for classification
+        )
+        self.svm_use_intensity_only = (
+            use_intensity_only  # 🔥 NEW: Store for classification
+        )
 
         # Extract training pixels OUTSIDE segment
         X_train = []
         y_train = []
         training_pixel_counts = {}
         filtered_training_rois = {}
-        filtered_training_rois_for_grouping = {}  # Track which pixels are kept per class
+        filtered_training_rois_for_grouping = (
+            {}
+        )  # Track which pixels are kept per class
         pixels_kept_outside = 0
         pixels_rejected_inside = 0
 
@@ -6620,7 +7087,9 @@ class CombinedTransectCube:
                 y_train.extend([class_name] * len(class_pixels))
                 training_pixel_counts[class_name] = len(class_pixels)
                 filtered_training_rois[class_name] = filtered_pixels
-                filtered_training_rois_for_grouping[class_name] = filtered_pixels  # For spatial clustering
+                filtered_training_rois_for_grouping[class_name] = (
+                    filtered_pixels  # For spatial clustering
+                )
 
                 if not quiet:
                     print(
@@ -6637,10 +7106,45 @@ class CombinedTransectCube:
         X_train = np.array(X_train)
         y_train = np.array(y_train)
 
+        # 🔥 NEW: Intensity-only mode - replace full spectrum with mean intensity
+        if use_intensity_only:
+            intensity = np.mean(X_train, axis=1, keepdims=True)  # Shape: (n_pixels, 1)
+            X_train = intensity  # Replace spectrum with single intensity value
+            if not quiet:
+                print(f"\n💡 Intensity-only mode activated:")
+                print(
+                    f"   Intensity range: [{intensity.min():.4f}, {intensity.max():.4f}]"
+                )
+                print(
+                    f"   Intensity mean: {intensity.mean():.4f} ± {intensity.std():.4f}"
+                )
+                print(
+                    f"   Feature dimensionality: {X_train.shape[1]} (mean intensity only)"
+                )
+
+        # 🔥 NEW: Add brightness feature (mean intensity across wavelength-filtered spectrum)
+        elif add_brightness_feature:
+            brightness = np.mean(X_train, axis=1, keepdims=True)  # Shape: (n_pixels, 1)
+            X_train = np.hstack([X_train, brightness])  # Append as last column
+            if not quiet:
+                print(f"\n💡 Brightness feature added:")
+                print(
+                    f"   Brightness range: [{brightness.min():.4f}, {brightness.max():.4f}]"
+                )
+                print(
+                    f"   Brightness mean: {brightness.mean():.4f} ± {brightness.std():.4f}"
+                )
+
         if not quiet:
             print(
-                f"\n✅ Training data: {X_train.shape[0]} pixels, {X_train.shape[1]} wavelengths"
+                f"\n✅ Training data: {X_train.shape[0]} pixels, {X_train.shape[1]} features"
             )
+            if use_intensity_only:
+                print(f"   Features: 1 mean intensity value")
+            elif add_brightness_feature:
+                print(f"   Features: {X_train.shape[1]-1} wavelengths + 1 brightness")
+            else:
+                print(f"   Features: {X_train.shape[1]} wavelengths")
             print(f"   Kept (outside segment): {pixels_kept_outside}")
             print(f"   Rejected (inside segment): {pixels_rejected_inside}")
 
@@ -6667,48 +7171,58 @@ class CombinedTransectCube:
         # Subsample per group if requested (prevent large groups from dominating)
         if subsample_per_group is not None:
             if not quiet:
-                print(f"\n✂️  Subsampling: max {subsample_per_group} pixels per group...")
-            
+                print(
+                    f"\n✂️  Subsampling: max {subsample_per_group} pixels per group..."
+                )
+
             keep_indices = []
             for group_name in np.unique(groups):
                 group_mask = groups == group_name
                 group_indices = np.where(group_mask)[0]
-                
+
                 if len(group_indices) > subsample_per_group:
                     # Randomly sample subsample_per_group pixels
                     np.random.seed(42)
-                    sampled_indices = np.random.choice(group_indices, subsample_per_group, replace=False)
+                    sampled_indices = np.random.choice(
+                        group_indices, subsample_per_group, replace=False
+                    )
                     keep_indices.extend(sampled_indices)
                     if not quiet:
-                        print(f"   {group_name}: {len(group_indices)} → {subsample_per_group} pixels")
+                        print(
+                            f"   {group_name}: {len(group_indices)} → {subsample_per_group} pixels"
+                        )
                 else:
                     keep_indices.extend(group_indices)
-            
+
             keep_indices = np.array(keep_indices)
             X_train = X_train[keep_indices]
             y_train = y_train[keep_indices]
             groups = groups[keep_indices]
-            
+
             if not quiet:
                 print(f"   Total: {len(keep_indices)} pixels after subsampling")
-        
+
         # Calculate sample weights if requested (weight by 1/group_size)
         sample_weights = None
         if use_sample_weights:
             if not quiet:
                 print(f"\n⚖️  Using sample weights: weight = 1 / group_size")
-            
+
             sample_weights = np.zeros(len(groups))
             for group_name in np.unique(groups):
                 group_mask = groups == group_name
                 group_size = np.sum(group_mask)
                 sample_weights[group_mask] = 1.0 / group_size
-            
+
             # Normalize so weights sum to number of samples
-            sample_weights = sample_weights * len(sample_weights) / np.sum(sample_weights)
-            
+            sample_weights = (
+                sample_weights * len(sample_weights) / np.sum(sample_weights)
+            )
+
             if not quiet:
-                print(f"   Weight range: {sample_weights.min():.3f} - {sample_weights.max():.3f}")
+                print(
+                    f"   Weight range: {sample_weights.min():.3f} - {sample_weights.max():.3f}"
+                )
 
         # Encode labels
         le = LabelEncoder()
@@ -6726,7 +7240,9 @@ class CombinedTransectCube:
         n_groups = len(np.unique(groups))
         if cv_folds > n_groups:
             if not quiet:
-                print(f"\n⚠️  WARNING: Requested {cv_folds} folds but only {n_groups} ROI groups available")
+                print(
+                    f"\n⚠️  WARNING: Requested {cv_folds} folds but only {n_groups} ROI groups available"
+                )
                 print(f"   Reducing to {n_groups}-fold CV (Leave-One-Group-Out)")
             cv_folds = n_groups
 
@@ -6734,18 +7250,97 @@ class CombinedTransectCube:
         if not quiet:
             print(f"\n🔄 Performing {cv_folds}-fold GROUPED cross-validation...")
 
-        try:
-            from sklearn.model_selection import StratifiedGroupKFold
-            sgkf = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-            cv_splitter = sgkf
+        # 🔥 NEW: Custom fold generation to ensure all classes in validation
+        def generate_balanced_folds(X, y, groups, class_names, n_splits, quiet=False):
+            """
+            Generate CV folds ensuring each fold has ALL classes in validation.
+            Uses Leave-One-Bomb-Out strategy: each fold gets exactly one bomb group
+            plus a mix of dark and sediment groups to ensure class balance.
+            """
+            from collections import Counter, defaultdict
+            import random
+
+            # Group pixels by group name AND class
+            group_to_class = {}
+            group_to_indices = defaultdict(list)
+
+            for idx, (group_name, class_name) in enumerate(zip(groups, y)):
+                group_to_indices[group_name].append(idx)
+                if group_name not in group_to_class:
+                    group_to_class[group_name] = class_name
+
+            # Separate groups by class
+            class_to_groups = defaultdict(list)
+            for group_name, class_name in group_to_class.items():
+                class_to_groups[class_name].append(group_name)
+
             if not quiet:
-                print(f"   ✅ Using StratifiedGroupKFold (maintains class distribution + grouping)")
-        except ImportError:
-            from sklearn.model_selection import GroupKFold
-            gkf = GroupKFold(n_splits=cv_folds)
-            cv_splitter = gkf
+                print(f"\n   📊 Groups per class:")
+                for class_name in sorted(class_to_groups.keys()):
+                    print(
+                        f"      {class_name}: {len(class_to_groups[class_name])} groups"
+                    )
+
+            # Find the minority class (typically bombs with 2 groups)
+            minority_class = min(
+                class_to_groups.keys(), key=lambda c: len(class_to_groups[c])
+            )
+            minority_groups = class_to_groups[minority_class]
+            n_minority_groups = len(minority_groups)
+
             if not quiet:
-                print(f"   ⚠️  StratifiedGroupKFold not available, using GroupKFold (grouping only)")
+                print(
+                    f"   🎯 Minority class: {minority_class} ({n_minority_groups} groups)"
+                )
+                print(
+                    f"   🔄 Using Leave-One-{minority_class.split('_')[-1].title()}-Out strategy"
+                )
+
+            # Adjust n_splits to number of minority groups (can't have more folds)
+            actual_splits = min(n_splits, n_minority_groups)
+            if actual_splits < n_splits:
+                if not quiet:
+                    print(
+                        f"   ⚠️  Reducing folds: {n_splits} → {actual_splits} (limited by {minority_class})"
+                    )
+
+            # Generate folds
+            folds = []
+            random.seed(42)
+
+            # Each fold gets exactly ONE minority group in validation
+            for fold_idx in range(actual_splits):
+                val_groups = [minority_groups[fold_idx]]  # One minority group
+
+                # Add groups from other classes to validation (spread evenly)
+                for class_name, groups_list in class_to_groups.items():
+                    if class_name == minority_class:
+                        continue  # Already handled
+
+                    # Assign groups to val in round-robin fashion
+                    for i, group_name in enumerate(groups_list):
+                        if i % actual_splits == fold_idx:
+                            val_groups.append(group_name)
+
+                # Get indices for train/val
+                val_indices = []
+                train_indices = []
+
+                for group_name, indices in group_to_indices.items():
+                    if group_name in val_groups:
+                        val_indices.extend(indices)
+                    else:
+                        train_indices.extend(indices)
+
+                folds.append((np.array(train_indices), np.array(val_indices)))
+
+            return folds, actual_splits
+
+        # Generate custom folds
+        custom_folds, actual_cv_folds = generate_balanced_folds(
+            X_train, y_train, groups, class_names, cv_folds, quiet=quiet
+        )
+        cv_folds = actual_cv_folds
 
         cv_accuracy = []
         cv_precision = []
@@ -6753,9 +7348,7 @@ class CombinedTransectCube:
         cv_f1 = []
         cv_confusion_matrices = []
 
-        for fold_idx, (train_idx, val_idx) in enumerate(
-            cv_splitter.split(X_train, y_train_encoded, groups=groups)  # 🔥 NEW: Pass groups
-        ):
+        for fold_idx, (train_idx, val_idx) in enumerate(custom_folds):
             X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
             y_fold_train, y_fold_val = (
                 y_train_encoded[train_idx],
@@ -6768,32 +7361,43 @@ class CombinedTransectCube:
             train_roi_set = set(groups_fold_train)
             val_roi_set = set(groups_fold_val)
             overlap = train_roi_set & val_roi_set
-            
+
             # Class distribution
             from collections import Counter
+
             train_counts = Counter(y_train[train_idx])
             val_counts = Counter(y_train[val_idx])
-            
+
             # Check if all classes present in validation
             val_classes = set(val_counts.keys())
             all_classes = set(class_names)
             missing_classes = all_classes - val_classes
-            
+
             if not quiet:
                 print(f"\n   📂 Fold {fold_idx + 1}/{cv_folds}:")
                 print(f"      Train groups: {sorted(train_roi_set)}")
                 print(f"      Val groups:   {sorted(val_roi_set)}")
-                
+
                 if overlap:
                     print(f"      ❌ OVERLAP DETECTED: {overlap} (DATA LEAKAGE!)")
                 else:
                     print(f"      ✅ No overlap (clean split)")
-                
+
                 print(f"      Train samples: {dict(train_counts)}")
                 print(f"      Val samples:   {dict(val_counts)}")
-                
+
                 if missing_classes:
                     print(f"      ⚠️  MISSING CLASSES IN VAL: {missing_classes}")
+
+            # 🔥 NEW: REFUSE fold if validation is missing any class
+            if missing_classes:
+                error_msg = (
+                    f"❌ FOLD {fold_idx + 1} INVALID: Validation set missing classes {missing_classes}!\n"
+                    f"   This makes CV scores unreliable.\n"
+                    f"   Try reducing cv_folds or use Leave-One-Bomb-Out strategy.\n"
+                    f"   Current fold has: {sorted(val_roi_set)}"
+                )
+                raise ValueError(error_msg)
 
             # Train SVM on this fold
             if optimize_params:
@@ -6807,29 +7411,43 @@ class CombinedTransectCube:
                     # Use GroupKFold for inner CV (grouped splitting)
                     inner_cv = GroupKFold(n_splits=min(3, n_train_groups))
                     grid_search = GridSearchCV(
-                        SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                        SVC(
+                            kernel=svm_kernel, class_weight="balanced", random_state=42
+                        ),
                         param_grid,
                         cv=inner_cv,
                         scoring="f1_macro",
                         n_jobs=-1,
                     )
-                    grid_search.fit(X_fold_train, y_fold_train, groups=groups_fold_train)
+                    grid_search.fit(
+                        X_fold_train, y_fold_train, groups=groups_fold_train
+                    )
                 else:
                     # Not enough groups for inner CV - use simple train/val split (no inner CV)
                     if not quiet:
-                        print(f"      ⚠️  Only {n_train_groups} groups in training - skipping inner CV, using default params")
+                        print(
+                            f"      ⚠️  Only {n_train_groups} groups in training - skipping inner CV, using default params"
+                        )
                     grid_search = GridSearchCV(
-                        SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                        SVC(
+                            kernel=svm_kernel, class_weight="balanced", random_state=42
+                        ),
                         param_grid,
                         cv=2,  # Minimum CV splits
                         scoring="f1_macro",
                         n_jobs=-1,
                     )
-                    grid_search.fit(X_fold_train, y_fold_train)  # No groups for inner CV
+                    grid_search.fit(
+                        X_fold_train, y_fold_train
+                    )  # No groups for inner CV
                 fold_model = grid_search.best_estimator_
             else:
                 fold_model = SVC(
-                    kernel=svm_kernel, C=svm_C, gamma=svm_gamma, class_weight="balanced", random_state=42  # 🔥 NEW: class_weight="balanced"
+                    kernel=svm_kernel,
+                    C=svm_C,
+                    gamma=svm_gamma,
+                    class_weight="balanced",
+                    random_state=42,  # 🔥 NEW: class_weight="balanced"
                 )
                 fold_model.fit(X_fold_train, y_fold_train)
 
@@ -6887,6 +7505,37 @@ class CombinedTransectCube:
 
         start_time = time.time()
 
+        # 🔥 NEW: Setup class weights (custom dict or balanced)
+        if class_weight_dict is not None:
+            # Convert class names to encoded labels
+            class_weight_encoded = {}
+            for class_name, weight in class_weight_dict.items():
+                if class_name in class_names:
+                    encoded_label = le.transform([class_name])[0]
+                    class_weight_encoded[encoded_label] = weight
+                else:
+                    print(
+                        f"   ⚠️  Warning: Class '{class_name}' in class_weight_dict not found in training data"
+                    )
+
+            # Fill in any missing classes with weight 1.0
+            for class_name in class_names:
+                encoded_label = le.transform([class_name])[0]
+                if encoded_label not in class_weight_encoded:
+                    class_weight_encoded[encoded_label] = 1.0
+
+            class_weight_setting = class_weight_encoded
+            if not quiet:
+                print(f"\n⚖️  Using custom class weights:")
+                for class_name in class_names:
+                    encoded_label = le.transform([class_name])[0]
+                    weight = class_weight_encoded[encoded_label]
+                    print(f"   {class_name}: {weight:.2f}x")
+        else:
+            class_weight_setting = "balanced"
+            if not quiet:
+                print(f"\n⚖️  Using balanced class weights (automatic)")
+
         if optimize_params:
             param_grid = {
                 "C": [0.1, 1, 10, 100, 1000],
@@ -6897,7 +7546,11 @@ class CombinedTransectCube:
             if n_unique_groups >= 3:
                 final_inner_cv = GroupKFold(n_splits=min(3, n_unique_groups))
                 grid_search = GridSearchCV(
-                    SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                    SVC(
+                        kernel=svm_kernel,
+                        class_weight=class_weight_setting,
+                        random_state=42,
+                    ),
                     param_grid,
                     cv=final_inner_cv,
                     scoring="f1_macro",
@@ -6907,9 +7560,15 @@ class CombinedTransectCube:
             else:
                 # Not enough groups - use standard CV (falls back to pixel-level for hyperparameter tuning only)
                 if not quiet:
-                    print(f"   ⚠️  Only {n_unique_groups} ROI groups - using pixel-level CV for hyperparameter tuning")
+                    print(
+                        f"   ⚠️  Only {n_unique_groups} ROI groups - using pixel-level CV for hyperparameter tuning"
+                    )
                 grid_search = GridSearchCV(
-                    SVC(kernel=svm_kernel, class_weight="balanced", random_state=42),
+                    SVC(
+                        kernel=svm_kernel,
+                        class_weight=class_weight_setting,
+                        random_state=42,
+                    ),
                     param_grid,
                     cv=3,
                     scoring="f1_macro",
@@ -6925,7 +7584,11 @@ class CombinedTransectCube:
                 )
         else:
             final_model = SVC(
-                kernel=svm_kernel, C=svm_C, gamma=svm_gamma, class_weight="balanced", random_state=42  # 🔥 NEW: class_weight="balanced"
+                kernel=svm_kernel,
+                C=svm_C,
+                gamma=svm_gamma,
+                class_weight=class_weight_setting,
+                random_state=42,  # 🔥 NEW: class_weight="balanced"
             )
             final_model.fit(X_train, y_train_encoded)
             best_params = {"C": svm_C, "gamma": svm_gamma}
@@ -6937,18 +7600,20 @@ class CombinedTransectCube:
         self.svm_label_encoder = le
         self.svm_class_names = class_names
         self.svm_training_segment = (segment_start, segment_end)
-        
+
         # Store spatial groups for visualization
         if use_spatial_groups:
             # Create spatial_groups_roi_collection for plotting
             spatial_groups_roi = {}
-            for i, (pixel, group_name) in enumerate(zip(filtered_training_rois_for_grouping, groups)):
+            for i, (pixel, group_name) in enumerate(
+                zip(filtered_training_rois_for_grouping, groups)
+            ):
                 if group_name not in spatial_groups_roi:
                     spatial_groups_roi[group_name] = []
                 # Get the actual pixel coordinate from filtered_training_rois
                 # Need to reconstruct which pixel this is
                 pass
-            
+
             # Better approach: reconstruct from groups array
             spatial_groups_roi_collection = {}
             pixel_idx = 0
@@ -6960,7 +7625,7 @@ class CombinedTransectCube:
                             spatial_groups_roi_collection[group_name] = []
                         spatial_groups_roi_collection[group_name].append(pixel_coord)
                         pixel_idx += 1
-            
+
             self.svm_spatial_groups = spatial_groups_roi_collection
         else:
             self.svm_spatial_groups = None
@@ -6985,11 +7650,226 @@ class CombinedTransectCube:
             "best_params": best_params,
             "training_pixels_per_class": training_pixel_counts,
             "filtered_training_rois": filtered_training_rois,
-            "spatial_groups_roi_collection": spatial_groups_roi_collection if use_spatial_groups else None,  # 🔥 NEW
+            "spatial_groups_roi_collection": (
+                spatial_groups_roi_collection if use_spatial_groups else None
+            ),  # 🔥 NEW
             "filtered_pixels_outside": pixels_kept_outside,
             "filtered_pixels_inside": pixels_rejected_inside,
             "training_time": training_time,
         }
+
+    def _post_classification_filtering(
+        self,
+        classification_map,
+        class_names,
+        post_cc_bomb=True,
+        post_cc_dark=True,
+        post_cc_sediment=False,
+        cc_connectivity=8,
+        cc_min_area=20,
+        morph_close_radius=1,
+        morph_open_radius=1,
+        merge_proximity_px=0,
+        quiet=False,
+    ):
+        """
+        Post-classification connected-component filtering to remove isolated pixels.
+
+        This function applies morphological operations and connected-component filtering
+        to clean up the classification results by removing small, isolated regions.
+
+        Args:
+            classification_map: 2D array of class names (track x slit)
+            class_names: List of class names in the classification
+            post_cc_bomb: Apply filtering to bomb class (default: True)
+            post_cc_dark: Apply filtering to dark class (default: True)
+            post_cc_sediment: Apply filtering to sediment class (default: False)
+            cc_connectivity: Connectivity for connected components (4 or 8)
+            cc_min_area: Minimum area (pixels) to keep a component
+            morph_close_radius: Radius for morphological closing (0 to disable)
+            morph_open_radius: Radius for morphological opening (0 to disable)
+            merge_proximity_px: Merge components within this distance (0 to disable)
+            quiet: Suppress progress messages
+
+        Returns:
+            Cleaned classification map (2D array of class names)
+        """
+        from scipy.ndimage import (
+            label,
+            binary_closing,
+            binary_opening,
+            binary_dilation,
+            generate_binary_structure,
+            iterate_structure,
+        )
+
+        # Create disk structuring element (replacement for skimage.morphology.disk)
+        def create_disk(radius):
+            """Create a disk-shaped structuring element."""
+            if radius <= 0:
+                return np.ones((1, 1), dtype=np.uint8)
+
+            y, x = np.ogrid[-radius : radius + 1, -radius : radius + 1]
+            disk_mask = x**2 + y**2 <= radius**2
+            return disk_mask.astype(np.uint8)
+
+        if not quiet:
+            print(f"\n🧹 POST-CLASSIFICATION FILTERING")
+            print(f"=" * 60)
+
+        cleaned_map = classification_map.copy()
+
+        # Determine which classes to filter
+        filter_classes = {}
+        for class_name in class_names:
+            if "bomb" in class_name.lower() and post_cc_bomb:
+                filter_classes[class_name] = "bomb"
+            elif "dark" in class_name.lower() and post_cc_dark:
+                filter_classes[class_name] = "dark"
+            elif "sediment" in class_name.lower() and post_cc_sediment:
+                filter_classes[class_name] = "sediment"
+
+        if not filter_classes:
+            if not quiet:
+                print("   ⚠️  No classes selected for filtering")
+            return cleaned_map
+
+        if not quiet:
+            print(f"   Classes to filter: {list(filter_classes.keys())}")
+            print(f"   Connectivity: {cc_connectivity}")
+            print(f"   Min area: {cc_min_area} pixels")
+            print(
+                f"   Morph close radius: {morph_close_radius} ({'disabled' if morph_close_radius == 0 else 'enabled'})"
+            )
+            print(
+                f"   Morph open radius: {morph_open_radius} ({'disabled' if morph_open_radius == 0 else 'enabled'})"
+            )
+            print(
+                f"   Merge proximity: {merge_proximity_px} px ({'disabled' if merge_proximity_px == 0 else 'enabled'})"
+            )
+
+        # Process each class
+        for class_name, class_type in filter_classes.items():
+            if not quiet:
+                print(f"\n   🔍 Filtering {class_name} ({class_type})...")
+
+            # 1. Create binary mask for this class
+            binary_mask = (classification_map == class_name).astype(np.uint8)
+            original_count = np.sum(binary_mask)
+
+            if original_count == 0:
+                if not quiet:
+                    print(f"      ⚠️  No pixels found for {class_name}")
+                continue
+
+            # 2. Label connected components FIRST (before morphological operations)
+            # This way we identify clusters based on original pixels, not eroded ones
+            structure = np.ones((3, 3), dtype=int) if cc_connectivity == 8 else None
+            labeled_mask, n_components = label(binary_mask, structure=structure)
+
+            if not quiet:
+                print(f"      Found {n_components} connected components")
+
+            # 3. Filter components by area
+            cleaned_mask = np.zeros_like(binary_mask)
+            components_kept = 0
+            components_removed = 0
+            pixels_kept = 0
+            pixels_removed = 0
+
+            for component_id in range(1, n_components + 1):
+                component_mask = labeled_mask == component_id
+                component_area = np.sum(component_mask)
+
+                if component_area >= cc_min_area:
+                    cleaned_mask[component_mask] = 1
+                    components_kept += 1
+                    pixels_kept += component_area
+                else:
+                    components_removed += 1
+                    pixels_removed += component_area
+
+            if not quiet:
+                print(
+                    f"      Kept: {components_kept} components ({pixels_kept} pixels)"
+                )
+                print(
+                    f"      Removed: {components_removed} components ({pixels_removed} pixels)"
+                )
+
+            # 4. Apply morphological operations AFTER filtering (optional cleanup)
+            # Morphological closing (fills small holes in kept clusters)
+            if morph_close_radius > 0:
+                selem = create_disk(morph_close_radius)
+                cleaned_mask = binary_closing(cleaned_mask, structure=selem).astype(
+                    np.uint8
+                )
+
+            # Morphological opening (smooths edges of kept clusters)
+            # WARNING: This can shrink clusters! Use with caution or disable.
+            if morph_open_radius > 0:
+                selem = create_disk(morph_open_radius)
+                cleaned_mask = binary_opening(cleaned_mask, structure=selem).astype(
+                    np.uint8
+                )
+
+            # 6. Merge nearby components (optional)
+            if merge_proximity_px > 0 and components_kept > 1:
+                # Dilate components and merge overlaps
+                selem = create_disk(merge_proximity_px)
+                dilated_mask = binary_dilation(cleaned_mask, structure=selem).astype(
+                    np.uint8
+                )
+
+                # Re-label after dilation to merge components
+                merged_labeled, n_merged = label(dilated_mask, structure=structure)
+
+                # Apply merged labels back to original cleaned mask
+                cleaned_mask = np.zeros_like(binary_mask)
+                for component_id in range(1, n_merged + 1):
+                    component_mask = merged_labeled == component_id
+                    # Only keep pixels that were in original cleaned_mask
+                    original_component_mask = (labeled_mask > 0) & component_mask
+                    cleaned_mask[original_component_mask] = 1
+
+                if not quiet:
+                    print(f"      After merging: {n_merged} components")
+
+            # 7. Write cleaned mask back to classification map
+            # Pixels that don't pass the filter are RENAMED to filtered_* (not removed!)
+            # First, find all pixels of this class in cleaned_map
+            class_mask = cleaned_map == class_name
+            # Pixels that should be removed: in original class but NOT in cleaned_mask
+            pixels_to_remove = class_mask & (~cleaned_mask.astype(bool))
+            n_pixels_to_remove = np.sum(pixels_to_remove)
+
+            if n_pixels_to_remove > 0:
+                # Create filtered class name: classified_bombs → filtered_bombs
+                filtered_class_name = class_name.replace("classified_", "filtered_")
+
+                # Reclassify removed pixels with filtered_* name
+                cleaned_map[pixels_to_remove] = filtered_class_name
+
+                if not quiet:
+                    print(
+                        f"      ✂️  Reclassified {n_pixels_to_remove} pixels as {filtered_class_name}"
+                    )
+
+            final_count = np.sum(cleaned_mask)
+            if not quiet:
+                removed_pct = (
+                    ((original_count - final_count) / original_count * 100)
+                    if original_count > 0
+                    else 0
+                )
+                print(
+                    f"      Final: {final_count} pixels ({original_count - final_count} removed, {removed_pct:.1f}%)"
+                )
+
+        if not quiet:
+            print(f"\n✅ Post-classification filtering complete")
+
+        return cleaned_map
 
     def classify_segment_with_validation(
         self,
@@ -7000,6 +7880,16 @@ class CombinedTransectCube:
         use_corrected=True,
         save_to_h5=True,
         dataset_name="svm_classification_validated",
+        # 🔥 NEW: Post-classification filtering parameters
+        apply_post_filtering=True,
+        post_cc_bomb=True,
+        post_cc_dark=True,
+        post_cc_sediment=False,
+        cc_connectivity=8,
+        cc_min_area=20,
+        morph_close_radius=1,
+        morph_open_radius=1,
+        merge_proximity_px=0,
         quiet=False,
     ):
         """
@@ -7007,9 +7897,10 @@ class CombinedTransectCube:
 
         This method:
         1. Classifies all pixels in [segment_start, segment_end] using trained SVM
-        2. Extracts validation pixels from ROIs that are INSIDE the segment
-        3. Computes confusion matrix and per-class metrics on validation pixels
-        4. Returns classification map + validation metrics + filtered validation ROI coordinates
+        2. (Optional) Applies post-classification filtering to remove isolated pixels
+        3. Extracts validation pixels from ROIs that are INSIDE the segment
+        4. Computes confusion matrix and per-class metrics on validation pixels
+        5. Returns classification map + validation metrics + filtered validation ROI coordinates
 
         Args:
             segment_start: Start track index of segment to classify
@@ -7021,6 +7912,15 @@ class CombinedTransectCube:
             use_corrected: Use corrected data (True) or raw data (False)
             save_to_h5: Save classification map to H5 files
             dataset_name: Name of dataset in H5 file
+            apply_post_filtering: Apply post-classification connected-component filtering (default: True)
+            post_cc_bomb: Filter bomb class to remove isolated pixels (default: True)
+            post_cc_dark: Filter dark class to remove isolated pixels (default: True)
+            post_cc_sediment: Filter sediment class to remove isolated pixels (default: False)
+            cc_connectivity: Connectivity for connected components - 4 or 8 (default: 8)
+            cc_min_area: Minimum component area in pixels (default: 20)
+            morph_close_radius: Morphological closing radius in pixels, 0 to disable (default: 1)
+            morph_open_radius: Morphological opening radius in pixels, 0 to disable (default: 1)
+            merge_proximity_px: Merge components within this distance, 0 to disable (default: 0)
             quiet: Suppress progress messages
 
         Returns:
@@ -7074,10 +7974,12 @@ class CombinedTransectCube:
         n_tracks, n_slits, n_wavelengths = cube_data.shape
 
         # Apply same wavelength filtering as training
-        if hasattr(self, 'svm_wavelength_indices'):
+        if hasattr(self, "svm_wavelength_indices"):
             cube_data = cube_data[:, :, self.svm_wavelength_indices]
             if not quiet:
-                print(f"\n📊 Using wavelength subset: {len(self.svm_wavelength_indices)} wavelengths")
+                print(
+                    f"\n📊 Using wavelength subset: {len(self.svm_wavelength_indices)} wavelengths"
+                )
 
         if not quiet:
             print(f"\n📦 Datacube shape: {cube_data.shape}")
@@ -7102,31 +8004,66 @@ class CombinedTransectCube:
         start_time = time.time()
 
         X_classify = segment_data.reshape(-1, segment_data.shape[2])
-        
+
+        # 🔥 NEW: Intensity-only mode - replace full spectrum with mean intensity
+        if hasattr(self, "svm_use_intensity_only") and self.svm_use_intensity_only:
+            intensity = np.mean(
+                X_classify, axis=1, keepdims=True
+            )  # Shape: (n_pixels, 1)
+            X_classify = intensity  # Replace spectrum with single intensity value
+            if not quiet:
+                print(
+                    f"   💡 Intensity-only mode (range: [{intensity.min():.4f}, {intensity.max():.4f}])"
+                )
+
+        # 🔥 NEW: Add brightness feature if it was used during training
+        elif (
+            hasattr(self, "svm_add_brightness_feature")
+            and self.svm_add_brightness_feature
+        ):
+            brightness = np.mean(
+                X_classify, axis=1, keepdims=True
+            )  # Shape: (n_pixels, 1)
+            X_classify = np.hstack([X_classify, brightness])  # Append as last column
+            if not quiet:
+                print(
+                    f"   💡 Added brightness feature (range: [{brightness.min():.4f}, {brightness.max():.4f}])"
+                )
+
         # Classify with progress bar (batch processing for better visualization)
         batch_size = 10000  # Classify 10k pixels at a time
         n_batches = int(np.ceil(len(X_classify) / batch_size))
         y_pred_encoded = np.zeros(len(X_classify), dtype=int)
-        
+
         if not quiet:
             from tqdm import tqdm
-            progress_bar = tqdm(total=len(X_classify), desc="   Classifying", unit="pixels", ncols=100)
-        
+
+            progress_bar = tqdm(
+                total=len(X_classify), desc="   Classifying", unit="pixels", ncols=100
+            )
+
         for i in range(n_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, len(X_classify))
             batch = X_classify[start_idx:end_idx]
             y_pred_encoded[start_idx:end_idx] = self.svm_model.predict(batch)
-            
+
             if not quiet:
                 progress_bar.update(len(batch))
-        
+
         if not quiet:
             progress_bar.close()
-        
+
         y_pred = self.svm_label_encoder.inverse_transform(y_pred_encoded)
 
-        classification_map = y_pred.reshape(segment_shape[0], segment_shape[1])
+        # 🔥 RENAME: training_* → classified_* (these are predictions, not training data!)
+        y_pred_classified = np.array(
+            [name.replace("training_", "classified_") for name in y_pred]
+        )
+
+        classification_map = y_pred_classified.reshape(
+            segment_shape[0], segment_shape[1]
+        )
         classification_map_encoded = y_pred_encoded.reshape(
             segment_shape[0], segment_shape[1]
         )
@@ -7136,12 +8073,51 @@ class CombinedTransectCube:
         if not quiet:
             print(f"   ✅ Classification complete in {classification_time:.2f} seconds")
 
-            # Class distribution
-            unique, counts = np.unique(y_pred, return_counts=True)
-            print(f"\n📊 Classification distribution:")
+            # Class distribution (before filtering)
+            unique, counts = np.unique(y_pred_classified, return_counts=True)
+            print(f"\n📊 Classification distribution (before filtering):")
             for class_name, count in zip(unique, counts):
-                percentage = (count / len(y_pred)) * 100
+                percentage = (count / len(y_pred_classified)) * 100
                 print(f"   {class_name}: {count} pixels ({percentage:.1f}%)")
+
+        # 🔥 NEW: Store "before filtering" version for comparison
+        classification_map_before_filtering = classification_map.copy()
+        classification_map_encoded_before_filtering = classification_map_encoded.copy()
+
+        # 🔥 NEW: Apply post-classification filtering
+        if apply_post_filtering:
+            classification_map = self._post_classification_filtering(
+                classification_map,
+                self.svm_class_names,
+                post_cc_bomb=post_cc_bomb,
+                post_cc_dark=post_cc_dark,
+                post_cc_sediment=post_cc_sediment,
+                cc_connectivity=cc_connectivity,
+                cc_min_area=cc_min_area,
+                morph_close_radius=morph_close_radius,
+                morph_open_radius=morph_open_radius,
+                merge_proximity_px=merge_proximity_px,
+                quiet=quiet,
+            )
+
+            # Update encoded map and y_pred for validation
+            # Re-encode the cleaned classification map
+            classification_map_encoded = np.zeros_like(classification_map, dtype=int)
+            for idx, class_name in enumerate(self.svm_class_names):
+                classification_map_encoded[classification_map == class_name] = idx
+
+            # Update y_pred for validation
+            y_pred = classification_map.flatten()
+            y_pred_encoded = classification_map_encoded.flatten()
+
+            if not quiet:
+                # Class distribution (after filtering)
+                unique, counts = np.unique(y_pred[y_pred != ""], return_counts=True)
+                print(f"\n📊 Classification distribution (after filtering):")
+                for class_name, count in zip(unique, counts):
+                    if class_name:  # Skip empty strings
+                        percentage = (count / len(y_pred)) * 100
+                        print(f"   {class_name}: {count} pixels ({percentage:.1f}%)")
 
         # Validation on inside-segment ROIs
         if validation_rois:
@@ -7300,9 +8276,7 @@ class CombinedTransectCube:
                         ds.attrs["track_end"] = segment_end
 
                         if not quiet:
-                            print(
-                                f"   💾 Saved to: {geofile.name} → {ds_path}"
-                            )
+                            print(f"   💾 Saved to: {geofile.name} → {ds_path}")
 
                 except Exception as e:
                     print(f"   ⚠️  Could not save to {geofile.name}: {e}")
@@ -7311,12 +8285,21 @@ class CombinedTransectCube:
         self.svm_classification_map = classification_map
         self.svm_classification_map_encoded = classification_map_encoded
         self.svm_classification_range = (segment_start, segment_end)
-        self.svm_validation_class_mapping = validation_class_mapping  # Store mapping for plotting colors
+        self.svm_validation_class_mapping = (
+            validation_class_mapping  # Store mapping for plotting colors
+        )
+
+        # 🔥 FIX: Return classified_* names, not training_* names
+        classified_class_names = [
+            name.replace("training_", "classified_") for name in self.svm_class_names
+        ]
 
         results = {
             "classification_map": classification_map,
             "classification_map_encoded": classification_map_encoded,
-            "class_names": self.svm_class_names,
+            "classification_map_before_filtering": classification_map_before_filtering,  # 🔥 NEW
+            "classification_map_encoded_before_filtering": classification_map_encoded_before_filtering,  # 🔥 NEW
+            "class_names": classified_class_names,  # 🔥 FIX: Use renamed version
             "track_range": (segment_start, segment_end),
             "classification_time": classification_time,
             "validation_metrics": val_metrics,
@@ -7330,6 +8313,404 @@ class CombinedTransectCube:
             print("=" * 60)
 
         return results
+
+    # ============================================================================
+    # 🔥 NEW: CLEANER WRAPPER FUNCTIONS FOR BETTER SEPARATION
+    # ============================================================================
+
+    def classify_segment(
+        self,
+        segment_start,
+        segment_end,
+        use_corrected=True,
+        quiet=False,
+    ):
+        """
+        Classify segment pixels using trained SVM model (NO post-filtering, NO validation).
+
+        This is a CLEAN function that ONLY does classification.
+        For filtering, use filter_classification() afterwards.
+        For validation, use validate_classification() afterwards.
+
+        Args:
+            segment_start: Start track index of segment to classify
+            segment_end: End track index of segment to classify
+            use_corrected: Use corrected data (True) or raw data (False)
+            quiet: Suppress progress messages
+
+        Returns:
+            dict with keys:
+                - 'classification_map': 2D array of class names (segment_size x n_slits)
+                - 'classification_map_encoded': 2D array of encoded labels
+                - 'class_names': List of class names
+                - 'segment_shape': Shape of classified segment
+                - 'track_range': (segment_start, segment_end)
+        """
+        if not quiet:
+            print("=" * 60)
+            print("🎯 SEGMENT CLASSIFICATION (no filtering, no validation)")
+            print("=" * 60)
+
+        # Call the full function with filtering and validation disabled
+        results = self.classify_segment_with_validation(
+            segment_start=segment_start,
+            segment_end=segment_end,
+            validation_rois=None,  # No validation
+            use_corrected=use_corrected,
+            save_to_h5=False,  # Don't save (let user decide)
+            apply_post_filtering=False,  # No filtering
+            quiet=quiet,
+        )
+
+        # Get shape from classification map
+        classification_map = results["classification_map_before_filtering"]
+        segment_shape = classification_map.shape
+
+        # Return only classification results (no validation metrics)
+        return {
+            "classification_map": classification_map,
+            "classification_map_encoded": results[
+                "classification_map_encoded_before_filtering"
+            ],
+            "class_names": results["class_names"],
+            "segment_shape": segment_shape,
+            "track_range": results["track_range"],
+        }
+
+    def filter_classification(
+        self,
+        classification_map,
+        class_names,
+        filter_bombs=True,
+        filter_dark=True,
+        filter_sediment=False,
+        min_area_px=20,
+        connectivity=8,
+        morph_close_radius=1,
+        morph_open_radius=1,
+        merge_proximity_px=0,
+        quiet=False,
+    ):
+        """
+        Apply post-classification filtering to remove isolated pixels.
+
+        This is a CLEAN function that ONLY does filtering (connected-component analysis).
+        Use after classify_segment() to clean up noisy predictions.
+
+        Args:
+            classification_map: 2D array of class names from classify_segment()
+            class_names: List of class names (from classify_segment())
+            filter_bombs: Apply filtering to bomb pixels
+            filter_dark: Apply filtering to dark spot pixels
+            filter_sediment: Apply filtering to sediment pixels
+            min_area_px: Minimum pixels per connected component (smaller = removed)
+            connectivity: 4 or 8 (how pixels connect: orthogonal or diagonal)
+            morph_close_radius: Fill small holes (0 = disabled)
+            morph_open_radius: Remove small protrusions (0 = disabled)
+            merge_proximity_px: Merge nearby components (0 = disabled)
+            quiet: Suppress progress messages
+
+        Returns:
+            dict with keys:
+                - 'filtered_map': 2D array of filtered class names
+                - 'original_map': Original classification map (copy)
+                - 'pixels_removed_per_class': Dict of removed pixel counts
+        """
+        if not quiet:
+            print("=" * 60)
+            print("🧹 POST-CLASSIFICATION FILTERING")
+            print("=" * 60)
+
+        # Map class names to filter flags
+        filter_flags = {}
+        for class_name in class_names:
+            if "bomb" in class_name.lower():
+                filter_flags[class_name] = filter_bombs
+            elif "dark" in class_name.lower():
+                filter_flags[class_name] = filter_dark
+            elif "sediment" in class_name.lower():
+                filter_flags[class_name] = filter_sediment
+            else:
+                filter_flags[class_name] = False  # Default: no filtering
+
+        # Count original pixels
+        original_counts = {}
+        for class_name in class_names:
+            original_counts[class_name] = np.sum(classification_map == class_name)
+
+        # Apply filtering using internal function
+        filtered_map = self._post_classification_filtering(
+            classification_map,
+            class_names,
+            post_cc_bomb=filter_bombs,
+            post_cc_dark=filter_dark,
+            post_cc_sediment=filter_sediment,
+            cc_connectivity=connectivity,
+            cc_min_area=min_area_px,
+            morph_close_radius=morph_close_radius,
+            morph_open_radius=morph_open_radius,
+            merge_proximity_px=merge_proximity_px,
+            quiet=quiet,
+        )
+
+        # Count pixels in filtered map (including new filtered_* classes)
+        pixels_removed = {}
+        filtered_class_counts = {}
+
+        # Get all unique classes in filtered map (includes filtered_* classes)
+        all_classes_after = np.unique(filtered_map)
+
+        for class_name in class_names:
+            final_count = np.sum(filtered_map == class_name)
+            pixels_removed[class_name] = original_counts[class_name] - final_count
+
+            # Check if filtered version exists
+            filtered_class_name = class_name.replace("classified_", "filtered_")
+            if filtered_class_name in all_classes_after:
+                filtered_class_counts[filtered_class_name] = np.sum(
+                    filtered_map == filtered_class_name
+                )
+
+        if not quiet:
+            print(f"\n📊 Filtering summary:")
+            for class_name in class_names:
+                if filter_flags[class_name]:
+                    pct = (
+                        (pixels_removed[class_name] / original_counts[class_name] * 100)
+                        if original_counts[class_name] > 0
+                        else 0
+                    )
+                    print(
+                        f"   {class_name}: {pixels_removed[class_name]} pixels removed ({pct:.1f}%)"
+                    )
+
+                    # Show filtered class count
+                    filtered_class_name = class_name.replace("classified_", "filtered_")
+                    if filtered_class_name in filtered_class_counts:
+                        print(
+                            f"      → Created {filtered_class_name}: {filtered_class_counts[filtered_class_name]} pixels"
+                        )
+                else:
+                    print(f"   {class_name}: No filtering applied")
+
+            print(f"\n📊 Final class distribution:")
+            for class_name in sorted(all_classes_after):
+                count = np.sum(filtered_map == class_name)
+                print(f"   {class_name}: {count} pixels")
+
+        return {
+            "filtered_map": filtered_map,
+            "original_map": classification_map.copy(),
+            "pixels_removed_per_class": pixels_removed,
+            "filtered_class_counts": filtered_class_counts,
+            "all_classes": list(all_classes_after),
+        }
+
+    def merge_filtered_to_sediment(
+        self,
+        filtered_map,
+        quiet=False,
+    ):
+        """
+        Merge filtered_* classes and classified_sediment into new_sediment.
+
+        This creates a 3-class map for validation by combining:
+        - classified_sediment + filtered_bombs + filtered_dark → new_sediment
+        - classified_bombs → stays as is
+        - classified_dark → stays as is
+
+        Args:
+            filtered_map: 2D array from filter_classification() with 5 classes
+            quiet: Suppress progress messages
+
+        Returns:
+            dict with keys:
+                - 'validation_map': 2D array with 3 classes (for validation)
+                - 'class_names': List of 3 class names
+                - 'merge_summary': Dict showing what was merged
+        """
+        if not quiet:
+            print("=" * 60)
+            print("🔀 MERGING FILTERED CLASSES TO SEDIMENT")
+            print("=" * 60)
+
+        validation_map = filtered_map.copy()
+
+        # Find all unique classes in input
+        unique_classes = np.unique(filtered_map)
+
+        if not quiet:
+            print(f"\n📊 Before merge:")
+            for class_name in sorted(unique_classes):
+                count = np.sum(filtered_map == class_name)
+                print(f"   {class_name}: {count} pixels")
+
+        # Merge: classified_sediment + filtered_* → new_sediment
+        merge_summary = {}
+        total_merged = 0
+
+        for class_name in unique_classes:
+            if "sediment" in class_name.lower() or "filtered_" in class_name:
+                pixels = np.sum(filtered_map == class_name)
+                merge_summary[class_name] = pixels
+                total_merged += pixels
+                validation_map[filtered_map == class_name] = "new_sediment"
+
+        # Final class names for validation
+        final_classes = ["classified_bombs", "classified_dark", "new_sediment"]
+
+        if not quiet:
+            print(f"\n🔀 Merged into new_sediment:")
+            for class_name, count in merge_summary.items():
+                print(f"   {class_name}: {count} pixels")
+            print(f"   ─────────────────────────")
+            print(f"   Total: {total_merged} pixels")
+
+            print(f"\n📊 After merge (3 classes for validation):")
+            for class_name in final_classes:
+                count = np.sum(validation_map == class_name)
+                print(f"   {class_name}: {count} pixels")
+
+        return {
+            "validation_map": validation_map,
+            "class_names": final_classes,
+            "merge_summary": merge_summary,
+        }
+
+    def validate_classification(
+        self,
+        classification_map,
+        segment_start,
+        segment_end,
+        validation_rois,
+        validation_class_mapping=None,
+        quiet=False,
+    ):
+        """
+        Validate classification results using ground-truth ROIs.
+
+        This is a CLEAN function that ONLY does validation (metrics calculation).
+        Use after classify_segment() or filter_classification().
+
+        Args:
+            classification_map: 2D array of class names (from classify or filter)
+            segment_start: Start track index of segment
+            segment_end: End track index of segment
+            validation_rois: List of ROI names or dict of ROI pixels
+            validation_class_mapping: Dict mapping validation ROI names to training class names
+            quiet: Suppress progress messages
+
+        Returns:
+            dict with keys:
+                - 'accuracy': Overall accuracy
+                - 'confusion_matrix': Confusion matrix
+                - 'precision_per_class': Dict of precision per class
+                - 'recall_per_class': Dict of recall per class
+                - 'f1_per_class': Dict of F1 score per class
+                - 'support_per_class': Dict of pixel counts per class
+                - 'filtered_validation_rois': Dict of validation pixels used
+        """
+        from sklearn.metrics import (
+            confusion_matrix,
+            accuracy_score,
+            precision_recall_fscore_support,
+        )
+
+        if not quiet:
+            print("=" * 60)
+            print("📊 CLASSIFICATION VALIDATION")
+            print("=" * 60)
+
+        # Convert validation ROIs if needed
+        if isinstance(validation_rois, list):
+            val_roi_dict = {}
+            for roi_name in validation_rois:
+                if roi_name in self.roi_collection:
+                    val_roi_dict[roi_name] = self.roi_collection[roi_name]
+            validation_rois = val_roi_dict
+
+        # Filter validation pixels (keep only those INSIDE segment)
+        filtered_val_rois = {}
+        n_tracks = classification_map.shape[0]
+        n_slits = classification_map.shape[1]
+
+        for val_roi_name, val_pixels in validation_rois.items():
+            filtered_pixels = []
+            for slit_idx, track_idx in val_pixels:
+                if segment_start <= track_idx <= segment_end:
+                    rel_track = track_idx - segment_start
+                    if 0 <= rel_track < n_tracks and 0 <= slit_idx < n_slits:
+                        filtered_pixels.append((slit_idx, track_idx))
+            if len(filtered_pixels) > 0:
+                filtered_val_rois[val_roi_name] = filtered_pixels
+
+        if not filtered_val_rois:
+            if not quiet:
+                print("⚠️  No validation pixels found inside segment!")
+            return None
+
+        # Map validation ROI names to training class names
+        if validation_class_mapping is None:
+            validation_class_mapping = {name: name for name in filtered_val_rois.keys()}
+
+        # Extract predictions and ground truth
+        y_val_pred = []
+        y_val_true = []
+
+        for val_roi_name, val_pixels in filtered_val_rois.items():
+            training_class = validation_class_mapping.get(val_roi_name, val_roi_name)
+
+            for slit_idx, track_idx in val_pixels:
+                rel_track = track_idx - segment_start
+                if 0 <= rel_track < n_tracks and 0 <= slit_idx < n_slits:
+                    predicted_class = classification_map[rel_track, slit_idx]
+                    y_val_pred.append(predicted_class)
+                    y_val_true.append(training_class)
+
+        # Determine unique classes in classification_map
+        unique_pred_classes = np.unique(classification_map)
+        unique_true_classes = np.unique(y_val_true)
+        all_classes = sorted(set(unique_pred_classes) | set(unique_true_classes))
+
+        if not quiet:
+            print(f"\n   Classes in classification: {list(unique_pred_classes)}")
+            print(f"   Classes in validation: {list(unique_true_classes)}")
+
+        # Calculate metrics
+        val_cm = confusion_matrix(y_val_true, y_val_pred, labels=all_classes)
+        val_accuracy = accuracy_score(y_val_true, y_val_pred)
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_val_true, y_val_pred, labels=all_classes, zero_division=0
+        )
+
+        val_metrics = {
+            "accuracy": val_accuracy,
+            "confusion_matrix": val_cm,
+            "precision_per_class": dict(zip(all_classes, precision)),
+            "recall_per_class": dict(zip(all_classes, recall)),
+            "f1_per_class": dict(zip(all_classes, f1)),
+            "support_per_class": dict(zip(all_classes, support)),
+            "filtered_validation_rois": filtered_val_rois,
+            "class_names": all_classes,
+        }
+
+        if not quiet:
+            print(f"\n📈 Validation Results:")
+            print(f"   Overall Accuracy: {val_accuracy:.3f}")
+            print(f"\n   Per-Class Metrics:")
+            for idx, class_name in enumerate(all_classes):
+                print(
+                    f"   {class_name}: P={precision[idx]:.3f}, "
+                    f"R={recall[idx]:.3f}, "
+                    f"F1={f1[idx]:.3f}, "
+                    f"Support={support[idx]}"
+                )
+
+        return val_metrics
+
+    # ============================================================================
+    # END OF CLEANER WRAPPER FUNCTIONS
+    # ============================================================================
 
     def plot_classification_map(
         self,
@@ -7365,13 +8746,14 @@ class CombinedTransectCube:
         # Get georeferencing info (reuse plot_georef logic)
         # Note: track_start and track_end are absolute indices
         # ECEF arrays are 2D: (tracks, slits)
-        X_ecef = self.X_ecef[track_start:track_end+1, :]
-        Y_ecef = self.Y_ecef[track_start:track_end+1, :]
-        Z_ecef = self.Z_ecef[track_start:track_end+1, :]
+        X_ecef = self.X_ecef[track_start : track_end + 1, :]
+        Y_ecef = self.Y_ecef[track_start : track_end + 1, :]
+        Z_ecef = self.Z_ecef[track_start : track_end + 1, :]
 
         # Transform coordinates based on coordinate system
         if coordinate_system.upper() == "LATLON":
             from pyproj import Transformer
+
             tf_ecef_to_geo = Transformer.from_crs(
                 "EPSG:4978", "EPSG:4979", always_xy=True
             )
@@ -7390,7 +8772,7 @@ class CombinedTransectCube:
                 h0 = float(getattr(config, "H0", 0.0))
             else:
                 lat0, lon0, h0 = 60.8011575, 10.7122345, 0.0
-            
+
             N, E, D = _ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, lat0, lon0, h0)
             Xp, Yp = E, N
             xlabel = f"East (m) from {lat0}°, {lon0}°"
@@ -7411,24 +8793,31 @@ class CombinedTransectCube:
         n_classes = len(self.svm_class_names)
         colors = []
         display_labels = []
-        
+
         # Use validation_class_mapping to find correct validation ROI colors
         # The mapping is: {"validation_roi_name": "training_class_name"}
         # We need reverse: {"training_class_name": "validation_roi_name"}
         reverse_mapping = {}
-        if hasattr(self, 'svm_validation_class_mapping') and self.svm_validation_class_mapping:
-            reverse_mapping = {v: k for k, v in self.svm_validation_class_mapping.items()}
-        
+        if (
+            hasattr(self, "svm_validation_class_mapping")
+            and self.svm_validation_class_mapping
+        ):
+            reverse_mapping = {
+                v: k for k, v in self.svm_validation_class_mapping.items()
+            }
+
         for class_name in self.svm_class_names:
             # Create better display label: "Classified: Sediment" instead of "training_sediment"
             if class_name.startswith("training_"):
-                clean_name = class_name.replace("training_", "").replace("_", " ").title()
+                clean_name = (
+                    class_name.replace("training_", "").replace("_", " ").title()
+                )
             else:
                 clean_name = class_name.replace("_", " ").title()
             display_labels.append(f"Classified: {clean_name}")
-            
+
             color_found = False
-            
+
             # Priority 1: Use validation ROI color via reverse mapping
             # E.g., training_sediment → sediment, training_dark → "dark spots"
             if class_name in reverse_mapping:
@@ -7436,19 +8825,21 @@ class CombinedTransectCube:
                 if validation_roi_name in self.roi_color_map:
                     colors.append(self.roi_color_map[validation_roi_name])
                     color_found = True
-            
+
             # Priority 2: Training ROI color
             if not color_found and class_name in self.roi_color_map:
                 colors.append(self.roi_color_map[class_name])
                 color_found = True
-            
+
             # Priority 3: Fallback to default colors
             if not color_found:
                 if isinstance(cmap, str):
                     base_cmap = plt.cm.get_cmap(cmap, n_classes)
                     colors.append(base_cmap(len(colors)))
                 else:
-                    colors.append(cmap[len(colors)] if len(colors) < len(cmap) else 'gray')
+                    colors.append(
+                        cmap[len(colors)] if len(colors) < len(cmap) else "gray"
+                    )
 
         cmap_discrete = ListedColormap(colors[:n_classes])
 
@@ -7542,7 +8933,7 @@ class CombinedTransectCube:
         n_tracks, n_slits, n_wavelengths = cube_data.shape
 
         # Get segment (track_start and track_end are absolute indices)
-        segment_data = cube_data[track_start:track_end+1, :, :]
+        segment_data = cube_data[track_start : track_end + 1, :, :]
 
         # Create RGB (no transpose - keep as tracks x slits x wavelength)
         red_idx = np.argmin(np.abs(self.wavelengths - red_wl))
@@ -7562,13 +8953,14 @@ class CombinedTransectCube:
         RGB = np.dstack([R, G, B])
 
         # Get coordinates (absolute indices, ECEF arrays are 2D: tracks x slits)
-        X_ecef = self.X_ecef[track_start:track_end+1, :]
-        Y_ecef = self.Y_ecef[track_start:track_end+1, :]
-        Z_ecef = self.Z_ecef[track_start:track_end+1, :]
+        X_ecef = self.X_ecef[track_start : track_end + 1, :]
+        Y_ecef = self.Y_ecef[track_start : track_end + 1, :]
+        Z_ecef = self.Z_ecef[track_start : track_end + 1, :]
 
         # Transform coordinates based on coordinate system
         if coordinate_system.upper() == "LATLON":
             from pyproj import Transformer
+
             tf_ecef_to_geo = Transformer.from_crs(
                 "EPSG:4978", "EPSG:4979", always_xy=True
             )
@@ -7587,7 +8979,7 @@ class CombinedTransectCube:
                 h0 = float(getattr(config, "H0", 0.0))
             else:
                 lat0, lon0, h0 = 60.8011575, 10.7122345, 0.0
-            
+
             N, E, D = _ecef_to_ned_arrays(X_ecef, Y_ecef, Z_ecef, lat0, lon0, h0)
             Xp, Yp = E, N
             xlabel = f"East (m) from {lat0}°, {lon0}°"
@@ -7615,41 +9007,50 @@ class CombinedTransectCube:
         # Use same colors and labels as classification map
         colors = []
         display_labels = []
-        
+
         # Use validation_class_mapping to find correct validation ROI colors
         reverse_mapping = {}
-        if hasattr(self, 'svm_validation_class_mapping') and self.svm_validation_class_mapping:
-            reverse_mapping = {v: k for k, v in self.svm_validation_class_mapping.items()}
-        
+        if (
+            hasattr(self, "svm_validation_class_mapping")
+            and self.svm_validation_class_mapping
+        ):
+            reverse_mapping = {
+                v: k for k, v in self.svm_validation_class_mapping.items()
+            }
+
         for class_name in self.svm_class_names:
             # Create better display label: "Classified: Sediment" instead of "training_sediment"
             if class_name.startswith("training_"):
-                clean_name = class_name.replace("training_", "").replace("_", " ").title()
+                clean_name = (
+                    class_name.replace("training_", "").replace("_", " ").title()
+                )
             else:
                 clean_name = class_name.replace("_", " ").title()
             display_labels.append(f"Classified: {clean_name}")
-            
+
             color_found = False
-            
+
             # Priority 1: Use validation ROI color via reverse mapping
             if class_name in reverse_mapping:
                 validation_roi_name = reverse_mapping[class_name]
                 if validation_roi_name in self.roi_color_map:
                     colors.append(self.roi_color_map[validation_roi_name])
                     color_found = True
-            
+
             # Priority 2: Training ROI color
             if not color_found and class_name in self.roi_color_map:
                 colors.append(self.roi_color_map[class_name])
                 color_found = True
-            
+
             # Priority 3: Fallback to default colors
             if not color_found:
                 if isinstance(cmap, str):
                     base_cmap = plt.cm.get_cmap(cmap, n_classes)
                     colors.append(base_cmap(len(colors)))
                 else:
-                    colors.append(cmap[len(colors)] if len(colors) < len(cmap) else 'gray')
+                    colors.append(
+                        cmap[len(colors)] if len(colors) < len(cmap) else "gray"
+                    )
 
         # Create overlay with alpha
         cmap_overlay = ListedColormap(colors[:n_classes])

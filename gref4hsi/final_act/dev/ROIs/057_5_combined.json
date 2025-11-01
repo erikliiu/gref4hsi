@@ -2,7 +2,7 @@
   "transect_name": "Combined_output",
   "export_date": "2025-10-31T09:32:27.949781",
   "roi_collection": {
-    "dark spots": [
+    "validation_dark": [
       [
         632,
         743
@@ -1436,7 +1436,7 @@
         741
       ]
     ],
-    "all bombs": [
+    "validation_bombs": [
       [
         827,
         1504
@@ -3254,7 +3254,7 @@
         1130
       ]
     ],
-    "sediment": [
+    "validation_sediment": [
       [
         455,
         1495
