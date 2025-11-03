@@ -721,10 +721,10 @@ class CombinedTransectCube:
         if idxR is None or idxG is None or idxB is None:
             raise RuntimeError(f"Requested wavelengths not available")
 
-        # Extract channels
-        R = data_cube[:, :, idxR]
-        G = data_cube[:, :, idxG]
-        B = data_cube[:, :, idxB]
+        # Extract channels (MUST COPY to avoid modifying source data during normalization)
+        R = data_cube[:, :, idxR].copy()
+        G = data_cube[:, :, idxG].copy()
+        B = data_cube[:, :, idxB].copy()
 
         return R, G, B
 
@@ -767,6 +767,7 @@ class CombinedTransectCube:
             "training_dark": "#000000",  # black
             "training_sediment": "#8B4513",  # brown (same as sediment)
             # 🔥 Classification output (same colors as training_*)
+            "classified_unknown": "#8A2BE2",  # red (same as training_bombs)
             "classified_bombs": "#FF0000",  # red (same as training_bombs)
             "classified_dark": "#000000",  # black (same as training_dark)
             "classified_sediment": "#8B4513",  # brown (same as training_sediment)
@@ -6900,6 +6901,7 @@ class CombinedTransectCube:
         class_weight_dict=None,  # 🔥 NEW: Custom class weights (e.g., {"training_bombs": 2.0})
         add_brightness_feature=False,  # 🔥 NEW: Add brightness (mean intensity) as feature
         use_intensity_only=False,  # 🔥 NEW: Use only mean intensity instead of full spectrum
+        remap_labels=None,  # 🔥 NEW: Dict mapping ROI names to final class names (e.g., {"training_bombs": "bombs", "validation_bombs": "bombs"})
         quiet=False,
     ):
         """
@@ -6907,14 +6909,17 @@ class CombinedTransectCube:
 
         This method:
         1. Extracts training pixels from ROIs that are OUTSIDE [segment_start, segment_end]
+           OR ALL pixels if segment_start/segment_end are None
         2. Performs K-fold cross-validation to evaluate model performance
-        3. Trains a final SVM model on ALL outside pixels
+        3. Trains a final SVM model on ALL outside pixels (or all pixels if no segment defined)
         4. Returns the trained model + CV metrics + filtered ROI coordinates
 
         Args:
             training_rois: List of ROI names to use for training (e.g., ["training_dark", "training_sediment"])
             segment_start: Start track index of segment (pixels outside this will be used for training)
+                          Set to None to use ALL pixels (no segment filtering)
             segment_end: End track index of segment (pixels outside this will be used for training)
+                        Set to None to use ALL pixels (no segment filtering)
             wavelength_range: Tuple (min_wl, max_wl) to restrict wavelengths used (e.g., (500, 650))
                              If None, uses all wavelengths
             cv_folds: Number of folds for cross-validation (default: 5)
@@ -6925,6 +6930,8 @@ class CombinedTransectCube:
             svm_gamma: SVM kernel coefficient (used if optimize_params=False)
             add_brightness_feature: Add mean intensity as additional feature (default: False)
             use_intensity_only: Use ONLY mean intensity (ignore spectrum). Cannot be True if add_brightness_feature=True (default: False)
+            remap_labels: Optional dict mapping ROI names to final class names (e.g., {"training_bombs": "bombs", "validation_bombs": "bombs"})
+                         This allows combining training and validation ROIs into single classes (default: None = use ROI names as-is)
             quiet: Suppress progress messages
 
         Returns:
@@ -6996,7 +7003,8 @@ class CombinedTransectCube:
         if not training_rois:
             raise ValueError("No valid training ROIs provided")
 
-        # Get datacube
+        # Get datacube - ⚠️ CRITICAL: DO NOT create a copy here, just get reference
+        # (Copying the full cube would waste huge amounts of memory)
         cube_data = (
             self.data_corrected
             if (use_corrected and hasattr(self, "data_corrected"))
@@ -7027,12 +7035,17 @@ class CombinedTransectCube:
                 )
         else:
             wl_indices = np.arange(len(self.wavelengths))
-            wavelengths_used = self.wavelengths
+            wavelengths_used = (
+                self.wavelengths.copy()
+            )  # ✅ FIX: Create copy to avoid reference issues!
 
         if not quiet:
             print(f"\n�📦 Datacube shape: {cube_data.shape}")
             print(f"📏 Using data: {'corrected' if use_corrected else 'raw'}")
-            print(f"🎯 Segment range: tracks {segment_start} to {segment_end}")
+            if segment_start is None or segment_end is None:
+                print(f"🎯 Segment range: NONE (using ALL pixels from ROIs)")
+            else:
+                print(f"🎯 Segment range: tracks {segment_start} to {segment_end}")
             print(f"📍 Training ROIs: {list(training_rois.keys())}")
             if add_brightness_feature:
                 print(
@@ -7068,11 +7081,24 @@ class CombinedTransectCube:
             filtered_pixels = []
 
             for slit_idx, track_idx in roi_pixels:  # ROIs stored as (slit, track)
-                # Check if pixel is OUTSIDE segment
-                if track_idx < segment_start or track_idx > segment_end:
-                    # Valid training pixel (outside segment)
+                # Check if pixel is valid for training
+                # If segment_start/end are None, use ALL pixels
+                # Otherwise, use pixels OUTSIDE segment
+                if segment_start is None or segment_end is None:
+                    # No segment filtering - use ALL pixels
+                    is_valid_pixel = True
+                else:
+                    # Use pixels OUTSIDE segment
+                    is_valid_pixel = (
+                        track_idx < segment_start or track_idx > segment_end
+                    )
+
+                if is_valid_pixel:
+                    # Valid training pixel
                     if 0 <= track_idx < n_tracks and 0 <= slit_idx < n_slits:
-                        spectrum = cube_data[track_idx, slit_idx, :]
+                        spectrum = cube_data[
+                            track_idx, slit_idx, :
+                        ].copy()  # ✅ FIX: Create copy to prevent modifying original datacube!
                         class_pixels.append(spectrum)
                         filtered_pixels.append(
                             (slit_idx, track_idx)
@@ -7083,25 +7109,56 @@ class CombinedTransectCube:
                     pixels_rejected_inside += 1
 
             if len(class_pixels) > 0:
-                X_train.extend(class_pixels)
-                y_train.extend([class_name] * len(class_pixels))
-                training_pixel_counts[class_name] = len(class_pixels)
-                filtered_training_rois[class_name] = filtered_pixels
-                filtered_training_rois_for_grouping[class_name] = (
-                    filtered_pixels  # For spatial clustering
+                # 🔥 NEW: Apply label remapping if provided
+                final_label = (
+                    remap_labels[class_name]
+                    if remap_labels and class_name in remap_labels
+                    else class_name
                 )
+
+                X_train.extend(class_pixels)
+                y_train.extend([final_label] * len(class_pixels))
+
+                # Track pixel counts by FINAL label (after remapping)
+                if final_label not in training_pixel_counts:
+                    training_pixel_counts[final_label] = 0
+                training_pixel_counts[final_label] += len(class_pixels)
+
+                # Keep filtered ROIs by ORIGINAL ROI name (for visualization)
+                filtered_training_rois[class_name] = filtered_pixels
+
+                # For spatial grouping, use FINAL label
+                if final_label not in filtered_training_rois_for_grouping:
+                    filtered_training_rois_for_grouping[final_label] = []
+                filtered_training_rois_for_grouping[final_label].extend(filtered_pixels)
 
                 if not quiet:
-                    print(
-                        f"   {class_name}: {len(class_pixels)} pixels (rejected {len(roi_pixels) - len(class_pixels)} inside segment)"
+                    remap_msg = (
+                        f" → {final_label}"
+                        if remap_labels and class_name in remap_labels
+                        else ""
                     )
+                    if segment_start is None or segment_end is None:
+                        print(f"   {class_name}{remap_msg}: {len(class_pixels)} pixels")
+                    else:
+                        print(
+                            f"   {class_name}{remap_msg}: {len(class_pixels)} pixels (rejected {len(roi_pixels) - len(class_pixels)} inside segment)"
+                        )
             else:
-                print(
-                    f"   ⚠️  Warning: No valid training pixels for class '{class_name}' outside segment!"
-                )
+                if segment_start is None or segment_end is None:
+                    print(
+                        f"   ⚠️  Warning: No valid training pixels for class '{class_name}'!"
+                    )
+                else:
+                    print(
+                        f"   ⚠️  Warning: No valid training pixels for class '{class_name}' outside segment!"
+                    )
 
         if not X_train:
-            raise ValueError("No training pixels found outside segment!")
+            if segment_start is None or segment_end is None:
+                raise ValueError("No training pixels found in ROIs!")
+            else:
+                raise ValueError("No training pixels found outside segment!")
 
         X_train = np.array(X_train)
         y_train = np.array(y_train)
@@ -7332,7 +7389,13 @@ class CombinedTransectCube:
                     else:
                         train_indices.extend(indices)
 
-                folds.append((np.array(train_indices), np.array(val_indices)))
+                # Convert to integer arrays explicitly
+                folds.append(
+                    (
+                        np.array(train_indices, dtype=np.int64),
+                        np.array(val_indices, dtype=np.int64),
+                    )
+                )
 
             return folds, actual_splits
 
@@ -7356,6 +7419,20 @@ class CombinedTransectCube:
             )
             groups_fold_train = groups[train_idx]
             groups_fold_val = groups[val_idx]
+
+            # 🔥 CHECK: Skip fold if training or validation set is empty
+            if len(X_fold_train) == 0:
+                if not quiet:
+                    print(
+                        f"\n   ⚠️  Fold {fold_idx + 1}/{cv_folds}: SKIPPED (empty training set)"
+                    )
+                continue
+            if len(X_fold_val) == 0:
+                if not quiet:
+                    print(
+                        f"\n   ⚠️  Fold {fold_idx + 1}/{cv_folds}: SKIPPED (empty validation set)"
+                    )
+                continue
 
             # 🔥 NEW: Verify no ROI overlap between train/val (data leakage check)
             train_roi_set = set(groups_fold_train)
@@ -7400,19 +7477,35 @@ class CombinedTransectCube:
                 raise ValueError(error_msg)
 
             # Train SVM on this fold
-            if optimize_params:
+            if optimize_params and len(X_fold_train) > 0:
                 param_grid = {
                     "C": [0.1, 1, 10, 100, 1000],
                     "gamma": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1, "scale", "auto"],
                 }
                 # 🔥 NEW: Use GroupKFold for inner CV in GridSearchCV, but only if enough groups
                 n_train_groups = len(train_roi_set)
-                if n_train_groups >= 3:
+                n_train_samples = len(X_fold_train)
+
+                # Check if we have enough samples for inner CV
+                # For 2-fold CV: need at least 2 samples per class (1 per fold)
+                # For safer CV: need at least 4 samples per class (2 per fold)
+                min_samples_per_class = (
+                    min(train_counts.values()) if train_counts else 0
+                )
+                can_do_grouped_cv = n_train_groups >= 3
+                can_do_stratified_cv = (
+                    min_samples_per_class >= 4
+                )  # Need 2 per fold minimum
+
+                if can_do_grouped_cv:
                     # Use GroupKFold for inner CV (grouped splitting)
                     inner_cv = GroupKFold(n_splits=min(3, n_train_groups))
                     grid_search = GridSearchCV(
                         SVC(
-                            kernel=svm_kernel, class_weight="balanced", random_state=42
+                            kernel=svm_kernel,
+                            class_weight="balanced",
+                            probability=True,
+                            random_state=42,
                         ),
                         param_grid,
                         cv=inner_cv,
@@ -7422,15 +7515,15 @@ class CombinedTransectCube:
                     grid_search.fit(
                         X_fold_train, y_fold_train, groups=groups_fold_train
                     )
-                else:
-                    # Not enough groups for inner CV - use simple train/val split (no inner CV)
-                    if not quiet:
-                        print(
-                            f"      ⚠️  Only {n_train_groups} groups in training - skipping inner CV, using default params"
-                        )
+                    fold_model = grid_search.best_estimator_
+                elif can_do_stratified_cv:
+                    # Use StratifiedKFold for inner CV (no group constraint)
                     grid_search = GridSearchCV(
                         SVC(
-                            kernel=svm_kernel, class_weight="balanced", random_state=42
+                            kernel=svm_kernel,
+                            class_weight="balanced",
+                            probability=True,
+                            random_state=42,
                         ),
                         param_grid,
                         cv=2,  # Minimum CV splits
@@ -7440,13 +7533,29 @@ class CombinedTransectCube:
                     grid_search.fit(
                         X_fold_train, y_fold_train
                     )  # No groups for inner CV
-                fold_model = grid_search.best_estimator_
+                    fold_model = grid_search.best_estimator_
+                else:
+                    # Not enough samples for inner CV - use default params
+                    if not quiet:
+                        print(
+                            f"      ⚠️  Only {n_train_samples} samples ({n_train_groups} groups) - skipping inner CV, using default params"
+                        )
+                    fold_model = SVC(
+                        kernel=svm_kernel,
+                        C=1.0,
+                        gamma="scale",
+                        class_weight="balanced",
+                        probability=True,
+                        random_state=42,
+                    )
+                    fold_model.fit(X_fold_train, y_fold_train)
             else:
                 fold_model = SVC(
                     kernel=svm_kernel,
                     C=svm_C,
                     gamma=svm_gamma,
                     class_weight="balanced",
+                    probability=True,
                     random_state=42,  # 🔥 NEW: class_weight="balanced"
                 )
                 fold_model.fit(X_fold_train, y_fold_train)
@@ -7549,6 +7658,7 @@ class CombinedTransectCube:
                     SVC(
                         kernel=svm_kernel,
                         class_weight=class_weight_setting,
+                        probability=True,
                         random_state=42,
                     ),
                     param_grid,
@@ -7567,6 +7677,7 @@ class CombinedTransectCube:
                     SVC(
                         kernel=svm_kernel,
                         class_weight=class_weight_setting,
+                        probability=True,
                         random_state=42,
                     ),
                     param_grid,
@@ -7588,6 +7699,7 @@ class CombinedTransectCube:
                 C=svm_C,
                 gamma=svm_gamma,
                 class_weight=class_weight_setting,
+                probability=True,
                 random_state=42,  # 🔥 NEW: class_weight="balanced"
             )
             final_model.fit(X_train, y_train_encoded)
@@ -7890,6 +8002,7 @@ class CombinedTransectCube:
         morph_close_radius=1,
         morph_open_radius=1,
         merge_proximity_px=0,
+        confidence_threshold=None,
         quiet=False,
     ):
         """
@@ -8035,6 +8148,12 @@ class CombinedTransectCube:
         n_batches = int(np.ceil(len(X_classify) / batch_size))
         y_pred_encoded = np.zeros(len(X_classify), dtype=int)
 
+        # 🔥 NEW: Compute probabilities if confidence threshold is set
+        if confidence_threshold is not None:
+            y_pred_proba = np.zeros((len(X_classify), len(self.svm_class_names)))
+        else:
+            y_pred_proba = None
+
         if not quiet:
             from tqdm import tqdm
 
@@ -8048,6 +8167,10 @@ class CombinedTransectCube:
             batch = X_classify[start_idx:end_idx]
             y_pred_encoded[start_idx:end_idx] = self.svm_model.predict(batch)
 
+            # 🔥 NEW: Get probabilities if needed
+            if confidence_threshold is not None:
+                y_pred_proba[start_idx:end_idx] = self.svm_model.predict_proba(batch)
+
             if not quiet:
                 progress_bar.update(len(batch))
 
@@ -8060,6 +8183,28 @@ class CombinedTransectCube:
         y_pred_classified = np.array(
             [name.replace("training_", "classified_") for name in y_pred]
         )
+
+        # 🔥 NEW: Apply confidence threshold
+        confidence_map = None
+        unknown_count = 0
+        if confidence_threshold is not None:
+            max_proba = y_pred_proba.max(axis=1)  # Best probability per pixel
+            low_confidence_mask = max_proba < confidence_threshold
+            y_pred_classified[low_confidence_mask] = "classified_unknown"
+            unknown_count = low_confidence_mask.sum()
+
+            # Store confidence map for visualization
+            confidence_map = max_proba.reshape(segment_shape[0], segment_shape[1])
+
+            if not quiet:
+                print(f"\n🎲 Confidence Thresholding:")
+                print(f"   Threshold: {confidence_threshold:.2f}")
+                print(
+                    f"   Unknown pixels: {unknown_count} ({100.0 * unknown_count / len(y_pred_classified):.1f}%)"
+                )
+                print(
+                    f"   Confidence range: [{max_proba.min():.3f}, {max_proba.max():.3f}]"
+                )
 
         classification_map = y_pred_classified.reshape(
             segment_shape[0], segment_shape[1]
@@ -8294,6 +8439,10 @@ class CombinedTransectCube:
             name.replace("training_", "classified_") for name in self.svm_class_names
         ]
 
+        # 🔥 NEW: Add "classified_unknown" to class names if confidence threshold was used
+        if confidence_threshold is not None and unknown_count > 0:
+            classified_class_names.append("classified_unknown")
+
         results = {
             "classification_map": classification_map,
             "classification_map_encoded": classification_map_encoded,
@@ -8307,6 +8456,11 @@ class CombinedTransectCube:
             "validation_pixels_inside": val_pixels_inside,
             "validation_pixels_outside": val_pixels_outside,
         }
+
+        # 🔥 NEW: Add confidence info if threshold was used
+        if confidence_threshold is not None:
+            results["confidence_map"] = confidence_map
+            results["unknown_count"] = unknown_count
 
         if not quiet:
             print("\n✅ Classification and validation complete!")
@@ -8323,6 +8477,7 @@ class CombinedTransectCube:
         segment_start,
         segment_end,
         use_corrected=True,
+        confidence_threshold=None,
         quiet=False,
     ):
         """
@@ -8336,20 +8491,31 @@ class CombinedTransectCube:
             segment_start: Start track index of segment to classify
             segment_end: End track index of segment to classify
             use_corrected: Use corrected data (True) or raw data (False)
+            confidence_threshold: Minimum probability threshold (0.0-1.0). If set, pixels
+                                 with max probability below this become "classified_unknown".
+                                 Default None (all pixels classified, no threshold).
             quiet: Suppress progress messages
 
         Returns:
             dict with keys:
                 - 'classification_map': 2D array of class names (segment_size x n_slits)
                 - 'classification_map_encoded': 2D array of encoded labels
-                - 'class_names': List of class names
+                - 'class_names': List of class names (includes "classified_unknown" if threshold used)
                 - 'segment_shape': Shape of classified segment
                 - 'track_range': (segment_start, segment_end)
+                - 'confidence_map': 2D array of max probabilities (only if threshold used)
+                - 'unknown_count': Number of pixels classified as unknown (only if threshold used)
         """
         if not quiet:
             print("=" * 60)
             print("🎯 SEGMENT CLASSIFICATION (no filtering, no validation)")
             print("=" * 60)
+            if confidence_threshold is not None:
+                print(f"🎲 Confidence threshold: {confidence_threshold:.2f}")
+                print(
+                    f"   (Pixels with max_prob < {confidence_threshold:.2f} → classified_unknown)"
+                )
+                print("=" * 60)
 
         # Call the full function with filtering and validation disabled
         results = self.classify_segment_with_validation(
@@ -8359,6 +8525,7 @@ class CombinedTransectCube:
             use_corrected=use_corrected,
             save_to_h5=False,  # Don't save (let user decide)
             apply_post_filtering=False,  # No filtering
+            confidence_threshold=confidence_threshold,  # Pass through
             quiet=quiet,
         )
 
@@ -8366,8 +8533,8 @@ class CombinedTransectCube:
         classification_map = results["classification_map_before_filtering"]
         segment_shape = classification_map.shape
 
-        # Return only classification results (no validation metrics)
-        return {
+        # Base return dict
+        return_dict = {
             "classification_map": classification_map,
             "classification_map_encoded": results[
                 "classification_map_encoded_before_filtering"
@@ -8376,6 +8543,90 @@ class CombinedTransectCube:
             "segment_shape": segment_shape,
             "track_range": results["track_range"],
         }
+
+        # Add confidence info if threshold was used
+        if confidence_threshold is not None:
+            return_dict["confidence_map"] = results["confidence_map"]
+            return_dict["unknown_count"] = results["unknown_count"]
+
+        return return_dict
+
+    def merge_unknown_to_sediment(
+        self,
+        classification_results,
+        quiet=False,
+    ):
+        """
+        Merge 'classified_unknown' pixels into 'classified_sediment'.
+
+        Converts 4-class classification output (with confidence threshold) to 3-class
+        output compatible with the standard pipeline. This allows you to:
+        1. Run classify_segment with confidence_threshold to identify uncertain pixels
+        2. Analyze/visualize the uncertainty (optional)
+        3. Merge unknown pixels into sediment (conservative assumption)
+        4. Continue with standard filtering/merge/validation pipeline
+
+        Args:
+            classification_results: Dict returned from classify_segment() with confidence_threshold
+            quiet: Suppress progress messages
+
+        Returns:
+            dict: Modified classification_results with 3 classes
+                - 'classification_map': Updated 2D array (unknown → sediment)
+                - 'class_names': Updated list (3 classes, no 'classified_unknown')
+                - 'merge_stats': Dict with pixel counts before/after merge
+                - All other original keys preserved
+        """
+        if not quiet:
+            print("=" * 60)
+            print("🔀 MERGING UNKNOWN PIXELS TO SEDIMENT")
+            print("=" * 60)
+
+        # Copy results to avoid modifying original
+        merged_results = classification_results.copy()
+        classification_map = classification_results["classification_map"].copy()
+        class_names = classification_results["class_names"].copy()
+
+        # Check if unknown class exists
+        if "classified_unknown" not in class_names:
+            if not quiet:
+                print("⚠️  No 'classified_unknown' class found - nothing to merge")
+                print("   Returning original results unchanged")
+            return classification_results
+
+        # Count pixels before merge
+        unknown_mask = classification_map == "classified_unknown"
+        sediment_mask = classification_map == "classified_sediment"
+        unknown_count = np.sum(unknown_mask)
+        sediment_count_before = np.sum(sediment_mask)
+
+        if not quiet:
+            print(f"\n📊 Pixel counts BEFORE merge:")
+            print(f"   classified_sediment: {sediment_count_before}")
+            print(f"   classified_unknown:  {unknown_count}")
+
+        # Merge: unknown → sediment
+        classification_map[unknown_mask] = "classified_sediment"
+        sediment_count_after = np.sum(classification_map == "classified_sediment")
+
+        # Remove 'classified_unknown' from class names
+        class_names_merged = [c for c in class_names if c != "classified_unknown"]
+
+        if not quiet:
+            print(f"\n📊 Pixel counts AFTER merge:")
+            print(f"   classified_sediment: {sediment_count_after} (+{unknown_count})")
+            print(f"\n✅ Merge complete! Classes: {class_names_merged}")
+
+        # Update results dict
+        merged_results["classification_map"] = classification_map
+        merged_results["class_names"] = class_names_merged
+        merged_results["merge_stats"] = {
+            "unknown_pixels_merged": unknown_count,
+            "sediment_count_before": sediment_count_before,
+            "sediment_count_after": sediment_count_after,
+        }
+
+        return merged_results
 
     def filter_classification(
         self,
