@@ -3202,6 +3202,235 @@ class CombinedTransectCube:
 
         return self.data_corrected
 
+    def apply_percentile_clipping(
+        self, lower_percentile=5, upper_percentile=95, quiet=False
+    ):
+        """
+        Clip extreme spectral values per-pixel using percentiles to remove spikes.
+
+        This removes outlier spikes in each pixel's spectrum by clipping values outside
+        the percentile range. Useful for removing sensor artifacts and high-frequency noise
+        before smoothing, especially at wavelength edges where SNR is poor.
+
+        **Use case:** You have huge spikes at <450nm and >700nm that contaminate smoothing
+        in the good 450-700nm range. Run this BEFORE smoothing to clip those spikes.
+
+        Parameters:
+        -----------
+        lower_percentile : float, default=5
+            Lower percentile threshold (0-100). Values below this are clipped.
+        upper_percentile : float, default=95
+            Upper percentile threshold (0-100). Values above this are clipped.
+        quiet : bool, default=False
+            If True, suppresses progress messages
+
+        Returns:
+        --------
+        np.ndarray : The clipped datacube (T, S, B)
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> cube.apply_percentile_clipping(lower_percentile=5, upper_percentile=95)
+        >>> cube.apply_spectral_smoothing(wavelength_smoothing=20)
+        >>> cube.apply_wavelength_filter(wavelength_range=(450, 700))
+        """
+        if self.data_corrected is None:
+            raise ValueError(
+                "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        if not quiet:
+            print("=" * 60)
+            print("✂️ PERCENTILE CLIPPING (Per-Spectrum)")
+            print("=" * 60)
+            print(f"📊 Datacube shape: {self.data_corrected.shape}")
+            print(
+                f"📉 Clipping range: {lower_percentile}th - {upper_percentile}th percentile"
+            )
+
+        T, S, B = self.data_corrected.shape
+        original_min = self.data_corrected.min()
+        original_max = self.data_corrected.max()
+
+        # Progress bar
+        try:
+            from tqdm import tqdm
+
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+
+        # Process each spectrum (pixel) independently
+        total_pixels = T * S
+        if use_tqdm:
+            pbar = tqdm(total=total_pixels, desc="   Clipping pixels", unit="pixel")
+
+        for t in range(T):
+            for s in range(S):
+                spectrum = self.data_corrected[t, s, :]
+
+                # Compute percentiles for this spectrum
+                p_low = np.percentile(spectrum, lower_percentile)
+                p_high = np.percentile(spectrum, upper_percentile)
+
+                # Clip values outside percentile range
+                self.data_corrected[t, s, :] = np.clip(spectrum, p_low, p_high)
+
+                if use_tqdm:
+                    pbar.update(1)
+
+        if use_tqdm:
+            pbar.close()
+
+        clipped_min = self.data_corrected.min()
+        clipped_max = self.data_corrected.max()
+
+        if not quiet:
+            print(
+                f"\n📈 Value range before clipping: [{original_min:.4f}, {original_max:.4f}]"
+            )
+            print(
+                f"📉 Value range after clipping:  [{clipped_min:.4f}, {clipped_max:.4f}]"
+            )
+            print(f"✅ Clipping complete!")
+            print("=" * 60)
+
+        return self.data_corrected
+
+    def apply_edge_padding(
+        self, good_wavelength_range=(450, 700), padding_method="constant", quiet=False
+    ):
+        """
+        Pad wavelength bands outside the 'good' range with edge values to prevent
+        smoothing contamination.
+
+        **The Problem:** When you smooth with a large window (e.g., 20 bands), bad bands
+        outside your good range (450-700nm) contaminate the edges inside the good range.
+
+        **The Solution:** Replace bad bands (<450nm and >700nm) with the edge values from
+        the good range BEFORE smoothing. This way smoothing doesn't see the volatile spikes.
+
+        Parameters:
+        -----------
+        good_wavelength_range : tuple of (min_wl, max_wl)
+            Wavelength range in nanometers that contains good data (e.g., (450, 700))
+        padding_method : str, default="constant"
+            How to pad the bad bands:
+            - "constant": Replace with edge value (simplest, recommended)
+            - "linear": Linear extrapolation from first/last N bands
+        quiet : bool, default=False
+            If True, suppresses progress messages
+
+        Returns:
+        --------
+        np.ndarray : The padded datacube (T, S, B) with same shape
+
+        Example:
+        --------
+        >>> cube.apply_illumination_correction_v2()
+        >>> cube.apply_percentile_clipping(lower_percentile=5, upper_percentile=95)
+        >>> cube.apply_edge_padding(good_wavelength_range=(450, 700))  # Pad bad edges
+        >>> cube.apply_spectral_smoothing(wavelength_smoothing=20)     # Now safe to smooth
+        >>> cube.apply_wavelength_filter(wavelength_range=(450, 700))  # Crop to good range
+        """
+        if self.data_corrected is None:
+            raise ValueError(
+                "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        wl_min, wl_max = good_wavelength_range
+
+        # Find indices of good wavelength range
+        good_mask = (self.wavelengths >= wl_min) & (self.wavelengths <= wl_max)
+        good_indices = np.where(good_mask)[0]
+
+        if len(good_indices) == 0:
+            raise ValueError(f"No wavelengths found in good range {wl_min}-{wl_max} nm")
+
+        first_good_idx = good_indices[0]
+        last_good_idx = good_indices[-1]
+
+        if not quiet:
+            print("=" * 60)
+            print(f"🛡️ EDGE PADDING: {padding_method.upper()}")
+            print("=" * 60)
+            print(f"📊 Datacube shape: {self.data_corrected.shape}")
+            print(
+                f"🌊 Wavelength range: {self.wavelengths[0]:.1f} - {self.wavelengths[-1]:.1f} nm"
+            )
+            print(
+                f"✅ Good range: {wl_min}-{wl_max} nm (indices {first_good_idx}-{last_good_idx})"
+            )
+            print(
+                f"⚠️  Bad bands: {first_good_idx} before, {len(self.wavelengths) - last_good_idx - 1} after"
+            )
+
+        T, S, B = self.data_corrected.shape
+
+        if padding_method == "constant":
+            # Replace bad bands with edge values (simplest)
+            for t in range(T):
+                for s in range(S):
+                    # Pad bands before good range with first good value
+                    if first_good_idx > 0:
+                        edge_value_low = self.data_corrected[t, s, first_good_idx]
+                        self.data_corrected[t, s, :first_good_idx] = edge_value_low
+
+                    # Pad bands after good range with last good value
+                    if last_good_idx < B - 1:
+                        edge_value_high = self.data_corrected[t, s, last_good_idx]
+                        self.data_corrected[t, s, last_good_idx + 1 :] = edge_value_high
+
+        elif padding_method == "linear":
+            # Linear extrapolation from first/last 5 good bands
+            n_extrap_bands = min(5, len(good_indices) // 4)  # Use first/last 5 bands
+
+            for t in range(T):
+                for s in range(S):
+                    spectrum = self.data_corrected[t, s, :]
+
+                    # Extrapolate lower edge
+                    if first_good_idx > 0 and n_extrap_bands >= 2:
+                        x_fit = self.wavelengths[
+                            first_good_idx : first_good_idx + n_extrap_bands
+                        ]
+                        y_fit = spectrum[
+                            first_good_idx : first_good_idx + n_extrap_bands
+                        ]
+                        coeffs = np.polyfit(x_fit, y_fit, 1)  # Linear fit
+
+                        # Extrapolate to lower wavelengths
+                        x_extrap = self.wavelengths[:first_good_idx]
+                        y_extrap = np.polyval(coeffs, x_extrap)
+                        self.data_corrected[t, s, :first_good_idx] = y_extrap
+
+                    # Extrapolate upper edge
+                    if last_good_idx < B - 1 and n_extrap_bands >= 2:
+                        x_fit = self.wavelengths[
+                            last_good_idx - n_extrap_bands + 1 : last_good_idx + 1
+                        ]
+                        y_fit = spectrum[
+                            last_good_idx - n_extrap_bands + 1 : last_good_idx + 1
+                        ]
+                        coeffs = np.polyfit(x_fit, y_fit, 1)  # Linear fit
+
+                        # Extrapolate to upper wavelengths
+                        x_extrap = self.wavelengths[last_good_idx + 1 :]
+                        y_extrap = np.polyval(coeffs, x_extrap)
+                        self.data_corrected[t, s, last_good_idx + 1 :] = y_extrap
+
+        else:
+            raise ValueError(
+                f"Unknown padding_method: {padding_method}. Choose 'constant' or 'linear'."
+            )
+
+        if not quiet:
+            print(f"\n✅ Edge padding complete ({padding_method} method)")
+            print("=" * 60)
+
+        return self.data_corrected
+
     def apply_wavelength_filter(self, wavelength_range=(490, 680), quiet=False):
         """
         Filter datacube to only include specified wavelength range.
@@ -3377,7 +3606,16 @@ class CombinedTransectCube:
         return self.data_corrected
 
     def apply_spectral_smoothing(
-        self, wavelength_smoothing=10, method="savgol", savgol_polyorder=2, quiet=False
+        self,
+        wavelength_smoothing=10,
+        method="gaussian",
+        savgol_polyorder=2,
+        gaussian_sigma=2.0,
+        median_kernel_size=5,
+        whittaker_lambda=1e4,
+        bilateral_sigma_spatial=2.0,
+        bilateral_sigma_intensity=0.1,
+        quiet=False,
     ):
         """
         Smooth each pixel's spectrum along the wavelength axis.
@@ -3388,15 +3626,34 @@ class CombinedTransectCube:
         Parameters:
         -----------
         wavelength_smoothing : int
-            Window size for smoothing (must be odd for savgol)
+            Window size for smoothing (used for moving_average and savgol methods)
             Larger values = more smoothing
-        method : str, default="savgol"
+        method : str, default="gaussian"
             Smoothing method:
+            - "gaussian": Gaussian filter (sigma-based smoothing, good for noise reduction)
             - "savgol": Savitzky-Golay filter (preserves peaks/valleys)
             - "moving_average": Simple rolling mean
+            - "median": Median filter (robust to outliers)
+            - "whittaker": Whittaker smoother (excellent feature preservation)
+            - "bilateral": Bilateral filter (edge-preserving)
         savgol_polyorder : int, default=2
             Polynomial order for Savitzky-Golay filter (2 or 3)
             Only used if method="savgol"
+        gaussian_sigma : float, default=2.0
+            Standard deviation for Gaussian filter
+            Only used if method="gaussian". Larger values = more smoothing
+        median_kernel_size : int, default=5
+            Kernel size for median filter (must be odd)
+            Only used if method="median". Larger values = more smoothing
+        whittaker_lambda : float, default=1e4
+            Smoothing parameter for Whittaker smoother (range: 1e2 to 1e6)
+            Only used if method="whittaker". Larger values = more smoothing
+        bilateral_sigma_spatial : float, default=2.0
+            Spatial sigma for bilateral filter
+            Only used if method="bilateral". Larger values = more smoothing
+        bilateral_sigma_intensity : float, default=0.1
+            Intensity sigma for bilateral filter
+            Only used if method="bilateral". Smaller values = stronger edge preservation
         quiet : bool, default=False
             If True, suppresses progress messages
 
@@ -3409,7 +3666,7 @@ class CombinedTransectCube:
         >>> cube.apply_illumination_correction_v2()
         >>> cube.apply_wavelength_filter(wavelength_range=(490, 680))
         >>> cube.apply_spectral_normalization(method="l2")
-        >>> cube.apply_spectral_smoothing(wavelength_smoothing=10, method="savgol")
+        >>> cube.apply_spectral_smoothing(method="gaussian", gaussian_sigma=2.0)
         >>> cube.train_svm_with_cv(...)  # Train on normalized+smoothed spectra
         """
         if self.data_corrected is None:
@@ -3417,7 +3674,8 @@ class CombinedTransectCube:
                 "No corrected data available. Run apply_illumination_correction_v2() first."
             )
 
-        if wavelength_smoothing <= 1:
+        # Only check wavelength_smoothing for methods that use it
+        if method in ["moving_average", "savgol"] and wavelength_smoothing <= 1:
             if not quiet:
                 print("⚠️  wavelength_smoothing <= 1, no smoothing applied")
             return self.data_corrected
@@ -3427,9 +3685,20 @@ class CombinedTransectCube:
             print(f"🌊 SPECTRAL SMOOTHING: {method.upper()}")
             print("=" * 60)
             print(f"📊 Datacube shape: {self.data_corrected.shape}")
-            print(f"🪟 Window size: {wavelength_smoothing}")
+            if method in ["moving_average", "savgol"]:
+                print(f"🪟 Window size: {wavelength_smoothing}")
             if method == "savgol":
                 print(f"📐 Polynomial order: {savgol_polyorder}")
+            elif method == "gaussian":
+                print(f"📐 Gaussian sigma: {gaussian_sigma}")
+            elif method == "median":
+                print(f"📐 Median kernel size: {median_kernel_size}")
+            elif method == "whittaker":
+                print(f"📐 Whittaker lambda: {whittaker_lambda}")
+            elif method == "bilateral":
+                print(
+                    f"📐 Bilateral sigma (spatial/intensity): {bilateral_sigma_spatial}/{bilateral_sigma_intensity}"
+                )
 
         T, S, B = self.data_corrected.shape
 
@@ -3478,10 +3747,114 @@ class CombinedTransectCube:
 
             self.data_corrected = smoothed.astype(np.float32)
 
+        elif method == "gaussian":
+            from scipy.ndimage import gaussian_filter1d
+            from tqdm import tqdm
+
+            # Apply Gaussian filter along wavelength axis
+            smoothed = np.zeros_like(self.data_corrected)
+
+            # Progress bar over temporal dimension
+            for t in tqdm(range(T), desc="Smoothing spectra (gaussian)", disable=quiet):
+                for s in range(S):
+                    spectrum = self.data_corrected[t, s, :]
+                    smoothed[t, s, :] = gaussian_filter1d(
+                        spectrum, sigma=gaussian_sigma, mode="nearest"
+                    )
+
+            self.data_corrected = smoothed.astype(np.float32)
+
+        elif method == "median":
+            from scipy.ndimage import median_filter
+            from tqdm import tqdm
+
+            # Ensure kernel size is odd
+            kernel_size = median_kernel_size
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+                if not quiet:
+                    print(f"   ⚠️  Adjusted kernel size to odd number: {kernel_size}")
+
+            # Apply median filter along wavelength axis
+            smoothed = np.zeros_like(self.data_corrected)
+
+            for t in tqdm(range(T), desc="Smoothing spectra (median)", disable=quiet):
+                for s in range(S):
+                    spectrum = self.data_corrected[t, s, :]
+                    smoothed[t, s, :] = median_filter(
+                        spectrum, size=kernel_size, mode="nearest"
+                    )
+
+            self.data_corrected = smoothed.astype(np.float32)
+
+        elif method == "whittaker":
+            from scipy.sparse import diags, eye
+            from scipy.sparse.linalg import spsolve
+            from tqdm import tqdm
+
+            # Apply Whittaker smoother along wavelength axis
+            smoothed = np.zeros_like(self.data_corrected)
+
+            # Pre-compute the Whittaker matrix once (same for all spectra)
+            m = B
+            E = eye(m, format="csc")
+            D = diags([1, -2, 1], [0, 1, 2], shape=(m - 2, m))
+            W = E + whittaker_lambda * (D.T @ D)
+
+            for t in tqdm(
+                range(T), desc="Smoothing spectra (whittaker)", disable=quiet
+            ):
+                for s in range(S):
+                    spectrum = self.data_corrected[t, s, :]
+                    try:
+                        smoothed[t, s, :] = spsolve(W, spectrum)
+                    except Exception:
+                        # If Whittaker fails, keep original spectrum
+                        smoothed[t, s, :] = spectrum
+
+            self.data_corrected = smoothed.astype(np.float32)
+
+        elif method == "bilateral":
+            from tqdm import tqdm
+
+            # Apply bilateral filter along wavelength axis
+            smoothed = np.zeros_like(self.data_corrected)
+
+            for t in tqdm(
+                range(T), desc="Smoothing spectra (bilateral)", disable=quiet
+            ):
+                for s in range(S):
+                    spectrum = self.data_corrected[t, s, :]
+
+                    # Bilateral filter
+                    for i in range(B):
+                        half_window = int(3 * bilateral_sigma_spatial)
+                        start = max(0, i - half_window)
+                        end = min(B, i + half_window + 1)
+
+                        spatial_dist = np.arange(start, end) - i
+                        spatial_weight = np.exp(
+                            -(spatial_dist**2) / (2 * bilateral_sigma_spatial**2)
+                        )
+
+                        intensity_diff = spectrum[start:end] - spectrum[i]
+                        intensity_weight = np.exp(
+                            -(intensity_diff**2) / (2 * bilateral_sigma_intensity**2)
+                        )
+
+                        combined_weight = spatial_weight * intensity_weight
+                        combined_weight /= np.sum(combined_weight)
+
+                        smoothed[t, s, i] = np.sum(
+                            spectrum[start:end] * combined_weight
+                        )
+
+            self.data_corrected = smoothed.astype(np.float32)
+
         else:
             raise ValueError(
                 f"Unknown smoothing method: {method}. "
-                f"Choose from: savgol, moving_average"
+                f"Choose from: gaussian, savgol, moving_average, median, whittaker, bilateral"
             )
 
         if not quiet:
@@ -3491,8 +3864,20 @@ class CombinedTransectCube:
                 print(
                     f"   Window: {wavelength_smoothing}, Polyorder: {savgol_polyorder}"
                 )
-            else:
+            elif method == "moving_average":
                 print(f"   Window: {wavelength_smoothing}")
+            elif method == "gaussian":
+                print(f"   Sigma: {gaussian_sigma}")
+            elif method == "median":
+                print(
+                    f"   Kernel size: {median_kernel_size if median_kernel_size % 2 == 1 else median_kernel_size + 1}"
+                )
+            elif method == "whittaker":
+                print(f"   Lambda: {whittaker_lambda}")
+            elif method == "bilateral":
+                print(
+                    f"   Sigma (spatial/intensity): {bilateral_sigma_spatial}/{bilateral_sigma_intensity}"
+                )
             print("=" * 60)
 
         return self.data_corrected
@@ -4202,9 +4587,12 @@ class CombinedTransectCube:
 
     def plot_rgb(
         self,
-        red_wl=654.2,
-        green_wl=560,
-        blue_wl=440.3,
+        # red_wl=654.2,
+        # green_wl=560,
+        # blue_wl=440.3,
+        red_wl=620.0,
+        green_wl=565.0,
+        blue_wl=490.0,
         spacing=4,
         track_index=None,
         slit_index=None,
@@ -4228,6 +4616,13 @@ class CombinedTransectCube:
         line_width=2,
         line_style="-",
         line_labels=None,
+        flip_axes=False,  # NEW: If True, swap tracks/slits (tracks become vertical)
+        flip_horizontal=False,  # NEW: If True, invert horizontal axis direction
+        flip_vertical=False,  # NEW: If True, invert vertical axis direction
+        crop_center_track=None,  # NEW: Track index for crop center (requires crop_center_slit and crop_width)
+        crop_center_slit=None,  # NEW: Slit index for crop center (requires crop_center_track and crop_width)
+        crop_width=None,  # NEW: Width in slit pixels for square physical crop (track width = crop_width/3.61)
+        crop_aspect_ratio=3.61,  # NEW: Ratio of track:slit pixel physical size (default 3.61 for UHI)
     ):
         """
         Enhanced RGB plot supporting multiple named ROIs with different colors.
@@ -4236,6 +4631,23 @@ class CombinedTransectCube:
         - roi_collection: Dict of named ROIs or 'all' to use cube.roi_collection
         - Automatic color assignment per ROI
         - Legend shows ROI names and pixel counts
+
+        NEW AXIS CONTROL FEATURES:
+        - flip_axes: Swap tracks/slits axes (default: tracks=horizontal, slits=vertical)
+        - flip_horizontal: Invert horizontal axis direction (right-to-left instead of left-to-right)
+        - flip_vertical: Invert vertical axis direction (top-to-bottom instead of bottom-to-top)
+
+        NEW CROPPING FEATURES:
+        - crop_center_track: Track index at center of crop (0 to n_tracks-1)
+        - crop_center_slit: Slit index at center of crop (0 to n_slits-1)
+        - crop_width: Width in slit pixels (track width adjusted by crop_aspect_ratio for square physical area)
+        - crop_aspect_ratio: Ratio of track:slit pixel physical size (default 3.61 for UHI data)
+        - All three crop parameters must be provided together
+        - Cropping creates a square PHYSICAL area (not square in pixels due to aspect ratio)
+        - Cropping is applied after all flip transformations
+        - Axis labels show original coordinates of cropped region
+        - Overlays (ROIs, boundaries, lines) are disabled when cropping is applied
+        - Crop boundaries are clipped to image edges if they extend beyond
         """
 
         # Original RGB setup (unchanged)
@@ -4249,6 +4661,7 @@ class CombinedTransectCube:
         green_idx = np.argmin(np.abs(self.wavelengths - green_wl))
         blue_idx = np.argmin(np.abs(self.wavelengths - blue_wl))
 
+        # Extract RGB channels - default: (tracks, slits) -> transpose to (slits, tracks) for imshow
         R = cube_data[:, :, red_idx].T.copy()
         G = cube_data[:, :, green_idx].T.copy()
         B = cube_data[:, :, blue_idx].T.copy()
@@ -4261,36 +4674,247 @@ class CombinedTransectCube:
         rgb_image = np.stack([R, G, B], axis=-1)
         n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
 
-        if figsize is None:
-            figsize = (12 * spacing, 6)
-        plt.figure(figsize=figsize)
+        # Apply axis transformations
+        if flip_axes:
+            # Swap dimensions: tracks become vertical, slits become horizontal
+            rgb_image = np.transpose(rgb_image, (1, 0, 2))  # Swap first two dimensions
 
-        plt.imshow(
-            rgb_image, aspect="auto", origin="lower", extent=[0, n_tracks, 0, n_slits]
+        # Flip the image data itself (not just the axis labels)
+        if flip_horizontal:
+            # Flip left-right: reverse along axis 1 (horizontal/width)
+            rgb_image = np.flip(rgb_image, axis=1)
+
+        if flip_vertical:
+            # Flip up-down: reverse along axis 0 (vertical/height)
+            rgb_image = np.flip(rgb_image, axis=0)
+
+        # Handle cropping - extract square region centered at specified coordinates
+        # NOTE: Crop coordinates are specified in ORIGINAL (track, slit) space before any flips
+        crop_applied = False
+        crop_track_min = crop_track_max = crop_slit_min = crop_slit_max = None
+
+        if (
+            crop_center_track is not None
+            or crop_center_slit is not None
+            or crop_width is not None
+        ):
+            # Validate that all three crop parameters are provided
+            if (
+                crop_center_track is None
+                or crop_center_slit is None
+                or crop_width is None
+            ):
+                raise ValueError(
+                    "All three crop parameters (crop_center_track, crop_center_slit, crop_width) must be provided together"
+                )
+
+            # Calculate crop bounds in original coordinate space
+            # crop_width is in slit pixels; adjust track pixels by aspect ratio to get square physical area
+            half_width_slit = crop_width // 2
+            half_width_track = int(crop_width / crop_aspect_ratio / 2)
+
+            crop_track_min = max(0, crop_center_track - half_width_track)
+            crop_track_max = min(n_tracks, crop_center_track + half_width_track)
+            crop_slit_min = max(0, crop_center_slit - half_width_slit)
+            crop_slit_max = min(n_slits, crop_center_slit + half_width_slit)
+
+            print(f"📐 Aspect ratio correction: {crop_aspect_ratio:.2f}:1 (track:slit)")
+            print(
+                f"   Slit pixels: {crop_slit_max - crop_slit_min}, Track pixels: {crop_track_max - crop_track_min}"
+            )
+
+            # Extract cropped region from transformed rgb_image
+            # rgb_image ALWAYS starts as (n_slits, n_tracks, 3) after initial transpose
+            # After flip_axes: becomes (n_tracks, n_slits, 3)
+            # After flip_horizontal/vertical: data is flipped but shape stays same
+
+            # Determine current shape and extract crop
+            current_shape = rgb_image.shape
+
+            if flip_axes:
+                # Current shape: (n_tracks, n_slits, 3)
+                # Axis 0 = tracks, Axis 1 = slits
+                # Need to account for flips that were applied to the data
+                if flip_vertical:
+                    # Tracks were flipped, so indices are reversed
+                    row_slice = slice(
+                        n_tracks - crop_track_max, n_tracks - crop_track_min
+                    )
+                else:
+                    row_slice = slice(crop_track_min, crop_track_max)
+
+                if flip_horizontal:
+                    # Slits were flipped
+                    col_slice = slice(n_slits - crop_slit_max, n_slits - crop_slit_min)
+                else:
+                    col_slice = slice(crop_slit_min, crop_slit_max)
+            else:
+                # Current shape: (n_slits, n_tracks, 3)
+                # Axis 0 = slits, Axis 1 = tracks
+                if flip_vertical:
+                    # Slits were flipped
+                    row_slice = slice(n_slits - crop_slit_max, n_slits - crop_slit_min)
+                else:
+                    row_slice = slice(crop_slit_min, crop_slit_max)
+
+                if flip_horizontal:
+                    # Tracks were flipped
+                    col_slice = slice(
+                        n_tracks - crop_track_max, n_tracks - crop_track_min
+                    )
+                else:
+                    col_slice = slice(crop_track_min, crop_track_max)
+
+            # Extract the crop
+            rgb_image = rgb_image[row_slice, col_slice, :]
+            crop_applied = True
+
+            print(
+                f"🔍 Crop applied: track [{crop_track_min}:{crop_track_max}], slit [{crop_slit_min}:{crop_slit_max}]"
+            )
+            print(f"   Resulting shape: {rgb_image.shape}")
+
+        # Set up extent (defines coordinate range for axes) - keep axes consistent with actual data
+        if crop_applied:
+            # Use cropped coordinate ranges (in original coordinates)
+            if flip_axes:
+                # After flip: horizontal=slits, vertical=tracks
+                x_min, x_max = crop_slit_min, crop_slit_max
+                y_min, y_max = crop_track_min, crop_track_max
+                xlabel_text = "Slit Pixel Index"
+                ylabel_text = "Track Index"
+            else:
+                # Default: horizontal=tracks, vertical=slits
+                x_min, x_max = crop_track_min, crop_track_max
+                y_min, y_max = crop_slit_min, crop_slit_max
+                xlabel_text = "Track Index"
+                ylabel_text = "Slit Pixel Index"
+        else:
+            # Use full image ranges
+            if flip_axes:
+                # After flip: horizontal=slits, vertical=tracks
+                x_min, x_max = 0, n_slits
+                y_min, y_max = 0, n_tracks
+                xlabel_text = "Slit Pixel Index"
+                ylabel_text = "Track Index"
+            else:
+                # Default: horizontal=tracks, vertical=slits
+                x_min, x_max = 0, n_tracks
+                y_min, y_max = 0, n_slits
+                xlabel_text = "Track Index"
+                ylabel_text = "Slit Pixel Index"
+
+        # Origin is always 'lower' now since we flip the actual data
+        origin = "lower"
+
+        # Helper function to transform coordinates based on flipping
+        def transform_coords(track, slit):
+            """Transform track/slit coordinates based on flip settings"""
+            # Transform based on actual data flipping
+            if flip_axes:
+                # After axis swap: x=slit, y=track
+                x_coord = slit
+                y_coord = track
+                # Apply flips (these were applied to the data)
+                if flip_horizontal:
+                    x_coord = n_slits - 1 - x_coord
+                if flip_vertical:
+                    y_coord = n_tracks - 1 - y_coord
+            else:
+                # Default: x=track, y=slit
+                x_coord = track
+                y_coord = slit
+                # Apply flips (these were applied to the data)
+                if flip_horizontal:
+                    x_coord = n_tracks - 1 - x_coord
+                if flip_vertical:
+                    y_coord = n_slits - 1 - y_coord
+            return x_coord, y_coord
+
+        # Set up figure size
+        if figsize is None:
+            if crop_applied:
+                # For cropped images, make it square with reasonable size
+                figsize = (8, 8)
+            else:
+                figsize = (12 * spacing, 6)
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # For cropped images, use aspect='auto' but with square figsize
+        # aspect='equal' causes matplotlib to adjust limits beyond the extent
+        ax.imshow(
+            rgb_image,
+            aspect="auto",
+            origin=origin,
+            extent=[x_min, x_max, y_min, y_max],
         )
 
-        # File boundaries
-        if show_file_boundaries:
+        # Force the axis limits to match the extent exactly when cropping
+        if crop_applied:
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+
+        print(f"📊 Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]")
+        print(f"📐 Image shape after transformations: {rgb_image.shape}")
+
+        # Note: Overlays are disabled when cropping is applied, as they would reference
+        # coordinates outside the cropped region which could be misleading
+
+        # File boundaries (adjusted for axis flipping)
+        if show_file_boundaries and not crop_applied:
             for i, b in enumerate(self.file_boundaries):
                 # Draw boundary line (skip first one at track 0)
                 if i > 0:
-                    plt.axvline(
-                        b["start_track"],
-                        color="yellow",
-                        linestyle=":",
-                        linewidth=2,
-                        alpha=0.8,
-                        label="File boundary" if i == 1 else "",
-                    )
+                    track_boundary = b["start_track"]
+                    # Transform the boundary coordinate
+                    if flip_axes:
+                        # Tracks are now vertical
+                        if flip_vertical:
+                            track_boundary = n_tracks - 1 - track_boundary
+                        plt.axhline(
+                            track_boundary,
+                            color="yellow",
+                            linestyle=":",
+                            linewidth=2,
+                            alpha=0.8,
+                            label="File boundary" if i == 1 else "",
+                        )
+                    else:
+                        # Default: tracks are horizontal
+                        if flip_horizontal:
+                            track_boundary = n_tracks - 1 - track_boundary
+                        plt.axvline(
+                            track_boundary,
+                            color="yellow",
+                            linestyle=":",
+                            linewidth=2,
+                            alpha=0.8,
+                            label="File boundary" if i == 1 else "",
+                        )
 
-        # Cross-hairs (unchanged)
-        if track_index is not None:
-            plt.axvline(track_index, color="cyan", linestyle="--", linewidth=2)
-        if slit_index is not None:
-            plt.axhline(slit_index, color="lime", linestyle="--", linewidth=2)
+        # Cross-hairs (adjusted for axis flipping)
+        if track_index is not None and not crop_applied:
+            x_coord, _ = transform_coords(track_index, 0)
+            if flip_axes:
+                # Tracks are now vertical (y-axis)
+                _, y_coord = transform_coords(track_index, 0)
+                plt.axhline(y_coord, color="cyan", linestyle="--", linewidth=2)
+            else:
+                # Default: tracks are horizontal (x-axis)
+                plt.axvline(x_coord, color="cyan", linestyle="--", linewidth=2)
+        if slit_index is not None and not crop_applied:
+            if flip_axes:
+                # Slits are now horizontal (x-axis)
+                x_coord, _ = transform_coords(0, slit_index)
+                plt.axvline(x_coord, color="lime", linestyle="--", linewidth=2)
+            else:
+                # Default: slits are vertical (y-axis)
+                _, y_coord = transform_coords(0, slit_index)
+                plt.axhline(y_coord, color="lime", linestyle="--", linewidth=2)
 
         # Perimeter lines (unchanged)
-        if perimeter_line is not None:
+        if perimeter_line is not None and not crop_applied:
             if isinstance(perimeter_line[0], (int, float)):
                 lines_to_plot = [perimeter_line]
             else:
@@ -4307,9 +4931,13 @@ class CombinedTransectCube:
                 else:
                     label = "Perimeter line"
 
+                # Transform coordinates based on flip settings
+                x1, y1 = transform_coords(track1, slit1)
+                x2, y2 = transform_coords(track2, slit2)
+
                 plt.plot(
-                    [track1, track2],
-                    [slit1, slit2],
+                    [x1, x2],
+                    [y1, y2],
                     color=color,
                     linewidth=line_width,
                     linestyle=line_style,
@@ -4317,7 +4945,7 @@ class CombinedTransectCube:
                 )
 
         # NEW: Handle multiple ROIs
-        if roi_collection is not None:
+        if roi_collection is not None and not crop_applied:
             # Helper function to sort ROIs in display order
             def sort_rois_by_category(roi_dict):
                 """Sort ROIs: single bombs → double → triple → dark features → sediment"""
@@ -4389,25 +5017,36 @@ class CombinedTransectCube:
                         # NEW: Get consistent color across all plots
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
 
-                        # Plot ROI with unique color
+                        # Transform ROI coordinates based on flip settings
+                        roi_x_coords = []
+                        roi_y_coords = []
+                        for track, slit in zip(roi_tracks, roi_slits):
+                            x, y = transform_coords(track, slit)
+                            roi_x_coords.append(x)
+                            roi_y_coords.append(y)
+
+                        # Plot ROI with unique color (using transformed coordinates)
                         plt.scatter(
-                            roi_tracks,
-                            roi_slits,
+                            roi_x_coords,
+                            roi_y_coords,
                             c=color,
                             s=roi_marker_size,
                             marker=roi_marker_shape,
-                            edgecolors="black" if roi_marker_edgewidth > 0 else "none",
+                            edgecolors=(
+                                "black" if roi_marker_edgewidth > 0 else "none"
+                            ),
                             linewidths=roi_marker_edgewidth,
                             alpha=0.8,
                             label=f"{roi_name} ({len(valid_rois)})",
                         )
 
-                        # Optional: Add numbers for each ROI
+                        # Optional: Add numbers for each ROI (using transformed coordinates)
                         if roi_show_numbers:
                             for i, (slit, track) in enumerate(valid_rois, 1):
+                                x, y = transform_coords(track, slit)
                                 plt.text(
-                                    track,
-                                    slit + 3,
+                                    x,
+                                    y + 3,
                                     str(i),
                                     ha="center",
                                     va="bottom",
@@ -4422,7 +5061,7 @@ class CombinedTransectCube:
                                 )
 
         # Backward compatibility: single ROI support
-        elif roi_pixels is not None and len(roi_pixels) > 0:
+        elif roi_pixels is not None and len(roi_pixels) > 0 and not crop_applied:
             valid_rois = [
                 (slit, track)
                 for slit, track in roi_pixels
@@ -4433,9 +5072,17 @@ class CombinedTransectCube:
                 roi_tracks = [track for slit, track in valid_rois]
                 roi_slits = [slit for slit, track in valid_rois]
 
+                # Transform ROI coordinates based on flip settings
+                roi_x_coords = []
+                roi_y_coords = []
+                for track, slit in zip(roi_tracks, roi_slits):
+                    x, y = transform_coords(track, slit)
+                    roi_x_coords.append(x)
+                    roi_y_coords.append(y)
+
                 plt.scatter(
-                    roi_tracks,
-                    roi_slits,
+                    roi_x_coords,
+                    roi_y_coords,
                     c=roi_colors[0],
                     s=roi_marker_size,
                     marker=roi_marker_shape,
@@ -4445,14 +5092,22 @@ class CombinedTransectCube:
                     label=f"ROI Pixels ({len(valid_rois)})",
                 )
 
-        # Grid (unchanged)
-        for x in np.arange(0, n_tracks + 1, 50):
-            plt.axvline(x, color="black", linewidth=0.5, alpha=0.3)
-        for y in np.arange(0, n_slits + 1, 50):
-            plt.axhline(y, color="black", linewidth=0.5, alpha=0.3)
+        # Grid (adjusted for axis flipping) - disabled for cropped images
+        if not crop_applied:
+            if flip_axes:
+                # Grid lines based on actual axis assignment
+                for x in np.arange(0, n_slits + 1, 50):
+                    plt.axvline(x, color="black", linewidth=0.5, alpha=0.3)
+                for y in np.arange(0, n_tracks + 1, 50):
+                    plt.axhline(y, color="black", linewidth=0.5, alpha=0.3)
+            else:
+                for x in np.arange(0, n_tracks + 1, 50):
+                    plt.axvline(x, color="black", linewidth=0.5, alpha=0.3)
+                for y in np.arange(0, n_slits + 1, 50):
+                    plt.axhline(y, color="black", linewidth=0.5, alpha=0.3)
 
-        plt.xlabel("Track Index")
-        plt.ylabel("Slit Pixel Index")
+        plt.xlabel(xlabel_text)
+        plt.ylabel(ylabel_text)
 
         # Build title with file names
         file_names = [b["file"] for b in self.file_boundaries]
@@ -5435,8 +6090,13 @@ class CombinedTransectCube:
         wavelength_range=None,
         wavelength_smoothing=1,
         smooth_before_filter=False,  # NEW: Apply smoothing before wavelength filtering
-        smoothing_method="moving_average",  # NEW: Smoothing method ('moving_average' or 'savgol')
+        smoothing_method="moving_average",  # NEW: Smoothing method ('moving_average', 'savgol', 'gaussian', 'median', 'whittaker', 'bilateral')
         savgol_polyorder=2,  # NEW: Polynomial order for Savitzky-Golay filter (typically 2 or 3)
+        gaussian_sigma=2.0,  # NEW: Sigma for Gaussian smoothing
+        median_kernel_size=5,  # NEW: Kernel size for median filter (must be odd)
+        whittaker_lambda=1e4,  # NEW: Smoothing parameter for Whittaker smoother (larger = smoother)
+        bilateral_sigma_spatial=2.0,  # NEW: Spatial sigma for bilateral filter
+        bilateral_sigma_intensity=0.1,  # NEW: Intensity sigma for bilateral filter
         figsize=(12, 6),
         colors=[
             "#FF0000",
@@ -5458,8 +6118,10 @@ class CombinedTransectCube:
         interpolate_wavelengths=None,  # NEW: List of wavelength indices to interpolate (e.g., [104] for 560nm dip)
         legend_loc="best",  # NEW: Legend location ('best', 'upper right', 'outside', etc., or None to hide)
         ylim=None,  # NEW: Y-axis limits - tuple (ymin, ymax) or float for ±range around mean
+        derivative_order=0,  # NEW: Derivative order (0=raw, 1=first derivative, 2=second derivative)
+        derivative_window=2,  # NEW: Window size for derivative computation (default=2)
     ):
-        """Enhanced spectrum plotting with optional normalization, inline labels, std control, wavelength interpolation, and legend placement.
+        """Enhanced spectrum plotting with optional normalization, inline labels, std control, wavelength interpolation, derivative analysis, and legend placement.
 
         Parameters:
         -----------
@@ -5491,10 +6153,34 @@ class CombinedTransectCube:
             Smoothing method to use:
             - "moving_average": Rolling mean (pandas-based, same as illumination correction V2)
             - "savgol": Savitzky-Golay filter (polynomial fitting, preserves peaks/valleys better)
+            - "gaussian": Gaussian filter (sigma-based smoothing, good for noise reduction)
+            - "median": Median filter (robust to outliers, preserves edges)
+            - "whittaker": Whittaker smoother (penalized least squares, excellent feature preservation)
+            - "bilateral": Bilateral filter (edge-preserving, intensity-aware smoothing)
 
         savgol_polyorder : int, optional (default=2)
             Polynomial order for Savitzky-Golay filter (only used if smoothing_method='savgol').
             Typical values: 2 (quadratic) or 3 (cubic). Must be less than wavelength_smoothing.
+
+        gaussian_sigma : float, optional (default=2.0)
+            Standard deviation for Gaussian filter (only used if smoothing_method='gaussian').
+            Larger values produce smoother results.
+
+        median_kernel_size : int, optional (default=5)
+            Kernel size for median filter (only used if smoothing_method='median').
+            Must be odd. Larger values produce smoother results.
+
+        whittaker_lambda : float, optional (default=1e4)
+            Smoothing parameter for Whittaker smoother (only used if smoothing_method='whittaker').
+            Larger values produce smoother results. Typical range: 1e2 to 1e6.
+
+        bilateral_sigma_spatial : float, optional (default=2.0)
+            Spatial sigma for bilateral filter (only used if smoothing_method='bilateral').
+            Controls how far neighbors are considered. Larger values = more smoothing.
+
+        bilateral_sigma_intensity : float, optional (default=0.1)
+            Intensity sigma for bilateral filter (only used if smoothing_method='bilateral').
+            Controls how similar intensities must be. Smaller values = more edge preservation.
 
         ylim : float, tuple, or None, optional (default=None)
             Y-axis (intensity) limits for the plot:
@@ -5502,6 +6188,19 @@ class CombinedTransectCube:
             - float: e.g., 0.2 → sets limits to mean ± 0.2 (reduces apparent volatility)
             - tuple: (ymin, ymax) → absolute limits
             Example: ylim=0.2 with mean=1.04 → plot range [0.84, 1.24]
+
+        derivative_order : int, optional (default=0)
+            Spectral derivative order:
+            - 0: Raw spectrum (default, no derivative)
+            - 1: First derivative dI/dλ (rate of change, highlights slopes)
+            - 2: Second derivative d²I/dλ² (curvature, highlights absorption/emission features)
+            Derivatives are computed AFTER all preprocessing (smoothing, normalization).
+            Use derivatives to enhance spectral features and remove baseline effects.
+
+        derivative_window : int, optional (default=2)
+            Window size for derivative computation (number of wavelength steps).
+            Larger windows = smoother derivatives but less resolution.
+            Default of 2 works well for most hyperspectral data.
         """
 
         cube = (
@@ -5641,7 +6340,15 @@ class CombinedTransectCube:
             return result[0] if is_1d else result
 
         def smooth_spectrum(
-            spectrum, window_size, method="moving_average", polyorder=2
+            spectrum,
+            window_size,
+            method="moving_average",
+            polyorder=2,
+            gaussian_sigma_val=2.0,
+            median_kernel_val=5,
+            whittaker_lambda_val=1e4,
+            bilateral_sigma_spatial_val=2.0,
+            bilateral_sigma_intensity_val=0.1,
         ):
             """
             Smooth spectrum using specified method.
@@ -5651,20 +6358,32 @@ class CombinedTransectCube:
             spectrum : np.ndarray
                 1D spectrum array
             window_size : int
-                Window size for smoothing
+                Window size for smoothing (used for moving_average and savgol)
             method : str
-                'moving_average' or 'savgol'
+                'moving_average', 'savgol', 'gaussian', 'median', 'whittaker', 'bilateral'
             polyorder : int
                 Polynomial order for Savitzky-Golay (only used if method='savgol')
+            gaussian_sigma_val : float
+                Sigma for Gaussian smoothing
+            median_kernel_val : int
+                Kernel size for median filter
+            whittaker_lambda_val : float
+                Smoothing parameter for Whittaker smoother
+            bilateral_sigma_spatial_val : float
+                Spatial sigma for bilateral filter
+            bilateral_sigma_intensity_val : float
+                Intensity sigma for bilateral filter
 
             Returns:
             --------
             np.ndarray : Smoothed spectrum
             """
-            if window_size <= 1:
-                return spectrum
-            if window_size > len(spectrum):
-                window_size = len(spectrum)
+            # Early return only for methods that use window_size
+            if method in ["moving_average", "savgol"]:
+                if window_size <= 1:
+                    return spectrum
+                if window_size > len(spectrum):
+                    window_size = len(spectrum)
 
             if method == "savgol":
                 # Savitzky-Golay filter
@@ -5684,6 +6403,79 @@ class CombinedTransectCube:
                 )
                 return smoothed
 
+            elif method == "gaussian":
+                # Gaussian filter smoothing
+                from scipy.ndimage import gaussian_filter1d
+
+                smoothed = gaussian_filter1d(
+                    spectrum, sigma=gaussian_sigma_val, mode="nearest"
+                )
+                return smoothed
+
+            elif method == "median":
+                # Median filter smoothing
+                from scipy.ndimage import median_filter
+
+                # Ensure kernel size is odd
+                kernel_size = median_kernel_val
+                if kernel_size % 2 == 0:
+                    kernel_size += 1
+
+                smoothed = median_filter(spectrum, size=kernel_size, mode="nearest")
+                return smoothed
+
+            elif method == "whittaker":
+                # Whittaker smoother (penalized least squares)
+                # Based on Eilers (2003) "A perfect smoother"
+                try:
+                    from scipy.sparse import diags, eye
+                    from scipy.sparse.linalg import spsolve
+
+                    m = len(spectrum)
+                    E = eye(m, format="csc")
+                    D = diags([1, -2, 1], [0, 1, 2], shape=(m - 2, m))
+
+                    # Solve (E + lambda * D^T * D) * z = spectrum
+                    # where z is the smoothed spectrum
+                    W = E + whittaker_lambda_val * (D.T @ D)
+                    smoothed = spsolve(W, spectrum)
+
+                    return smoothed
+                except Exception as e:
+                    print(f"⚠️  Whittaker smoother failed: {e}, using original spectrum")
+                    return spectrum
+
+            elif method == "bilateral":
+                # Bilateral filter (edge-preserving smoothing)
+                # Weights based on both spatial distance and intensity similarity
+                smoothed = np.zeros_like(spectrum)
+
+                for i in range(len(spectrum)):
+                    # Define spatial window
+                    half_window = int(3 * bilateral_sigma_spatial_val)
+                    start = max(0, i - half_window)
+                    end = min(len(spectrum), i + half_window + 1)
+
+                    # Compute weights
+                    spatial_dist = np.arange(start, end) - i
+                    spatial_weight = np.exp(
+                        -(spatial_dist**2) / (2 * bilateral_sigma_spatial_val**2)
+                    )
+
+                    intensity_diff = spectrum[start:end] - spectrum[i]
+                    intensity_weight = np.exp(
+                        -(intensity_diff**2) / (2 * bilateral_sigma_intensity_val**2)
+                    )
+
+                    # Combined weight
+                    combined_weight = spatial_weight * intensity_weight
+                    combined_weight /= np.sum(combined_weight)
+
+                    # Weighted average
+                    smoothed[i] = np.sum(spectrum[start:end] * combined_weight)
+
+                return smoothed
+
             else:
                 # Moving average (default) - Use pandas rolling for proper alignment
                 import pandas as pd
@@ -5693,6 +6485,85 @@ class CombinedTransectCube:
                     window=window_size, center=True, min_periods=1
                 ).mean()
                 return smoothed.values
+
+        def compute_spectrum_derivative(spectrum, wavelengths_array, order=0, window=2):
+            """
+            Compute spectral derivatives.
+
+            Parameters:
+            -----------
+            spectrum : np.ndarray
+                1D spectrum array
+            wavelengths_array : np.ndarray
+                Corresponding wavelengths for the spectrum
+            order : int
+                Derivative order (0=raw, 1=first, 2=second)
+            window : int
+                Window size for derivative computation
+
+            Returns:
+            --------
+            np.ndarray : Derivative spectrum (same length as input)
+            """
+            if order == 0:
+                # No derivative, return as-is
+                return spectrum
+
+            if len(spectrum) < 2 * window + 1:
+                print(
+                    f"⚠️  Warning: Spectrum too short for derivative with window={window}"
+                )
+                return spectrum
+
+            derivative = np.zeros_like(spectrum)
+
+            if order == 1:
+                # First derivative: dI/dλ using central difference
+                for i in range(len(spectrum)):
+                    if i < window or i >= len(spectrum) - window:
+                        # At edges, use forward/backward difference
+                        if i < window:
+                            # Forward difference at start
+                            if i + 1 < len(spectrum):
+                                derivative[i] = (spectrum[i + 1] - spectrum[i]) / (
+                                    wavelengths_array[i + 1] - wavelengths_array[i]
+                                )
+                        else:
+                            # Backward difference at end
+                            derivative[i] = (spectrum[i] - spectrum[i - 1]) / (
+                                wavelengths_array[i] - wavelengths_array[i - 1]
+                            )
+                    else:
+                        # Central difference in the middle
+                        derivative[i] = (
+                            spectrum[i + window] - spectrum[i - window]
+                        ) / (
+                            wavelengths_array[i + window]
+                            - wavelengths_array[i - window]
+                        )
+
+            elif order == 2:
+                # Second derivative: d²I/dλ² using three-point formula
+                for i in range(len(spectrum)):
+                    if i < window or i >= len(spectrum) - window:
+                        # At edges, set to 0 or use lower-order approximation
+                        derivative[i] = 0
+                    else:
+                        # Three-point formula: (I[i+w] - 2*I[i] + I[i-w]) / h²
+                        h = wavelengths_array[i + window] - wavelengths_array[i]
+                        derivative[i] = (
+                            spectrum[i + window]
+                            - 2 * spectrum[i]
+                            + spectrum[i - window]
+                        ) / (h**2)
+
+            else:
+                print(
+                    f"⚠️  Warning: Derivative order {order} not supported, returning raw spectrum"
+                )
+                return spectrum
+
+            return derivative
 
         # Determine which normalization method to use
         # Handle backward compatibility: normalize=True maps to "mean"
@@ -5807,9 +6678,13 @@ class CombinedTransectCube:
                     f"   ✓ Reference computed from {len(all_spectra_for_ref)} spectra"
                 )
 
-        # Dynamic y-label based on normalization
+        # Dynamic y-label based on normalization and derivative order
         if ylabel == "Intensity":  # Only change default label
-            if active_normalization:
+            if derivative_order == 1:
+                ylabel = "First Derivative (dI/dλ)"
+            elif derivative_order == 2:
+                ylabel = "Second Derivative (d²I/dλ²)"
+            elif active_normalization:
                 label_map = {
                     "mean": "Mean-Normalized Intensity",
                     "mean_center": "Mean-Centered Intensity",
@@ -5854,6 +6729,11 @@ class CombinedTransectCube:
                                 wavelength_smoothing,
                                 smoothing_method,
                                 savgol_polyorder,
+                                gaussian_sigma,
+                                median_kernel_size,
+                                whittaker_lambda,
+                                bilateral_sigma_spatial,
+                                bilateral_sigma_intensity,
                             )
                         # Then filter wavelength range
                         spectra_array = spectra_array[:, wl_mask]
@@ -5876,12 +6756,22 @@ class CombinedTransectCube:
                                 wavelength_smoothing,
                                 smoothing_method,
                                 savgol_polyorder,
+                                gaussian_sigma,
+                                median_kernel_size,
+                                whittaker_lambda,
+                                bilateral_sigma_spatial,
+                                bilateral_sigma_intensity,
                             )
                             smoothed_std = smooth_spectrum(
                                 std_spectrum,
                                 wavelength_smoothing,
                                 smoothing_method,
                                 savgol_polyorder,
+                                gaussian_sigma,
+                                median_kernel_size,
+                                whittaker_lambda,
+                                bilateral_sigma_spatial,
+                                bilateral_sigma_intensity,
                             )
                             plot_wavelengths = wavelengths
                             plot_avg = smoothed_avg
@@ -5908,6 +6798,22 @@ class CombinedTransectCube:
                         if show_std:
                             plot_std = normalize_spectrum(
                                 plot_std, active_normalization
+                            )
+
+                    # NEW: Compute derivative if requested
+                    if derivative_order > 0:
+                        plot_avg = compute_spectrum_derivative(
+                            plot_avg,
+                            plot_wavelengths,
+                            derivative_order,
+                            derivative_window,
+                        )
+                        if show_std:
+                            plot_std = compute_spectrum_derivative(
+                                plot_std,
+                                plot_wavelengths,
+                                derivative_order,
+                                derivative_window,
                             )
 
                     # NEW: Get consistent color across all plots
@@ -5954,6 +6860,10 @@ class CombinedTransectCube:
                         )
 
             title = f"{data_label} ROI Spectra{range_info}"
+            if derivative_order == 1:
+                title += " [1st Derivative]"
+            elif derivative_order == 2:
+                title += " [2nd Derivative]"
             if active_normalization:
                 title += f" ({active_normalization.upper()})"
             if wavelength_smoothing > 1:
@@ -5978,7 +6888,15 @@ class CombinedTransectCube:
             if smooth_before_filter and wavelength_smoothing > 1:
                 # OPTION 1: Smooth BEFORE filtering (smooth full spectrum)
                 smoothed_spectrum = smooth_spectrum(
-                    spectrum, wavelength_smoothing, smoothing_method, savgol_polyorder
+                    spectrum,
+                    wavelength_smoothing,
+                    smoothing_method,
+                    savgol_polyorder,
+                    gaussian_sigma,
+                    median_kernel_size,
+                    whittaker_lambda,
+                    bilateral_sigma_spatial,
+                    bilateral_sigma_intensity,
                 )
                 # Then filter wavelength range
                 plot_spectrum = smoothed_spectrum[wl_mask]
@@ -5994,6 +6912,11 @@ class CombinedTransectCube:
                         wavelength_smoothing,
                         smoothing_method,
                         savgol_polyorder,
+                        gaussian_sigma,
+                        median_kernel_size,
+                        whittaker_lambda,
+                        bilateral_sigma_spatial,
+                        bilateral_sigma_intensity,
                     )
                     plot_wavelengths = wavelengths
                     plot_spectrum = smoothed_spectrum
@@ -6010,9 +6933,19 @@ class CombinedTransectCube:
             else:
                 plot_spectrum = normalize_spectrum(plot_spectrum, active_normalization)
 
+            # Compute derivative if requested
+            if derivative_order > 0:
+                plot_spectrum = compute_spectrum_derivative(
+                    plot_spectrum, plot_wavelengths, derivative_order, derivative_window
+                )
+
             plt.plot(plot_wavelengths, plot_spectrum, color=colors[0], linewidth=2)
 
             title = f"{data_label} Spectrum"
+            if derivative_order == 1:
+                title += " [1st Derivative]"
+            elif derivative_order == 2:
+                title += " [2nd Derivative]"
             if active_normalization:
                 title += f" ({active_normalization.upper()})"
             if wavelength_smoothing > 1:
