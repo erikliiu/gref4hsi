@@ -733,6 +733,8 @@ class CombinedTransectCube:
         Get consistent color for an ROI across all plots.
         Uses hardcoded colors for specific ROIs, then custom_color_map, then persistent color map, then assigns new color.
 
+        NEW: Smart pattern matching - ROIs with keywords (bomb, dark, halo, rust, etc.) get consistent color hues.
+
         Parameters:
         -----------
         roi_name : str
@@ -779,6 +781,67 @@ class CombinedTransectCube:
             "new_sediment": "#8B4513",  # brown (same as training_sediment)
         }
 
+        # NEW: Smart pattern matching for consistent color hues by feature type
+        # Maps keyword patterns to color groups (hue families)
+        PATTERN_COLOR_GROUPS = {
+            # Bombs: Blue/Cyan family (variations in saturation/lightness)
+            "bomb": [
+                "#0000FF",
+                "#1E90FF",
+                "#4169E1",
+                "#00BFFF",
+                "#87CEEB",
+            ],  # dark blue, dodger blue, royal blue, deep sky blue, light sky blue
+            # Dark features: Black/Gray family
+            "dark": [
+                "#000000",
+                "#2F2F2F",
+                "#4F4F4F",
+                "#696969",
+                "#808080",
+            ],  # pure black, dark gray, dim gray, medium gray, gray
+            # Halos: Yellow/Orange family
+            "halo": [
+                "#FFD700",
+                "#FFA500",
+                "#FF8C00",
+                "#FFAA00",
+                "#FFB733",
+            ],  # gold, orange, dark orange, bright orange, yellow-orange
+            # Arms: Magenta/Pink family
+            "arms": [
+                "#FF00FF",
+                "#FF69B4",
+                "#FF1493",
+                "#C71585",
+                "#DB7093",
+            ],  # magenta, hot pink, deep pink, medium violet red, pale violet red
+            # Rust: Red/Brown family
+            "rust": [
+                "#B22222",
+                "#CD5C5C",
+                "#A52A2A",
+                "#8B4513",
+                "#D2691E",
+            ],  # firebrick, indian red, brown, saddle brown, chocolate
+            # Pits: Dark gray/black tones
+            "pit": [
+                "#1C1C1C",
+                "#363636",
+                "#4A4A4A",
+                "#5E5E5E",
+                "#727272",
+            ],  # very dark gray variations
+            # Sediment: Brown/Tan family (kept as-is)
+            "sediment": [
+                "#8B4513",
+                "#A0522D",
+                "#CD853F",
+                "#DEB887",
+                "#D2B48C",
+            ],  # saddle brown, sienna, peru, burlywood, tan
+        }
+
         # Priority 1: Custom color map for this specific plot (allows override)
         if custom_color_map and roi_name in custom_color_map:
             return custom_color_map[roi_name]
@@ -793,7 +856,29 @@ class CombinedTransectCube:
         if roi_name in self.roi_color_map:
             return self.roi_color_map[roi_name]
 
-        # Priority 4: Assign new color and save it
+        # Priority 4: NEW - Smart pattern-based color assignment
+        # Check if ROI name contains any pattern keywords
+        roi_name_lower = roi_name.lower()
+        matched_pattern = None
+        for pattern in PATTERN_COLOR_GROUPS:
+            if pattern in roi_name_lower:
+                matched_pattern = pattern
+                break
+
+        if matched_pattern:
+            # Count how many ROIs with this pattern already exist
+            pattern_count = sum(
+                1
+                for name in self.roi_color_map.keys()
+                if matched_pattern in name.lower()
+            )
+            color_group = PATTERN_COLOR_GROUPS[matched_pattern]
+            # Cycle through colors in this group
+            color = color_group[pattern_count % len(color_group)]
+            self.roi_color_map[roi_name] = color
+            return color
+
+        # Priority 5: Fallback - Assign from default colors (for ROIs without pattern match)
         # Find next available color that's not already used
         used_colors = set(self.roi_color_map.values())
         for color in default_colors:
@@ -3119,7 +3204,312 @@ class CombinedTransectCube:
         return True
 
     # ============================================================================
-    # 🔥 NEW: Spectral Pre-processing Functions (In-Memory Only)
+    # � Spectral Smoothing Cache Functions
+    # ============================================================================
+
+    def _get_smoothing_dataset_name(
+        self,
+        method="gaussian",
+        wavelength_smoothing=10,
+        gaussian_sigma=2.0,
+        savgol_polyorder=2,
+        median_kernel_size=5,
+        whittaker_lambda=1e4,
+        bilateral_sigma_spatial=2.0,
+        bilateral_sigma_intensity=0.1,
+    ):
+        """
+        Generate dataset name for spectral smoothing with specific parameters.
+        Allows multiple cached versions with different parameters.
+        """
+        # Build parameter string based on method
+        if method == "gaussian":
+            params = f"sig{gaussian_sigma:.1f}".replace(".", "p")
+        elif method == "savgol":
+            params = f"w{wavelength_smoothing}_p{savgol_polyorder}"
+        elif method == "moving_average":
+            params = f"w{wavelength_smoothing}"
+        elif method == "median":
+            params = f"k{median_kernel_size}"
+        elif method == "whittaker":
+            # Use scientific notation for lambda (e.g., 1e4 -> "1e4")
+            lam_str = f"{whittaker_lambda:.0e}".replace("+", "")
+            params = f"lam{lam_str}"
+        elif method == "bilateral":
+            ss_str = f"{bilateral_sigma_spatial:.1f}".replace(".", "p")
+            si_str = f"{bilateral_sigma_intensity:.2f}".replace(".", "p")
+            params = f"ss{ss_str}_si{si_str}"
+        else:
+            params = "unknown"
+
+        return f"processed/radiance/dataCube_smoothed_{method}_{params}"
+
+    def has_spectral_smoothing(
+        self,
+        method="gaussian",
+        wavelength_smoothing=10,
+        gaussian_sigma=2.0,
+        savgol_polyorder=2,
+        median_kernel_size=5,
+        whittaker_lambda=1e4,
+        bilateral_sigma_spatial=2.0,
+        bilateral_sigma_intensity=0.1,
+    ):
+        """
+        Check if spectral smoothing with these parameters has already been applied.
+        Returns True if all files have the smoothed dataset with matching metadata.
+        """
+        import h5py
+
+        dset_name = self._get_smoothing_dataset_name(
+            method=method,
+            wavelength_smoothing=wavelength_smoothing,
+            gaussian_sigma=gaussian_sigma,
+            savgol_polyorder=savgol_polyorder,
+            median_kernel_size=median_kernel_size,
+            whittaker_lambda=whittaker_lambda,
+            bilateral_sigma_spatial=bilateral_sigma_spatial,
+            bilateral_sigma_intensity=bilateral_sigma_intensity,
+        )
+
+        for gf in self.geofiles:
+            try:
+                with h5py.File(gf.path, "r") as f:
+                    # Check if smoothed dataset exists
+                    if dset_name not in f:
+                        return False
+
+                    # Verify metadata matches
+                    dset = f[dset_name]
+                    if "method" not in dset.attrs:
+                        return False
+
+                    saved_method = dset.attrs["method"]
+                    if saved_method != method:
+                        return False
+
+                    # Check method-specific parameters
+                    if method == "gaussian" and "gaussian_sigma" in dset.attrs:
+                        if abs(dset.attrs["gaussian_sigma"] - gaussian_sigma) > 1e-6:
+                            return False
+                    elif method == "savgol":
+                        if (
+                            dset.attrs.get("wavelength_smoothing", -1)
+                            != wavelength_smoothing
+                            or dset.attrs.get("savgol_polyorder", -1)
+                            != savgol_polyorder
+                        ):
+                            return False
+                    elif method == "moving_average":
+                        if (
+                            dset.attrs.get("wavelength_smoothing", -1)
+                            != wavelength_smoothing
+                        ):
+                            return False
+                    elif method == "median":
+                        if (
+                            dset.attrs.get("median_kernel_size", -1)
+                            != median_kernel_size
+                        ):
+                            return False
+                    elif method == "whittaker":
+                        if (
+                            abs(
+                                dset.attrs.get("whittaker_lambda", 0) - whittaker_lambda
+                            )
+                            > 1e-3
+                        ):
+                            return False
+                    elif method == "bilateral":
+                        if (
+                            abs(
+                                dset.attrs.get("bilateral_sigma_spatial", 0)
+                                - bilateral_sigma_spatial
+                            )
+                            > 1e-6
+                            or abs(
+                                dset.attrs.get("bilateral_sigma_intensity", 0)
+                                - bilateral_sigma_intensity
+                            )
+                            > 1e-6
+                        ):
+                            return False
+
+            except Exception as e:
+                print(f"⚠️  Error checking smoothing cache in {gf.name}: {e}")
+                return False
+
+        return True
+
+    def load_spectral_smoothing(
+        self,
+        method="gaussian",
+        wavelength_smoothing=10,
+        gaussian_sigma=2.0,
+        savgol_polyorder=2,
+        median_kernel_size=5,
+        whittaker_lambda=1e4,
+        bilateral_sigma_spatial=2.0,
+        bilateral_sigma_intensity=0.1,
+    ):
+        """
+        Load previously saved spectral smoothing from HDF5 files.
+        Populates self.data_corrected.
+        """
+        import h5py
+
+        dset_name = self._get_smoothing_dataset_name(
+            method=method,
+            wavelength_smoothing=wavelength_smoothing,
+            gaussian_sigma=gaussian_sigma,
+            savgol_polyorder=savgol_polyorder,
+            median_kernel_size=median_kernel_size,
+            whittaker_lambda=whittaker_lambda,
+            bilateral_sigma_spatial=bilateral_sigma_spatial,
+            bilateral_sigma_intensity=bilateral_sigma_intensity,
+        )
+
+        # Calculate total size
+        T_total = sum(gf.shape[0] for gf in self.geofiles)
+        S, B = self.geofiles[0].shape[1], self.geofiles[0].shape[2]
+
+        print(
+            f"📂 Loading saved spectral smoothing ({method}) from {len(self.geofiles)} files..."
+        )
+
+        self.data_corrected = np.zeros((T_total, S, B), dtype=np.float32)
+
+        t_offset = 0
+        for gf in self.geofiles:
+            with h5py.File(gf.path, "r") as f:
+                if dset_name not in f:
+                    raise RuntimeError(
+                        f"{gf.name}: smoothed data not found at {dset_name}"
+                    )
+
+                dset = f[dset_name]
+                T_file = dset.shape[0]
+                self.data_corrected[t_offset : t_offset + T_file, :, :] = dset[()]
+
+                # Print metadata
+                if "method" in dset.attrs:
+                    print(f"   {gf.name}: method={dset.attrs['method']}")
+
+                t_offset += T_file
+
+        print(f"✅ Loaded spectral smoothing from disk (saved computation time!)")
+        return self.data_corrected
+
+    def save_spectral_smoothing(
+        self,
+        method="gaussian",
+        wavelength_smoothing=10,
+        gaussian_sigma=2.0,
+        savgol_polyorder=2,
+        median_kernel_size=5,
+        whittaker_lambda=1e4,
+        bilateral_sigma_spatial=2.0,
+        bilateral_sigma_intensity=0.1,
+    ):
+        """
+        Save the spectrally smoothed data to HDF5 files.
+        Splits self.data_corrected back into individual files and saves with
+        unique names based on method and parameters.
+        """
+        import h5py
+        import time
+
+        if self.data_corrected is None:
+            raise RuntimeError(
+                "No corrected data to save. Run apply_spectral_smoothing first."
+            )
+
+        dset_path = self._get_smoothing_dataset_name(
+            method=method,
+            wavelength_smoothing=wavelength_smoothing,
+            gaussian_sigma=gaussian_sigma,
+            savgol_polyorder=savgol_polyorder,
+            median_kernel_size=median_kernel_size,
+            whittaker_lambda=whittaker_lambda,
+            bilateral_sigma_spatial=bilateral_sigma_spatial,
+            bilateral_sigma_intensity=bilateral_sigma_intensity,
+        )
+
+        print(f"💾 Saving spectral smoothing to {len(self.geofiles)} files...")
+        print(f"   Dataset: {dset_path}")
+
+        t_offset = 0
+        for gf in self.geofiles:
+            T_file = gf.shape[0]
+            smoothed_chunk = self.data_corrected[t_offset : t_offset + T_file, :, :]
+
+            # Retry mechanism in case file is temporarily locked
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    with h5py.File(gf.path, "a") as f:
+                        # Remove old dataset if it exists (overwrite same parameters)
+                        if dset_path in f:
+                            del f[dset_path]
+
+                        # Create new dataset with compression
+                        dset = f.create_dataset(
+                            dset_path,
+                            data=smoothed_chunk,
+                            compression="gzip",
+                            compression_opts=4,
+                            dtype=np.float32,
+                        )
+
+                        # Save metadata (method-specific)
+                        dset.attrs["method"] = method
+                        dset.attrs["description"] = (
+                            f"Spectrally smoothed radiance ({method})"
+                        )
+
+                        if method == "gaussian":
+                            dset.attrs["gaussian_sigma"] = gaussian_sigma
+                        elif method == "savgol":
+                            dset.attrs["wavelength_smoothing"] = wavelength_smoothing
+                            dset.attrs["savgol_polyorder"] = savgol_polyorder
+                        elif method == "moving_average":
+                            dset.attrs["wavelength_smoothing"] = wavelength_smoothing
+                        elif method == "median":
+                            dset.attrs["median_kernel_size"] = median_kernel_size
+                        elif method == "whittaker":
+                            dset.attrs["whittaker_lambda"] = whittaker_lambda
+                        elif method == "bilateral":
+                            dset.attrs["bilateral_sigma_spatial"] = (
+                                bilateral_sigma_spatial
+                            )
+                            dset.attrs["bilateral_sigma_intensity"] = (
+                                bilateral_sigma_intensity
+                            )
+
+                        print(f"   ✓ {gf.name}: saved {smoothed_chunk.shape}")
+                    break  # Success, exit retry loop
+
+                except BlockingIOError as e:
+                    if attempt < max_retries - 1:
+                        print(
+                            f"   ⚠️  File locked, retrying in 1 second... (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(1)
+                    else:
+                        print(
+                            f"   ❌ Failed to save to {gf.name} after {max_retries} attempts"
+                        )
+                        print(
+                            f"      Try closing any programs that might have the file open"
+                        )
+                        raise
+
+            t_offset += T_file
+
+        print(f"✅ Spectral smoothing saved to disk")
+
+    # ============================================================================
+    # �🔥 NEW: Spectral Pre-processing Functions (In-Memory Only)
     # ============================================================================
 
     def apply_wavelength_interpolation(self, interpolate_wavelengths=None, quiet=False):
@@ -3615,13 +4005,16 @@ class CombinedTransectCube:
         whittaker_lambda=1e4,
         bilateral_sigma_spatial=2.0,
         bilateral_sigma_intensity=0.1,
+        force_recompute=False,
         quiet=False,
     ):
         """
         Smooth each pixel's spectrum along the wavelength axis.
 
-        This permanently modifies data_corrected (in memory only, not saved to disk).
+        This permanently modifies data_corrected (in memory only, but can be cached to disk).
         Smoothing is applied to ALL wavelengths currently in the datacube.
+
+        Results are automatically cached to disk. Use force_recompute=True to recalculate.
 
         Parameters:
         -----------
@@ -3654,6 +4047,9 @@ class CombinedTransectCube:
         bilateral_sigma_intensity : float, default=0.1
             Intensity sigma for bilateral filter
             Only used if method="bilateral". Smaller values = stronger edge preservation
+        force_recompute : bool, default=False
+            If True, recalculate smoothing even if cached version exists
+            If False, load from cache if available (much faster!)
         quiet : bool, default=False
             If True, suppresses progress messages
 
@@ -3672,6 +4068,32 @@ class CombinedTransectCube:
         if self.data_corrected is None:
             raise ValueError(
                 "No corrected data available. Run apply_illumination_correction_v2() first."
+            )
+
+        # Check if smoothing has already been computed and saved
+        if not force_recompute and self.has_spectral_smoothing(
+            method=method,
+            wavelength_smoothing=wavelength_smoothing,
+            gaussian_sigma=gaussian_sigma,
+            savgol_polyorder=savgol_polyorder,
+            median_kernel_size=median_kernel_size,
+            whittaker_lambda=whittaker_lambda,
+            bilateral_sigma_spatial=bilateral_sigma_spatial,
+            bilateral_sigma_intensity=bilateral_sigma_intensity,
+        ):
+            if not quiet:
+                print(
+                    f"💾 Found cached smoothing ({method}) - loading from disk (much faster!)"
+                )
+            return self.load_spectral_smoothing(
+                method=method,
+                wavelength_smoothing=wavelength_smoothing,
+                gaussian_sigma=gaussian_sigma,
+                savgol_polyorder=savgol_polyorder,
+                median_kernel_size=median_kernel_size,
+                whittaker_lambda=whittaker_lambda,
+                bilateral_sigma_spatial=bilateral_sigma_spatial,
+                bilateral_sigma_intensity=bilateral_sigma_intensity,
             )
 
         # Only check wavelength_smoothing for methods that use it
@@ -3879,6 +4301,20 @@ class CombinedTransectCube:
                     f"   Sigma (spatial/intensity): {bilateral_sigma_spatial}/{bilateral_sigma_intensity}"
                 )
             print("=" * 60)
+
+        # Save smoothed data to disk for future use
+        if not quiet:
+            print(f"\n💾 Caching smoothed data to disk for future use...")
+        self.save_spectral_smoothing(
+            method=method,
+            wavelength_smoothing=wavelength_smoothing,
+            gaussian_sigma=gaussian_sigma,
+            savgol_polyorder=savgol_polyorder,
+            median_kernel_size=median_kernel_size,
+            whittaker_lambda=whittaker_lambda,
+            bilateral_sigma_spatial=bilateral_sigma_spatial,
+            bilateral_sigma_intensity=bilateral_sigma_intensity,
+        )
 
         return self.data_corrected
 
@@ -4607,7 +5043,7 @@ class CombinedTransectCube:
         roi_color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
         roi_marker_size=100,
         roi_marker_shape="s",  # Marker shape: 's'=square, 'o'=circle, '^'=triangle, 'D'=diamond, etc.
-        roi_marker_edgewidth=2,  # Edge width for ROI markers (0 = no edge)
+        roi_marker_edgewidth=0,  # Edge width for ROI markers (0 = no edge)
         roi_show_numbers=False,
         roi_legend_loc="best",  # Legend location: 'best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center', 'outside', or None to hide
         roi_legend_markersize=10,  # Size of color markers in legend (default=10)
@@ -4623,9 +5059,22 @@ class CombinedTransectCube:
         crop_center_slit=None,  # NEW: Slit index for crop center (requires crop_center_track and crop_width)
         crop_width=None,  # NEW: Width in slit pixels for square physical crop (track width = crop_width/3.61)
         crop_aspect_ratio=3.61,  # NEW: Ratio of track:slit pixel physical size (default 3.61 for UHI)
+        derivative_order=0,  # NEW: 0 (raw), 1 (first derivative), 2 (second derivative)
+        derivative_window=2,  # NEW: Window size for derivative computation
+        use_wavelength_colormap=False,  # NEW: If True, plot single wavelength with natural color
+        wavelength_colormap_target=None,  # NEW: Target wavelength (nm) for single-wavelength mode (required if use_wavelength_colormap=True)
+        vmin=None,  # NEW: Minimum value for normalization (if None, uses 2nd percentile)
+        vmax=None,  # NEW: Maximum value for normalization (if None, uses 98th percentile)
     ):
         """
         Enhanced RGB plot supporting multiple named ROIs with different colors.
+
+        NEW SINGLE-WAVELENGTH COLORMAP MODE:
+        - use_wavelength_colormap: Enable single-wavelength visualization with natural colors
+        - wavelength_colormap_target: Target wavelength (nm) to visualize
+        - When enabled, plots single wavelength heatmap (white → wavelength color)
+        - All other features (derivatives, cropping, flipping, ROIs) still work
+        - RGB parameters (red_wl, green_wl, blue_wl) are ignored in this mode
 
         NEW MULTI-ROI FEATURES:
         - roi_collection: Dict of named ROIs or 'all' to use cube.roi_collection
@@ -4648,6 +5097,14 @@ class CombinedTransectCube:
         - Axis labels show original coordinates of cropped region
         - Overlays (ROIs, boundaries, lines) are disabled when cropping is applied
         - Crop boundaries are clipped to image edges if they extend beyond
+
+        NEW DERIVATIVE FEATURES:
+        - derivative_order: 0 (raw intensity), 1 (first derivative), 2 (second derivative)
+        - derivative_window: Window size for derivative computation (default=2)
+        - Derivatives are computed along wavelength axis for each RGB channel
+        - First derivative: dI/dλ - rate of spectral change
+        - Second derivative: d²I/dλ² - curvature of spectral features
+        - Derivative values are normalized to [0,1] per channel using min-max scaling
         """
 
         # Original RGB setup (unchanged)
@@ -4657,36 +5114,197 @@ class CombinedTransectCube:
             else self.data
         )
 
-        red_idx = np.argmin(np.abs(self.wavelengths - red_wl))
-        green_idx = np.argmin(np.abs(self.wavelengths - green_wl))
-        blue_idx = np.argmin(np.abs(self.wavelengths - blue_wl))
+        # NEW: Single-wavelength colormap mode
+        if use_wavelength_colormap:
+            if wavelength_colormap_target is None:
+                raise ValueError(
+                    "wavelength_colormap_target must be specified when use_wavelength_colormap=True"
+                )
 
-        # Extract RGB channels - default: (tracks, slits) -> transpose to (slits, tracks) for imshow
-        R = cube_data[:, :, red_idx].T.copy()
-        G = cube_data[:, :, green_idx].T.copy()
-        B = cube_data[:, :, blue_idx].T.copy()
+            # Import the colormap creation function from ndi_analysis_utils
+            from ..ndi_analysis_utils import create_wavelength_colormap
 
-        if normalize:
+            # Find closest wavelength index
+            wl_idx = np.argmin(np.abs(self.wavelengths - wavelength_colormap_target))
+            actual_wl = self.wavelengths[wl_idx]
+
+            print(f"🎨 Single-wavelength colormap mode: {actual_wl:.1f} nm")
+
+            # Compute intensity based on derivative order
+            if derivative_order == 0:
+                # Raw intensity
+                intensity_map = cube_data[:, :, wl_idx].T.copy()
+                derivative_label = "Raw Intensity"
+            elif derivative_order == 1:
+                # First derivative: dI/dλ
+                if (
+                    wl_idx < derivative_window
+                    or wl_idx >= len(self.wavelengths) - derivative_window
+                ):
+                    raise ValueError(
+                        f"Wavelength {wavelength_colormap_target} nm too close to edge for derivative with window={derivative_window}"
+                    )
+
+                intensity_forward = cube_data[:, :, wl_idx + derivative_window]
+                intensity_backward = cube_data[:, :, wl_idx - derivative_window]
+                wl_forward = self.wavelengths[wl_idx + derivative_window]
+                wl_backward = self.wavelengths[wl_idx - derivative_window]
+
+                intensity_map = (
+                    (intensity_forward - intensity_backward)
+                    / (wl_forward - wl_backward)
+                ).T.copy()
+                derivative_label = "1st Derivative (dI/dλ)"
+            elif derivative_order == 2:
+                # Second derivative: d²I/dλ²
+                if (
+                    wl_idx < derivative_window
+                    or wl_idx >= len(self.wavelengths) - derivative_window
+                ):
+                    raise ValueError(
+                        f"Wavelength {wavelength_colormap_target} nm too close to edge for 2nd derivative with window={derivative_window}"
+                    )
+
+                intensity_center = cube_data[:, :, wl_idx]
+                intensity_forward = cube_data[:, :, wl_idx + derivative_window]
+                intensity_backward = cube_data[:, :, wl_idx - derivative_window]
+
+                h = (
+                    self.wavelengths[wl_idx + derivative_window]
+                    - self.wavelengths[wl_idx]
+                )
+                intensity_map = (
+                    (intensity_forward - 2 * intensity_center + intensity_backward)
+                    / (h**2)
+                ).T.copy()
+                derivative_label = "2nd Derivative (d²I/dλ²)"
+            else:
+                raise ValueError(
+                    f"Invalid derivative_order: {derivative_order}. Must be 0, 1, or 2."
+                )
+
+            # DO NOT normalize yet - wait until after cropping for better contrast!
+            # Normalization will happen after cropping (if crop is applied)
+
+            # Store as single-channel "image" for compatibility with rest of plotting code
+            # We'll convert this to use a wavelength-specific colormap later
+            wavelength_image = intensity_map
+            wavelength_cmap = create_wavelength_colormap(actual_wl)
+            n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
+
+            print(f"   Derivative: {derivative_label}")
+            print(
+                f"   Raw intensity range (before normalization): [{np.nanmin(intensity_map):.4f}, {np.nanmax(intensity_map):.4f}]"
+            )
+            print(
+                f"   ⚠️ Normalization will be applied AFTER cropping for optimal contrast"
+            )
+
+        else:
+            # Standard RGB mode
+            red_idx = np.argmin(np.abs(self.wavelengths - red_wl))
+            green_idx = np.argmin(np.abs(self.wavelengths - green_wl))
+            blue_idx = np.argmin(np.abs(self.wavelengths - blue_wl))
+
+        # NEW: Apply derivative if requested (RGB mode only)
+        if not use_wavelength_colormap and derivative_order > 0:
+            # Compute derivatives for each RGB channel
+            def compute_derivative_2d(data_2d, wl_idx, order, window):
+                """Compute derivative at a specific wavelength for 2D spatial data"""
+                if order == 1:
+                    # First derivative: dI/dλ
+                    if wl_idx < window or wl_idx >= len(self.wavelengths) - window:
+                        raise ValueError(
+                            f"Wavelength index {wl_idx} too close to edge for derivative with window={window}"
+                        )
+
+                    intensity_forward = data_2d[:, :, wl_idx + window]
+                    intensity_backward = data_2d[:, :, wl_idx - window]
+                    wl_forward = self.wavelengths[wl_idx + window]
+                    wl_backward = self.wavelengths[wl_idx - window]
+
+                    derivative = (intensity_forward - intensity_backward) / (
+                        wl_forward - wl_backward
+                    )
+
+                elif order == 2:
+                    # Second derivative: d²I/dλ²
+                    if wl_idx < window or wl_idx >= len(self.wavelengths) - window:
+                        raise ValueError(
+                            f"Wavelength index {wl_idx} too close to edge for 2nd derivative with window={window}"
+                        )
+
+                    intensity_center = data_2d[:, :, wl_idx]
+                    intensity_forward = data_2d[:, :, wl_idx + window]
+                    intensity_backward = data_2d[:, :, wl_idx - window]
+
+                    h = self.wavelengths[wl_idx + window] - self.wavelengths[wl_idx]
+                    derivative = (
+                        intensity_forward - 2 * intensity_center + intensity_backward
+                    ) / (h**2)
+                else:
+                    raise ValueError(
+                        f"Invalid derivative_order: {order}. Must be 0, 1, or 2."
+                    )
+
+                return derivative
+
+            # Compute derivatives for R, G, B channels
+            R = compute_derivative_2d(
+                cube_data, red_idx, derivative_order, derivative_window
+            ).T.copy()
+            G = compute_derivative_2d(
+                cube_data, green_idx, derivative_order, derivative_window
+            ).T.copy()
+            B = compute_derivative_2d(
+                cube_data, blue_idx, derivative_order, derivative_window
+            ).T.copy()
+
+            print(
+                f"📊 Derivative order {derivative_order} computed at R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm"
+            )
+        elif not use_wavelength_colormap:
+            # Extract RGB channels - default: (tracks, slits) -> transpose to (slits, tracks) for imshow
+            R = cube_data[:, :, red_idx].T.copy()
+            G = cube_data[:, :, green_idx].T.copy()
+            B = cube_data[:, :, blue_idx].T.copy()
+
+        # Normalize each channel to [0, 1] range (RGB mode only, wavelength mode already normalized)
+        if not use_wavelength_colormap and normalize:
             for C in (R, G, B):
                 if C.max() != C.min():
                     C[:] = (C - C.min()) / (C.max() - C.min())
 
-        rgb_image = np.stack([R, G, B], axis=-1)
-        n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
+        # Create image for display
+        if use_wavelength_colormap:
+            # Single-channel wavelength image (will use colormap)
+            display_image = wavelength_image
+        else:
+            # RGB composite
+            rgb_image = np.stack([R, G, B], axis=-1)
+            display_image = rgb_image
+            n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
 
         # Apply axis transformations
         if flip_axes:
             # Swap dimensions: tracks become vertical, slits become horizontal
-            rgb_image = np.transpose(rgb_image, (1, 0, 2))  # Swap first two dimensions
+            if use_wavelength_colormap:
+                display_image = np.transpose(
+                    display_image, (1, 0)
+                )  # Swap dimensions for 2D image
+            else:
+                display_image = np.transpose(
+                    display_image, (1, 0, 2)
+                )  # Swap first two dimensions for RGB
 
         # Flip the image data itself (not just the axis labels)
         if flip_horizontal:
             # Flip left-right: reverse along axis 1 (horizontal/width)
-            rgb_image = np.flip(rgb_image, axis=1)
+            display_image = np.flip(display_image, axis=1)
 
         if flip_vertical:
             # Flip up-down: reverse along axis 0 (vertical/height)
-            rgb_image = np.flip(rgb_image, axis=0)
+            display_image = np.flip(display_image, axis=0)
 
         # Handle cropping - extract square region centered at specified coordinates
         # NOTE: Crop coordinates are specified in ORIGINAL (track, slit) space before any flips
@@ -4723,16 +5341,18 @@ class CombinedTransectCube:
                 f"   Slit pixels: {crop_slit_max - crop_slit_min}, Track pixels: {crop_track_max - crop_track_min}"
             )
 
-            # Extract cropped region from transformed rgb_image
-            # rgb_image ALWAYS starts as (n_slits, n_tracks, 3) after initial transpose
-            # After flip_axes: becomes (n_tracks, n_slits, 3)
+            # Extract cropped region from transformed display_image
+            # display_image shape depends on mode:
+            # - RGB mode: (n_slits, n_tracks, 3) initially, then transformations applied
+            # - Wavelength mode: (n_slits, n_tracks) initially, then transformations applied
+            # After flip_axes: RGB becomes (n_tracks, n_slits, 3), wavelength becomes (n_tracks, n_slits)
             # After flip_horizontal/vertical: data is flipped but shape stays same
 
             # Determine current shape and extract crop
-            current_shape = rgb_image.shape
+            current_shape = display_image.shape
 
             if flip_axes:
-                # Current shape: (n_tracks, n_slits, 3)
+                # Current shape: (n_tracks, n_slits) or (n_tracks, n_slits, 3)
                 # Axis 0 = tracks, Axis 1 = slits
                 # Need to account for flips that were applied to the data
                 if flip_vertical:
@@ -4766,13 +5386,59 @@ class CombinedTransectCube:
                     col_slice = slice(crop_track_min, crop_track_max)
 
             # Extract the crop
-            rgb_image = rgb_image[row_slice, col_slice, :]
+            if use_wavelength_colormap:
+                # 2D image
+                display_image = display_image[row_slice, col_slice]
+            else:
+                # RGB image
+                display_image = display_image[row_slice, col_slice, :]
             crop_applied = True
 
             print(
                 f"🔍 Crop applied: track [{crop_track_min}:{crop_track_max}], slit [{crop_slit_min}:{crop_slit_max}]"
             )
-            print(f"   Resulting shape: {rgb_image.shape}")
+            print(f"   Resulting shape: {display_image.shape}")
+
+            # Print raw intensity range AFTER cropping (before normalization)
+            if use_wavelength_colormap:
+                crop_min = np.nanmin(display_image)
+                crop_max = np.nanmax(display_image)
+                print(
+                    f"   📊 Raw intensity range of CROPPED region (before normalization): [{crop_min:.6f}, {crop_max:.6f}]"
+                )
+
+        # CRITICAL: Apply normalization AFTER cropping for wavelength mode
+        # This ensures percentiles are computed on the displayed region, not the full transect
+        if use_wavelength_colormap and normalize:
+            # Use fixed vmin/vmax if provided, otherwise compute percentiles
+            if vmin is not None and vmax is not None:
+                intensity_min = vmin
+                intensity_max = vmax
+                print(f"✨ Normalization applied AFTER crop:")
+                print(
+                    f"   🔒 FIXED normalization range (user-specified): [{intensity_min:.6f}, {intensity_max:.6f}]"
+                )
+            else:
+                # Normalize the cropped region using percentile-based scaling
+                intensity_min = np.nanpercentile(display_image, 2)
+                intensity_max = np.nanpercentile(display_image, 98)
+                print(f"✨ Normalization applied AFTER crop:")
+                print(
+                    f"   📊 AUTO percentile range (2nd-98th): [{intensity_min:.6f}, {intensity_max:.6f}]"
+                )
+
+            if intensity_max > intensity_min:
+                display_image = (display_image - intensity_min) / (
+                    intensity_max - intensity_min
+                )
+                # Clip to [0, 1] to handle values outside percentile range
+                display_image = np.clip(display_image, 0, 1)
+            else:
+                display_image = np.zeros_like(display_image)
+
+            print(
+                f"   Normalized output range: [{np.nanmin(display_image):.4f}, {np.nanmax(display_image):.4f}]"
+            )
 
         # Set up extent (defines coordinate range for axes) - keep axes consistent with actual data
         if crop_applied:
@@ -4807,31 +5473,53 @@ class CombinedTransectCube:
         # Origin is always 'lower' now since we flip the actual data
         origin = "lower"
 
-        # Helper function to transform coordinates based on flipping
+        # Helper function to transform coordinates based on flipping and cropping
         def transform_coords(track, slit):
-            """Transform track/slit coordinates based on flip settings"""
+            """Transform track/slit coordinates based on flip settings and crop offset.
+
+            INPUT: track, slit in ORIGINAL full-image coordinates
+            OUTPUT: x_coord, y_coord in display coordinates (accounting for crop + flips)
+            """
+            # The extent is set in original coordinates, and imshow with extent uses
+            # data coordinates directly. When we flip the DATA, the coordinate system
+            # in the extent needs to be adjusted to match.
+
             # Transform based on actual data flipping
             if flip_axes:
-                # After axis swap: x=slit, y=track
+                # After axis swap: x=slit, y=track (in original coordinate space)
                 x_coord = slit
                 y_coord = track
-                # Apply flips (these were applied to the data)
+                # When we flip the data horizontally/vertically, we need to mirror
+                # the coordinates within the extent range (not the full image range)
                 if flip_horizontal:
-                    x_coord = n_slits - 1 - x_coord
+                    # Mirror x within its extent range
+                    if crop_applied:
+                        x_coord = crop_slit_min + crop_slit_max - x_coord
+                    else:
+                        x_coord = n_slits - 1 - x_coord
                 if flip_vertical:
-                    y_coord = n_tracks - 1 - y_coord
+                    # Mirror y within its extent range
+                    if crop_applied:
+                        y_coord = crop_track_min + crop_track_max - y_coord
+                    else:
+                        y_coord = n_tracks - 1 - y_coord
             else:
-                # Default: x=track, y=slit
+                # Default: x=track, y=slit (in original coordinate space)
                 x_coord = track
                 y_coord = slit
-                # Apply flips (these were applied to the data)
+                # Apply flips within the appropriate range
                 if flip_horizontal:
-                    x_coord = n_tracks - 1 - x_coord
+                    if crop_applied:
+                        x_coord = crop_track_min + crop_track_max - x_coord
+                    else:
+                        x_coord = n_tracks - 1 - x_coord
                 if flip_vertical:
-                    y_coord = n_slits - 1 - y_coord
-            return x_coord, y_coord
+                    if crop_applied:
+                        y_coord = crop_slit_min + crop_slit_max - y_coord
+                    else:
+                        y_coord = n_slits - 1 - y_coord
+            return x_coord, y_coord  # Set up figure size
 
-        # Set up figure size
         if figsize is None:
             if crop_applied:
                 # For cropped images, make it square with reasonable size
@@ -4843,12 +5531,31 @@ class CombinedTransectCube:
 
         # For cropped images, use aspect='auto' but with square figsize
         # aspect='equal' causes matplotlib to adjust limits beyond the extent
-        ax.imshow(
-            rgb_image,
-            aspect="auto",
-            origin=origin,
-            extent=[x_min, x_max, y_min, y_max],
-        )
+        if use_wavelength_colormap:
+            # Single-wavelength colormap mode
+            im = ax.imshow(
+                display_image,
+                aspect="auto",
+                origin=origin,
+                extent=[x_min, x_max, y_min, y_max],
+                cmap=wavelength_cmap,
+                vmin=0,
+                vmax=1,
+            )
+            # Add colorbar for wavelength mode
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(
+                f"{derivative_label if derivative_order > 0 else 'Intensity'}\n(white = min, color = max)",
+                fontsize=11,
+            )
+        else:
+            # RGB composite mode
+            ax.imshow(
+                display_image,
+                aspect="auto",
+                origin=origin,
+                extent=[x_min, x_max, y_min, y_max],
+            )
 
         # Force the axis limits to match the extent exactly when cropping
         if crop_applied:
@@ -4856,7 +5563,7 @@ class CombinedTransectCube:
             ax.set_ylim(y_min, y_max)
 
         print(f"📊 Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]")
-        print(f"📐 Image shape after transformations: {rgb_image.shape}")
+        print(f"📐 Image shape after transformations: {display_image.shape}")
 
         # Note: Overlays are disabled when cropping is applied, as they would reference
         # coordinates outside the cropped region which could be misleading
@@ -4945,7 +5652,7 @@ class CombinedTransectCube:
                 )
 
         # NEW: Handle multiple ROIs
-        if roi_collection is not None and not crop_applied:
+        if roi_collection is not None:
             # Helper function to sort ROIs in display order
             def sort_rois_by_category(roi_dict):
                 """Sort ROIs: single bombs → double → triple → dark features → sediment"""
@@ -5003,12 +5710,22 @@ class CombinedTransectCube:
             # Plot each ROI with different color
             for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
                 if roi_pixels_list:
-                    # Validate coordinates
-                    valid_rois = [
-                        (slit, track)
-                        for slit, track in roi_pixels_list
-                        if 0 <= slit < n_slits and 0 <= track < n_tracks
-                    ]
+                    # NEW: Filter ROIs based on crop boundaries (if cropping is applied)
+                    if crop_applied:
+                        # Filter ROIs that fall within the crop region (using ORIGINAL coordinates)
+                        valid_rois = [
+                            (slit, track)
+                            for slit, track in roi_pixels_list
+                            if crop_slit_min <= slit < crop_slit_max
+                            and crop_track_min <= track < crop_track_max
+                        ]
+                    else:
+                        # No cropping: validate against full image bounds
+                        valid_rois = [
+                            (slit, track)
+                            for slit, track in roi_pixels_list
+                            if 0 <= slit < n_slits and 0 <= track < n_tracks
+                        ]
 
                     if valid_rois:
                         roi_tracks = [track for slit, track in valid_rois]
@@ -5024,6 +5741,21 @@ class CombinedTransectCube:
                             x, y = transform_coords(track, slit)
                             roi_x_coords.append(x)
                             roi_y_coords.append(y)
+
+                        # DEBUG: Print first few transformed coordinates
+                        if crop_applied and len(valid_rois) > 0:
+                            print(
+                                f"🔍 DEBUG ROI '{roi_name}': {len(valid_rois)} pixels"
+                            )
+                            print(
+                                f"   First 3 original: slit={roi_slits[:3]}, track={roi_tracks[:3]}"
+                            )
+                            print(
+                                f"   First 3 transformed: x={roi_x_coords[:3]}, y={roi_y_coords[:3]}"
+                            )
+                            print(
+                                f"   Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]"
+                            )
 
                         # Plot ROI with unique color (using transformed coordinates)
                         plt.scatter(
@@ -5061,12 +5793,21 @@ class CombinedTransectCube:
                                 )
 
         # Backward compatibility: single ROI support
-        elif roi_pixels is not None and len(roi_pixels) > 0 and not crop_applied:
-            valid_rois = [
-                (slit, track)
-                for slit, track in roi_pixels
-                if 0 <= slit < n_slits and 0 <= track < n_tracks
-            ]
+        elif roi_pixels is not None and len(roi_pixels) > 0:
+            # Filter ROIs based on crop boundaries (if cropping is applied)
+            if crop_applied:
+                valid_rois = [
+                    (slit, track)
+                    for slit, track in roi_pixels
+                    if crop_slit_min <= slit < crop_slit_max
+                    and crop_track_min <= track < crop_track_max
+                ]
+            else:
+                valid_rois = [
+                    (slit, track)
+                    for slit, track in roi_pixels
+                    if 0 <= slit < n_slits and 0 <= track < n_tracks
+                ]
 
             if valid_rois:
                 roi_tracks = [track for slit, track in valid_rois]
@@ -5118,7 +5859,26 @@ class CombinedTransectCube:
         else:
             files_str = f"{file_names[0]}, {file_names[1]}, ... {file_names[-1]} ({len(file_names)} files)"
 
-        title = f"RGB Composite - {files_str}\n(R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm)"
+        # Add derivative info to title
+        if use_wavelength_colormap:
+            # Single-wavelength mode: show wavelength, not RGB channels
+            if derivative_order == 0:
+                title_prefix = f"{wavelength_colormap_target:.1f} nm Single Wavelength"
+            elif derivative_order == 1:
+                title_prefix = f"{wavelength_colormap_target:.1f} nm (1st Derivative)"
+            else:
+                title_prefix = f"{wavelength_colormap_target:.1f} nm (2nd Derivative)"
+            title = f"{title_prefix} - {files_str}"
+        else:
+            # RGB composite mode: show RGB wavelengths
+            derivative_labels = {
+                0: "RGB Composite",
+                1: "RGB 1st Derivative (dI/dλ)",
+                2: "RGB 2nd Derivative (d²I/dλ²)",
+            }
+            title_prefix = derivative_labels.get(derivative_order, "RGB Composite")
+            title = f"{title_prefix} - {files_str}\n(R={red_wl}nm, G={green_wl}nm, B={blue_wl}nm)"
+
         if use_corrected:
             title = "Corrected " + title
         plt.title(title, fontsize=12, fontweight="bold")
@@ -10277,6 +11037,485 @@ class CombinedTransectCube:
 
         plt.tight_layout()
         plt.show()
+
+    def apply_mnf_transform(self, use_corrected=True, n_components=20, quiet=False):
+        """
+        Apply MNF (Minimum Noise Fraction) transformation to hyperspectral data.
+
+        MNF is a two-step process:
+        1. Noise whitening: Decorrelate and scale noise based on noise covariance
+        2. Signal transformation: PCA on whitened data to maximize SNR
+
+        Parameters:
+        -----------
+        use_corrected : bool
+            Use illumination-corrected data (default: True)
+        n_components : int
+            Number of MNF components to compute (default: 20)
+        quiet : bool
+            Suppress progress messages (default: False)
+
+        Stores:
+        -------
+        self.mnf_data : ndarray
+            Transformed data (n_tracks, n_slits, n_components)
+        self.mnf_eigenvalues : ndarray
+            MNF eigenvalues (signal-to-noise ratios)
+        self.mnf_explained_variance : ndarray
+            Fraction of total variance explained by each component
+        self.mnf_cumulative_variance : ndarray
+            Cumulative explained variance
+        self.mnf_transformation_matrix : ndarray
+            Combined transformation matrix (noise whitening + PCA)
+
+        Example:
+        --------
+            cube.apply_mnf_transform(use_corrected=True, n_components=20)
+            print(f"Top 3 components explain {cube.mnf_cumulative_variance[2]*100:.1f}% of variance")
+        """
+        from sklearn.decomposition import PCA
+        import numpy as np
+
+        if not quiet:
+            print("🔬 Computing MNF transformation...")
+            print(f"   Using {'corrected' if use_corrected else 'raw'} data")
+
+        # Get data
+        if (
+            use_corrected
+            and hasattr(self, "data_corrected")
+            and self.data_corrected is not None
+        ):
+            data = self.data_corrected
+            if not quiet:
+                print(f"   ✅ Using corrected data")
+        else:
+            data = self.data
+            if not quiet:
+                print(f"   ⚠️  Using raw data (no correction available)")
+
+        n_tracks, n_slits, n_bands = data.shape
+        if not quiet:
+            print(
+                f"   Data shape: {n_tracks} tracks × {n_slits} slits × {n_bands} bands"
+            )
+
+        # Reshape to 2D: (n_pixels, n_bands)
+        data_2d = data.reshape(-1, n_bands)
+        n_pixels = data_2d.shape[0]
+
+        # Remove NaN/Inf values
+        valid_mask = np.isfinite(data_2d).all(axis=1)
+        data_valid = data_2d[valid_mask]
+        n_valid = data_valid.shape[0]
+        if not quiet:
+            print(f"   Total pixels: {n_pixels:,}")
+            print(f"   Valid pixels: {n_valid:,} ({100*n_valid/n_pixels:.1f}%)")
+
+        # Step 1: Estimate noise covariance
+        if not quiet:
+            print("\n📊 Step 1: Estimating noise covariance...")
+            print("   Using difference between adjacent pixels (track direction)")
+
+        # Reshape back temporarily to compute differences
+        data_3d_valid = np.full((n_tracks, n_slits, n_bands), np.nan)
+        data_3d_valid[valid_mask.reshape(n_tracks, n_slits)] = data_valid
+
+        # Compute differences along track direction (axis 0)
+        noise_samples = []
+        for i in range(n_tracks - 1):
+            diff = data_3d_valid[i + 1, :, :] - data_3d_valid[i, :, :]
+            diff_valid = diff[np.isfinite(diff).all(axis=1)]
+            if len(diff_valid) > 0:
+                noise_samples.append(diff_valid)
+
+        noise_data = np.vstack(noise_samples)
+        if not quiet:
+            print(f"   Noise samples: {noise_data.shape[0]:,}")
+
+        # Noise covariance matrix (differences have 2x noise variance)
+        noise_cov = np.cov(noise_data.T) / 2.0
+
+        # Step 2: Noise whitening
+        if not quiet:
+            print("\n🔄 Step 2: Noise whitening transformation...")
+
+        # Eigendecomposition of noise covariance
+        noise_eigenvalues, noise_eigenvectors = np.linalg.eigh(noise_cov)
+
+        # Sort in descending order
+        idx = np.argsort(noise_eigenvalues)[::-1]
+        noise_eigenvalues = noise_eigenvalues[idx]
+        noise_eigenvectors = noise_eigenvectors[:, idx]
+
+        # Whitening matrix: D^(-1/2) * V^T where noise_cov = V * D * V^T
+        # Add small regularization to avoid division by very small values
+        epsilon = 1e-10
+        noise_inv_sqrt = np.diag(1.0 / np.sqrt(noise_eigenvalues + epsilon))
+        whitening_matrix = noise_inv_sqrt @ noise_eigenvectors.T
+
+        # Apply whitening
+        data_whitened = data_valid @ whitening_matrix.T
+        if not quiet:
+            print(f"   Whitened data shape: {data_whitened.shape}")
+
+        # Step 3: PCA on whitened data
+        if not quiet:
+            print("\n📈 Step 3: PCA on whitened data...")
+        pca = PCA(n_components=min(n_components, n_bands))
+        mnf_scores = pca.fit_transform(data_whitened)
+
+        if not quiet:
+            print(f"   MNF components computed: {pca.n_components_}")
+            print(f"   Explained variance (top 5): {pca.explained_variance_ratio_[:5]}")
+            print(
+                f"   Cumulative variance (top 5): {np.cumsum(pca.explained_variance_ratio_)[:5]}"
+            )
+
+        # Reshape back to 3D
+        mnf_data_3d = np.full((n_tracks, n_slits, pca.n_components_), np.nan)
+        mnf_data_3d[valid_mask.reshape(n_tracks, n_slits)] = mnf_scores
+
+        # Store results
+        self.mnf_data = mnf_data_3d
+        self.mnf_eigenvalues = pca.explained_variance_
+        self.mnf_explained_variance = pca.explained_variance_ratio_
+        self.mnf_cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+        self.mnf_transformation_matrix = whitening_matrix.T @ pca.components_.T
+        self.mnf_pca_model = pca
+        self.mnf_whitening_matrix = whitening_matrix
+
+        if not quiet:
+            print(f"\n✅ MNF transformation complete!")
+            print(f"   Output shape: {mnf_data_3d.shape}")
+            print(
+                f"   Top 3 components explain {self.mnf_cumulative_variance[2]*100:.1f}% of variance"
+            )
+
+        return {
+            "mnf_data": mnf_data_3d,
+            "eigenvalues": self.mnf_eigenvalues,
+            "explained_variance": self.mnf_explained_variance,
+            "cumulative_variance": self.mnf_cumulative_variance,
+        }
+
+    def plot_mnf_rgb(
+        self,
+        components=[1, 2, 3],
+        flip_axes=True,
+        flip_horizontal=False,
+        flip_vertical=False,
+        crop_center_track=None,
+        crop_center_slit=None,
+        crop_width=None,
+        crop_aspect_ratio=3.5,
+        roi_collection=None,
+        roi_marker_size=200,
+        roi_legend_loc="outside",
+        roi_marker_edgewidth=0,
+        roi_legend_markersize=10,
+        roi_show_numbers=False,
+        figsize=(8, 8),
+        title=None,
+        percentile_stretch=(2, 98),
+    ):
+        """
+        Plot MNF components as RGB composite (like plot_rgb but with MNF data).
+
+        Parameters:
+        -----------
+        components : list of int
+            Which MNF components to use for [Red, Green, Blue]. Default [1,2,3]
+            uses MNF1=R, MNF2=G, MNF3=B. Component indices are 1-based.
+        flip_axes : bool
+            Transpose the image (swap track and slit axes)
+        flip_horizontal : bool
+            Mirror the image horizontally
+        flip_vertical : bool
+            Mirror the image vertically
+        crop_center_track : int, optional
+            Track index for crop center (in original coordinates)
+        crop_center_slit : int, optional
+            Slit index for crop center (in original coordinates)
+        crop_width : int, optional
+            Width of crop in slit pixels
+        crop_aspect_ratio : float
+            Physical aspect ratio (track:slit pixel size, default 3.5 for UHI)
+        roi_collection : str, list, or dict, optional
+            ROI collection to overlay. Can be "all", list of names, or dict
+        roi_marker_size : int
+            Size of ROI markers (default: 200)
+        roi_legend_loc : str
+            Legend location ("outside", "upper right", etc.)
+        roi_marker_edgewidth : int
+            Edge width of ROI markers (default: 0)
+        roi_legend_markersize : int
+            Size of markers in legend (default: 10)
+        roi_show_numbers : bool
+            Show ROI numbers on plot (default: False)
+        figsize : tuple
+            Figure size (width, height) in inches
+        title : str, optional
+            Plot title (auto-generated if None)
+        percentile_stretch : tuple
+            Percentile values for contrast stretching (default 2nd-98th percentile)
+
+        Example:
+        --------
+            # Basic usage
+            cube.plot_mnf_rgb(components=[1, 2, 3])
+
+            # With cropping and ROIs
+            cube.plot_mnf_rgb(
+                components=[1, 3, 4],
+                flip_axes=True,
+                flip_horizontal=True,
+                crop_center_track=5592,
+                crop_center_slit=765,
+                crop_width=500,
+                roi_collection=roi_3,
+                roi_legend_loc="outside"
+            )
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if not hasattr(self, "mnf_data"):
+            print("❌ MNF data not found! Run apply_mnf_transform() first.")
+            return
+
+        # Validate components
+        max_comp = self.mnf_data.shape[2]
+        for comp in components:
+            if comp < 1 or comp > max_comp:
+                print(f"❌ Component {comp} out of range! Available: 1-{max_comp}")
+                return
+
+        print(f"🎨 Plotting MNF RGB composite:")
+        print(f"   Red   = MNF{components[0]}")
+        print(f"   Green = MNF{components[1]}")
+        print(f"   Blue  = MNF{components[2]}")
+
+        # Extract MNF components (convert to 0-indexed)
+        R = self.mnf_data[:, :, components[0] - 1].copy()
+        G = self.mnf_data[:, :, components[1] - 1].copy()
+        B = self.mnf_data[:, :, components[2] - 1].copy()
+
+        # Stack into RGB
+        rgb_image = np.stack([R, G, B], axis=2)
+        n_tracks, n_slits = R.shape
+
+        print(f"   Image shape: {n_tracks} tracks × {n_slits} slits")
+
+        # Handle cropping
+        crop_applied = False
+        if (
+            crop_center_track is not None
+            and crop_center_slit is not None
+            and crop_width is not None
+        ):
+            half_width_slit = crop_width // 2
+            half_width_track = int(crop_width / crop_aspect_ratio / 2)
+
+            crop_track_min = max(0, crop_center_track - half_width_track)
+            crop_track_max = min(n_tracks, crop_center_track + half_width_track)
+            crop_slit_min = max(0, crop_center_slit - half_width_slit)
+            crop_slit_max = min(n_slits, crop_center_slit + half_width_slit)
+
+            rgb_image = rgb_image[
+                crop_track_min:crop_track_max, crop_slit_min:crop_slit_max, :
+            ]
+            crop_applied = True
+            print(
+                f"   📦 Cropped to: track [{crop_track_min}:{crop_track_max}], slit [{crop_slit_min}:{crop_slit_max}]"
+            )
+
+        # Apply flips
+        if flip_axes:
+            rgb_image = np.transpose(rgb_image, (1, 0, 2))
+        if flip_horizontal:
+            rgb_image = np.flip(rgb_image, axis=1)
+        if flip_vertical:
+            rgb_image = np.flip(rgb_image, axis=0)
+
+        # Normalize each channel independently using percentile stretch
+        rgb_normalized = np.zeros_like(rgb_image)
+        for i in range(3):
+            channel = rgb_image[:, :, i]
+            valid = channel[np.isfinite(channel)]
+            if len(valid) > 0:
+                p_low, p_high = np.percentile(valid, percentile_stretch)
+                channel_stretched = np.clip((channel - p_low) / (p_high - p_low), 0, 1)
+                rgb_normalized[:, :, i] = channel_stretched
+                print(
+                    f"   Channel {i} ({['Red','Green','Blue'][i]}): [{p_low:.3f}, {p_high:.3f}]"
+                )
+
+        # Plot
+        fig, ax = plt.subplots(figsize=figsize)
+
+        if crop_applied:
+            if flip_axes:
+                extent = [crop_slit_min, crop_slit_max, crop_track_min, crop_track_max]
+            else:
+                extent = [crop_track_min, crop_track_max, crop_slit_min, crop_slit_max]
+        else:
+            if flip_axes:
+                extent = [0, n_slits, 0, n_tracks]
+            else:
+                extent = [0, n_tracks, 0, n_slits]
+
+        ax.imshow(rgb_normalized, aspect="auto", origin="lower", extent=extent)
+
+        if crop_applied:
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+
+        # Add ROIs if requested
+        if roi_collection is not None and hasattr(self, "roi_collection"):
+            # Determine which ROIs to plot
+            if roi_collection == "all":
+                rois_to_plot = self.roi_collection
+            elif isinstance(roi_collection, list):
+                rois_to_plot = {
+                    name: self.roi_collection[name]
+                    for name in roi_collection
+                    if name in self.roi_collection
+                }
+            elif isinstance(roi_collection, dict):
+                rois_to_plot = roi_collection
+            else:
+                rois_to_plot = {}
+
+            # Plot each ROI
+            for roi_name, roi_pixels in rois_to_plot.items():
+                if crop_applied:
+                    # Filter ROIs within crop
+                    valid_rois = [
+                        (slit, track)
+                        for slit, track in roi_pixels
+                        if crop_slit_min <= slit < crop_slit_max
+                        and crop_track_min <= track < crop_track_max
+                    ]
+                else:
+                    valid_rois = [
+                        (slit, track)
+                        for slit, track in roi_pixels
+                        if 0 <= slit < n_slits and 0 <= track < n_tracks
+                    ]
+
+                if valid_rois:
+                    roi_tracks = [track for slit, track in valid_rois]
+                    roi_slits = [slit for slit, track in valid_rois]
+
+                    # Get color (use same color method as plot_rgb)
+                    color = self._get_roi_color(
+                        roi_name, ["yellow", "cyan", "magenta"], None
+                    )
+
+                    # Transform coordinates
+                    if flip_axes:
+                        x_coords = roi_slits
+                        y_coords = roi_tracks
+                        if flip_horizontal:
+                            if crop_applied:
+                                x_coords = [
+                                    crop_slit_min + crop_slit_max - x for x in x_coords
+                                ]
+                            else:
+                                x_coords = [n_slits - 1 - x for x in x_coords]
+                    else:
+                        x_coords = roi_tracks
+                        y_coords = roi_slits
+                        if flip_horizontal:
+                            if crop_applied:
+                                x_coords = [
+                                    crop_track_min + crop_track_max - x
+                                    for x in x_coords
+                                ]
+                            else:
+                                x_coords = [n_tracks - 1 - x for x in x_coords]
+
+                    if flip_vertical:
+                        if flip_axes:
+                            if crop_applied:
+                                y_coords = [
+                                    crop_track_min + crop_track_max - y
+                                    for y in y_coords
+                                ]
+                            else:
+                                y_coords = [n_tracks - 1 - y for y in y_coords]
+                        else:
+                            if crop_applied:
+                                y_coords = [
+                                    crop_slit_min + crop_slit_max - y for y in y_coords
+                                ]
+                            else:
+                                y_coords = [n_slits - 1 - y for y in y_coords]
+
+                    ax.scatter(
+                        x_coords,
+                        y_coords,
+                        c=color,
+                        s=roi_marker_size,
+                        marker="s",
+                        edgecolors="black" if roi_marker_edgewidth > 0 else "none",
+                        linewidths=roi_marker_edgewidth,
+                        alpha=0.8,
+                        label=f"{roi_name} ({len(valid_rois)})",
+                    )
+
+                    # Show ROI numbers if requested
+                    if roi_show_numbers and len(valid_rois) > 0:
+                        center_x = np.mean(x_coords)
+                        center_y = np.mean(y_coords)
+                        ax.text(
+                            center_x,
+                            center_y,
+                            roi_name,
+                            color="white",
+                            fontsize=10,
+                            ha="center",
+                            va="center",
+                            bbox=dict(
+                                facecolor="black", alpha=0.5, edgecolor="none", pad=2
+                            ),
+                        )
+
+            # Add legend
+            if roi_legend_loc and roi_legend_loc != "none":
+                if roi_legend_loc == "outside":
+                    ax.legend(
+                        bbox_to_anchor=(1.05, 1),
+                        loc="upper left",
+                        markerscale=roi_legend_markersize / 100,
+                    )
+                else:
+                    ax.legend(
+                        loc=roi_legend_loc, markerscale=roi_legend_markersize / 100
+                    )
+
+        # Labels
+        if flip_axes:
+            ax.set_xlabel("Slit Pixel Index", fontsize=11)
+            ax.set_ylabel("Track Index", fontsize=11)
+        else:
+            ax.set_xlabel("Track Index", fontsize=11)
+            ax.set_ylabel("Slit Pixel Index", fontsize=11)
+
+        if title:
+            ax.set_title(title, fontsize=13, fontweight="bold")
+        else:
+            ax.set_title(
+                f"MNF RGB Composite (MNF{components[0]}-{components[1]}-{components[2]})",
+                fontsize=13,
+                fontweight="bold",
+            )
+
+        plt.tight_layout()
+        plt.show()
+
+        print(f"\n✅ MNF RGB plot complete!")
 
 
 # ------------------------- convenience -------------------------
