@@ -948,6 +948,22 @@ class CombinedTransectCube:
         north_arrow_position="upper right",  # Position: 'lower left', 'lower right', 'upper left', 'upper right'
         north_arrow_size=0.08,  # Size of north arrow relative to plot (0.0-1.0)
         north_arrow_color="black",  # Color of north arrow
+        # Single-wavelength colormap options (NEW - from plot_rgb)
+        use_wavelength_colormap=False,  # If True, plot single wavelength with natural color
+        wavelength_colormap_target=None,  # Target wavelength (nm) for single-wavelength mode
+        derivative_order=0,  # Derivative order: 0=raw, 1=first derivative, 2=second derivative
+        derivative_window=2,  # Window size for derivative computation
+        vmin=(
+            0.53,
+            0.58,
+            0.2,
+        ),  # Manual min value for colormap normalization (single value or per-channel tuple)
+        vmax=(
+            1.35,
+            1.37,
+            1.73,
+        ),  # Manual max value for colormap normalization (single value or per-channel tuple)
+        colorbar_fraction=0.046,  # Size of colorbar relative to main plot
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -1149,30 +1165,215 @@ class CombinedTransectCube:
         else:
             origin = None
 
+        # Initialize wavelength colormap variables (will be populated if use_wavelength_colormap=True)
+        mesh = None
+        wavelength_intensity_raw = None
+        actual_wl = None
+
         with _silence() as stack:
             if quiet:
                 stack.enter_context(warnings.catch_warnings())
                 warnings.simplefilter("ignore")
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
 
-            if use_corrected:
-                if not hasattr(self, "data_corrected") or self.data_corrected is None:
+            # NEW: Single-wavelength colormap mode
+            if use_wavelength_colormap:
+                if wavelength_colormap_target is None:
                     raise ValueError(
-                        "Corrected data not available. Run apply_illumination_correction() first."
+                        "wavelength_colormap_target must be specified when use_wavelength_colormap=True"
                     )
+
+                # Get data cube
+                if use_corrected:
+                    if (
+                        not hasattr(self, "data_corrected")
+                        or self.data_corrected is None
+                    ):
+                        raise ValueError(
+                            "Corrected data not available. Run apply_illumination_correction() first."
+                        )
+                    cube_data = self.data_corrected
+                else:
+                    cube_data = self.data
+
                 X_ecef, Y_ecef, Z_ecef = self.X_ecef, self.Y_ecef, self.Z_ecef
-                R, G, B = self._extract_rgb_from_cube(
-                    self.data_corrected, red_wl, green_wl, blue_wl
+
+                # Import the colormap creation function
+                from ..ndi_analysis_utils import create_wavelength_colormap
+
+                # Find closest wavelength index
+                wl_idx = np.argmin(
+                    np.abs(self.wavelengths - wavelength_colormap_target)
                 )
-                if normalize:
-                    for C in (R, G, B):
-                        m, M = np.nanmin(C), np.nanmax(C)
-                        if np.isfinite(m) and np.isfinite(M) and M > m:
-                            C[:] = (C - m) / (M - m)
+                actual_wl = self.wavelengths[wl_idx]
+
+                if not quiet:
+                    print(f"🎨 Single-wavelength georef mode: {actual_wl:.1f} nm")
+
+                # Compute intensity based on derivative order
+                if derivative_order == 0:
+                    # Raw intensity
+                    intensity_map = cube_data[:, :, wl_idx].copy()
+                    derivative_label = "Raw Intensity"
+                elif derivative_order == 1:
+                    # First derivative: dI/dλ
+                    if (
+                        wl_idx < derivative_window
+                        or wl_idx >= len(self.wavelengths) - derivative_window
+                    ):
+                        raise ValueError(
+                            f"Wavelength {wavelength_colormap_target} nm too close to edge for derivative with window={derivative_window}"
+                        )
+
+                    intensity_forward = cube_data[:, :, wl_idx + derivative_window]
+                    intensity_backward = cube_data[:, :, wl_idx - derivative_window]
+                    wl_forward = self.wavelengths[wl_idx + derivative_window]
+                    wl_backward = self.wavelengths[wl_idx - derivative_window]
+
+                    intensity_map = (intensity_forward - intensity_backward) / (
+                        wl_forward - wl_backward
+                    )
+                    derivative_label = "1st Derivative (dI/dλ)"
+                elif derivative_order == 2:
+                    # Second derivative: d²I/dλ²
+                    if (
+                        wl_idx < derivative_window
+                        or wl_idx >= len(self.wavelengths) - derivative_window
+                    ):
+                        raise ValueError(
+                            f"Wavelength {wavelength_colormap_target} nm too close to edge for derivative with window={derivative_window}"
+                        )
+
+                    intensity_center = cube_data[:, :, wl_idx]
+                    intensity_forward = cube_data[:, :, wl_idx + derivative_window]
+                    intensity_backward = cube_data[:, :, wl_idx - derivative_window]
+                    h = (
+                        self.wavelengths[wl_idx + derivative_window]
+                        - self.wavelengths[wl_idx]
+                    )
+
+                    intensity_map = (
+                        intensity_forward - 2 * intensity_center + intensity_backward
+                    ) / (h**2)
+                    derivative_label = "2nd Derivative (d²I/dλ²)"
+                else:
+                    raise ValueError(
+                        f"derivative_order must be 0, 1, or 2, got {derivative_order}"
+                    )
+
+                # IMPORTANT: In wavelength mode, vmin/vmax might be RGB tuples from default parameters
+                # We need scalar values for single-wavelength normalization
+                vmin_for_wavelength = vmin
+                vmax_for_wavelength = vmax
+                
+                if isinstance(vmin, (tuple, list)) and len(vmin) > 1:
+                    # Convert RGB tuple to scalar (use mean of the three channels)
+                    vmin_for_wavelength = np.mean(vmin)
+                    if not quiet:
+                        print(f"⚠️  Converted vmin tuple {vmin} to scalar {vmin_for_wavelength:.4f}")
+                
+                if isinstance(vmax, (tuple, list)) and len(vmax) > 1:
+                    # Convert RGB tuple to scalar (use mean of the three channels)
+                    vmax_for_wavelength = np.mean(vmax)
+                    if not quiet:
+                        print(f"⚠️  Converted vmax tuple {vmax} to scalar {vmax_for_wavelength:.4f}")
+
+                # Normalize to [0, 1] range
+                if vmin_for_wavelength is not None and vmax_for_wavelength is not None:
+                    # User-specified range
+                    intensity_normalized = np.clip(
+                        (intensity_map - vmin_for_wavelength) / (vmax_for_wavelength - vmin_for_wavelength), 0, 1
+                    )
+                else:
+                    # Auto range
+                    intensity_min = np.nanmin(intensity_map)
+                    intensity_max = np.nanmax(intensity_map)
+                    if intensity_max > intensity_min:
+                        intensity_normalized = (intensity_map - intensity_min) / (
+                            intensity_max - intensity_min
+                        )
+                    else:
+                        intensity_normalized = np.zeros_like(intensity_map)
+
+                # Create RGB from normalized intensity using wavelength colormap
+                wavelength_cmap = create_wavelength_colormap(actual_wl)
+                wavelength_rgba = wavelength_cmap(intensity_normalized)
+                R = wavelength_rgba[:, :, 0]
+                G = wavelength_rgba[:, :, 1]
+                B = wavelength_rgba[:, :, 2]
+
+                # Store colormap info for later use
+                wavelength_colormap_obj = wavelength_cmap
+                wavelength_intensity_raw = intensity_map
+
             else:
-                X_ecef, Y_ecef, Z_ecef, R, G, B = self._rgb_from_wavelengths(
-                    red_wl, green_wl, blue_wl, normalize
-                )
+                # Standard RGB mode
+                if use_corrected:
+                    if (
+                        not hasattr(self, "data_corrected")
+                        or self.data_corrected is None
+                    ):
+                        raise ValueError(
+                            "Corrected data not available. Run apply_illumination_correction() first."
+                        )
+                    X_ecef, Y_ecef, Z_ecef = self.X_ecef, self.Y_ecef, self.Z_ecef
+                    R, G, B = self._extract_rgb_from_cube(
+                        self.data_corrected, red_wl, green_wl, blue_wl
+                    )
+                    if normalize:
+                        # Check if vmin/vmax are provided for manual normalization
+                        if vmin is not None and vmax is not None:
+                            # Support both single values and per-channel tuples
+                            if isinstance(vmin, (tuple, list)) and isinstance(
+                                vmax, (tuple, list)
+                            ):
+                                # Per-channel normalization
+                                if len(vmin) != 3 or len(vmax) != 3:
+                                    raise ValueError(
+                                        f"vmin and vmax must have 3 values for per-channel normalization, got {len(vmin)} and {len(vmax)}"
+                                    )
+                                for i, (C, ch_name) in enumerate(
+                                    [(R, "Red"), (G, "Green"), (B, "Blue")]
+                                ):
+                                    ch_min, ch_max = vmin[i], vmax[i]
+                                    if ch_max > ch_min:
+                                        C[:] = np.clip(
+                                            (C - ch_min) / (ch_max - ch_min), 0, 1
+                                        )
+                                    else:
+                                        raise ValueError(
+                                            f"{ch_name} channel: vmax ({ch_max}) must be > vmin ({ch_min})"
+                                        )
+                                if not quiet:
+                                    print(
+                                        f"✨ Manual per-channel normalization applied:"
+                                    )
+                                    print(f"   Red:   [{vmin[0]:.4f}, {vmax[0]:.4f}]")
+                                    print(f"   Green: [{vmin[1]:.4f}, {vmax[1]:.4f}]")
+                                    print(f"   Blue:  [{vmin[2]:.4f}, {vmax[2]:.4f}]")
+                            else:
+                                # Single value normalization (same range for all channels)
+                                if vmax > vmin:
+                                    for C in (R, G, B):
+                                        C[:] = np.clip((C - vmin) / (vmax - vmin), 0, 1)
+                                    if not quiet:
+                                        print(
+                                            f"✨ Manual normalization applied to all channels: [{vmin:.4f}, {vmax:.4f}]"
+                                        )
+                                else:
+                                    raise ValueError(
+                                        f"vmax ({vmax}) must be > vmin ({vmin})"
+                                    )
+                        else:
+                            # Auto normalization: use global min/max per channel
+                            for C in (R, G, B):
+                                m, M = np.nanmin(C), np.nanmax(C)
+                                if np.isfinite(m) and np.isfinite(M) and M > m:
+                                    C[:] = (C - m) / (M - m)
+                else:
+                    X_ecef, Y_ecef, Z_ecef, R, G, B = self._rgb_from_wavelengths(
+                        red_wl, green_wl, blue_wl, normalize
+                    )
 
         T, S = X_ecef.shape
 
@@ -1305,7 +1506,12 @@ class CombinedTransectCube:
                 Yc[invalid_mask] = Yc[tuple(idx[:, invalid_mask])]
 
         fig, ax = plt.subplots(figsize=figsize)
-        ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
+
+        # Store mesh object for colorbar (in wavelength mode)
+        if use_wavelength_colormap:
+            mesh = ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
+        else:
+            ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
 
         # Store coordinate arrays for interactive tools (e.g., plot_georef_interactive_lines)
         ax._gref_coord_arrays = (Xp, Yp, start_idx)
@@ -1442,16 +1648,16 @@ class CombinedTransectCube:
                         # NEW: Get consistent color across all plots
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
 
-                        # Plot ROI
+                        # Plot ROI with solid colors - FAST METHOD
                         ax.scatter(
                             roi_x_coords,
                             roi_y_coords,
                             c=color,
-                            s=roi_marker_size,
-                            marker=roi_marker_shape,
+                            s=roi_marker_size**2 * 50,
+                            marker="s",
                             edgecolors="black" if roi_marker_edgewidth > 0 else "none",
                             linewidths=roi_marker_edgewidth,
-                            alpha=0.8,
+                            alpha=1.0,
                             label=f"{roi_name} ({len(roi_x_coords)})",
                             zorder=11,
                         )
@@ -2367,6 +2573,38 @@ class CombinedTransectCube:
             # (reuse your click handler from plot_georef if you want it here)
             pass
 
+        # -------- Colorbar for wavelength mode --------
+        if use_wavelength_colormap:
+            # Add colorbar with wavelength information
+            cbar = plt.colorbar(mesh, ax=ax, fraction=colorbar_fraction, pad=0.04)
+
+            # Compute actual range
+            if vmin is not None and vmax is not None:
+                range_min, range_max = vmin, vmax
+            else:
+                range_min = np.nanmin(wavelength_intensity_raw)
+                range_max = np.nanmax(wavelength_intensity_raw)
+
+            # Set colorbar label
+            if derivative_order == 0:
+                cbar.set_label(
+                    f"Intensity at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                )
+            elif derivative_order == 1:
+                cbar.set_label(
+                    f"dI/dλ at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                )
+            elif derivative_order == 2:
+                cbar.set_label(
+                    f"d²I/dλ² at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                )
+
+            # Update tick labels to show actual intensity values
+            cbar_ticks = cbar.get_ticks()
+            cbar.set_ticklabels(
+                [f"{range_min + t * (range_max - range_min):.3f}" for t in cbar_ticks]
+            )
+
         if original_interactive:
             plt.ion()
         plt.tight_layout()
@@ -2806,7 +3044,7 @@ class CombinedTransectCube:
         self, window_size=500, strength=1.0, force_recompute=False
     ):
         """
-        V2: Fixed version using pandas rolling median instead of scipy median_filter.
+        V2: Memory-efficient version using file-by-file processing and direct disk writes.
 
         Per-slit illumination normalization with automatic persistence.
 
@@ -2824,7 +3062,7 @@ class CombinedTransectCube:
         import numpy as np
         import pandas as pd
 
-        print("🔄 Using V2 algorithm (pandas rolling median)")
+        print("🔄 Using V2 algorithm (pandas rolling median, memory-efficient)")
 
         # --- Check if already computed and saved ---
         if not force_recompute and self.has_illumination_correction(
@@ -2855,43 +3093,69 @@ class CombinedTransectCube:
         )
         mode_txt = "global" if use_global else f"rolling (window={int(window_size)})"
         print(f"🔄 Computing illumination correction: {mode_txt}, strength={strength}")
+        print(f"💾 Memory-efficient mode: Processing file-by-file, direct disk write")
 
-        self.data_corrected = np.zeros((T_total, S, B), dtype=np.float32)
+        # PHASE 1: Compute reference statistics across all files (memory-efficient)
+        print("📊 Phase 1/2: Computing reference statistics...")
 
         try:
             from tqdm import tqdm
 
-            pbar = tqdm(total=S, desc="   Processing slits", unit="slit")
+            pbar = tqdm(total=S * B, desc="   Computing refs", unit="slit-band")
             use_tqdm = True
         except Exception:
             use_tqdm = False
             pbar = None
 
-        # --- process one slit at a time ---
-        for s in range(S):
-            slit_data_list = []
-            for gf in self.geofiles:
-                with h5py.File(gf.path, "r") as f:
-                    dset_name = (
-                        gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
-                    )
-                    if dset_name not in f:
-                        dset_name = gf.DSET_RGB_MAIN
-                    slit_slice = f[dset_name][:, s, :].astype(np.float32)  # (T_file, B)
-                    slit_data_list.append(slit_slice)
-            slit_data = np.concatenate(slit_data_list, axis=0)  # (T_total, B)
-            del slit_data_list
+        # Store reference values (small memory footprint: S × B × 4 bytes)
+        if use_global:
+            # Global: one value per (slit, band)
+            ref_values = np.ones((S, B), dtype=np.float32)
 
-            for b in range(B):
-                ts = slit_data[:, b]  # (T_total,)
+            for s in range(S):
+                for b in range(B):
+                    # Collect values across all files for this slit-band
+                    values = []
+                    for gf in self.geofiles:
+                        with h5py.File(gf.path, "r") as f:
+                            dset_name = (
+                                gf.DSET_RGB_CORR
+                                if gf.use_corrected
+                                else gf.DSET_RGB_MAIN
+                            )
+                            if dset_name not in f:
+                                dset_name = gf.DSET_RGB_MAIN
+                            values.append(f[dset_name][:, s, b])
 
-                if use_global:
+                    ts = np.concatenate(values)
                     ref = np.nanmedian(ts)
                     if not np.isfinite(ref) or ref == 0:
                         ref = 1.0
-                    corrected = ts / ref
-                else:
-                    # V2: Use pandas rolling median for proper 1D processing
+                    ref_values[s, b] = ref
+                    del ts, values
+
+                    if use_tqdm:
+                        pbar.update(1)
+        else:
+            # Rolling: one vector per (slit, band)
+            ref_values = {}
+
+            for s in range(S):
+                for b in range(B):
+                    # Collect values across all files
+                    values = []
+                    for gf in self.geofiles:
+                        with h5py.File(gf.path, "r") as f:
+                            dset_name = (
+                                gf.DSET_RGB_CORR
+                                if gf.use_corrected
+                                else gf.DSET_RGB_MAIN
+                            )
+                            if dset_name not in f:
+                                dset_name = gf.DSET_RGB_MAIN
+                            values.append(f[dset_name][:, s, b])
+
+                    ts = np.concatenate(values)
                     ref_vec = (
                         pd.Series(ts)
                         .rolling(window=int(window_size), center=True, min_periods=1)
@@ -2900,26 +3164,111 @@ class CombinedTransectCube:
                     )
                     ref_vec[ref_vec == 0] = 1.0
                     ref_vec[~np.isfinite(ref_vec)] = 1.0
-                    corrected = ts / ref_vec
+                    ref_values[(s, b)] = ref_vec.astype(np.float32)
+                    del ts, values
 
-                self.data_corrected[:, s, b] = (
-                    1 - strength
-                ) * ts + strength * corrected
-
-            del slit_data
-            if use_tqdm:
-                pbar.update(1)
+                    if use_tqdm:
+                        pbar.update(1)
 
         if use_tqdm:
             pbar.close()
 
-        print(f"✅ data_corrected ready ({mode_txt}) using V2 algorithm")
+        # PHASE 2: Apply correction file-by-file and save directly to disk
+        print("💾 Phase 2/2: Applying correction and saving to disk...")
 
-        # --- Save to disk ---
-        print("💾 Saving illumination correction to HDF5 files...")
-        self.save_illumination_correction(window_size, strength)
+        dset_name_out = self._get_correction_dataset_name(window_size, strength)
 
-        return self.data_corrected
+        for gf in self.geofiles:
+            print(f"   Processing {gf.name}...")
+
+            with h5py.File(gf.path, "r") as f_in:
+                dset_name_in = (
+                    gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
+                )
+                if dset_name_in not in f_in:
+                    dset_name_in = gf.DSET_RGB_MAIN
+
+                T_file, S_file, B_file = f_in[dset_name_in].shape
+
+                # Process in chunks to limit memory
+                chunk_size = 500  # Process 500 tracks at a time
+
+                # Create output dataset
+                with h5py.File(gf.path, "a") as f_out:
+                    if dset_name_out in f_out:
+                        del f_out[dset_name_out]
+
+                    dset_out = f_out.create_dataset(
+                        dset_name_out,
+                        shape=(T_file, S_file, B_file),
+                        dtype=np.float32,
+                        chunks=(min(100, T_file), S_file, B_file),
+                        compression="gzip",
+                        compression_opts=1,
+                    )
+
+                    # Add metadata
+                    dset_out.attrs["window_size"] = (
+                        window_size if window_size is not None else -1
+                    )
+                    dset_out.attrs["strength"] = strength
+                    dset_out.attrs["correction_method"] = (
+                        "rolling_v2" if not use_global else "global_v2"
+                    )
+
+                    # Find track offset for this file
+                    t_offset = 0
+                    for gf_prev in self.geofiles:
+                        if gf_prev == gf:
+                            break
+                        with h5py.File(gf_prev.path, "r") as f_tmp:
+                            dset_tmp = (
+                                gf_prev.DSET_RGB_CORR
+                                if gf_prev.use_corrected
+                                else gf_prev.DSET_RGB_MAIN
+                            )
+                            if dset_tmp not in f_tmp:
+                                dset_tmp = gf_prev.DSET_RGB_MAIN
+                            t_offset += f_tmp[dset_tmp].shape[0]
+
+                    # Process in chunks
+                    for chunk_start in range(0, T_file, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, T_file)
+                        chunk_data = f_in[dset_name_in][
+                            chunk_start:chunk_end, :, :
+                        ].astype(np.float32)
+
+                        # Apply correction
+                        for s in range(S_file):
+                            for b in range(B_file):
+                                ts = chunk_data[:, s, b]
+
+                                if use_global:
+                                    ref = ref_values[s, b]
+                                    corrected = ts / ref
+                                else:
+                                    # Extract relevant portion of ref_vec
+                                    ref_vec = ref_values[(s, b)][
+                                        t_offset + chunk_start : t_offset + chunk_end
+                                    ]
+                                    corrected = ts / ref_vec
+
+                                chunk_data[:, s, b] = (
+                                    1 - strength
+                                ) * ts + strength * corrected
+
+                        # Write chunk to disk
+                        dset_out[chunk_start:chunk_end, :, :] = chunk_data
+                        del chunk_data
+
+        # Clear reference values
+        del ref_values
+
+        print(f"✅ Illumination correction saved to disk ({mode_txt})")
+        print(f"   Loading corrected data into memory...")
+
+        # Load the corrected data (uses existing load function)
+        return self.load_illumination_correction(window_size, strength)
 
     def _get_correction_dataset_name(self, window_size=1000, strength=1.0):
         """
@@ -5058,13 +5407,17 @@ class CombinedTransectCube:
         crop_center_track=None,  # NEW: Track index for crop center (requires crop_center_slit and crop_width)
         crop_center_slit=None,  # NEW: Slit index for crop center (requires crop_center_track and crop_width)
         crop_width=None,  # NEW: Width in slit pixels for square physical crop (track width = crop_width/3.61)
-        crop_aspect_ratio=3.61,  # NEW: Ratio of track:slit pixel physical size (default 3.61 for UHI)
+        crop_aspect_ratio=3.61,  # NEW: Ratio of track:slit pixel physical size for CROP DIMENSIONS (default 3.61 for UHI)
+        display_aspect_ratio=1.0,  # NEW: Display stretch ratio (1.0=square pixels, 3.61=physical spacing, only for crops)
         derivative_order=0,  # NEW: 0 (raw), 1 (first derivative), 2 (second derivative)
         derivative_window=2,  # NEW: Window size for derivative computation
         use_wavelength_colormap=False,  # NEW: If True, plot single wavelength with natural color
         wavelength_colormap_target=None,  # NEW: Target wavelength (nm) for single-wavelength mode (required if use_wavelength_colormap=True)
-        vmin=None,  # NEW: Minimum value for normalization (if None, uses 2nd percentile)
-        vmax=None,  # NEW: Maximum value for normalization (if None, uses 98th percentile)
+        # vmin=None,  # NEW: Minimum value for normalization (if None, uses 2nd percentile)
+        # vmax=None,  # NEW: Maximum value for normalization (if None, uses 98th percentile)
+        vmin=(0.53, 0.58, 0.2),
+        vmax=(1.35, 1.37, 1.73),
+        colorbar_fraction=0.046,  # NEW: Fraction of axes width for colorbar (default 0.046, use 0.15 for larger, None for auto full-height)
     ):
         """
         Enhanced RGB plot supporting multiple named ROIs with different colors.
@@ -5087,10 +5440,18 @@ class CombinedTransectCube:
         - flip_vertical: Invert vertical axis direction (top-to-bottom instead of bottom-to-top)
 
         NEW CROPPING FEATURES:
-        - crop_center_track: Track index at center of crop (0 to n_tracks-1)
-        - crop_center_slit: Slit index at center of crop (0 to n_slits-1)
+        - crop_center_track: GLOBAL track index at center of crop (for CombinedTransectCube, same indices as shown in full transect plots)
+        - crop_center_slit: GLOBAL slit index at center of crop (0 to n_slits-1, typically 0-1023 for UHI data)
         - crop_width: Width in slit pixels (track width adjusted by crop_aspect_ratio for square physical area)
-        - crop_aspect_ratio: Ratio of track:slit pixel physical size (default 3.61 for UHI data)
+        - crop_aspect_ratio: Ratio of track:slit pixel physical size for CROP DIMENSIONS (default 3.61 for UHI data)
+          * Controls how many track vs slit pixels are extracted in the crop
+          * track_pixels = crop_width / crop_aspect_ratio
+        - display_aspect_ratio: Display stretch ratio for VISUALIZATION only (default 1.0 = square pixels)
+          * Controls how stretched the image appears on screen
+          * 1.0 = square pixels (equal spacing in both directions)
+          * 3.61 = physical spacing (matches sensor's actual track:slit pixel spacing)
+          * Independent of crop dimensions - only affects visual appearance
+          * Only applies to crops, not full transects
         - All three crop parameters must be provided together
         - Cropping creates a square PHYSICAL area (not square in pixels due to aspect ratio)
         - Cropping is applied after all flip transformations
@@ -5269,11 +5630,48 @@ class CombinedTransectCube:
             G = cube_data[:, :, green_idx].T.copy()
             B = cube_data[:, :, blue_idx].T.copy()
 
-        # Normalize each channel to [0, 1] range (RGB mode only, wavelength mode already normalized)
+        # Normalize each channel to [0, 1] range (RGB mode only, wavelength mode has own normalization)
         if not use_wavelength_colormap and normalize:
-            for C in (R, G, B):
-                if C.max() != C.min():
-                    C[:] = (C - C.min()) / (C.max() - C.min())
+            # Check if vmin/vmax are provided for manual normalization
+            if vmin is not None and vmax is not None:
+                # Support both single values and per-channel tuples
+                # Single value: vmin=0.5, vmax=1.5 → apply to all channels
+                # Per-channel: vmin=(0.4, 0.5, 0.3), vmax=(1.5, 1.6, 1.4) → R, G, B
+                if isinstance(vmin, (tuple, list)) and isinstance(vmax, (tuple, list)):
+                    # Per-channel normalization
+                    if len(vmin) != 3 or len(vmax) != 3:
+                        raise ValueError(
+                            f"vmin and vmax must have 3 values for per-channel normalization, got {len(vmin)} and {len(vmax)}"
+                        )
+                    for i, (C, ch_name) in enumerate(
+                        [(R, "Red"), (G, "Green"), (B, "Blue")]
+                    ):
+                        ch_min, ch_max = vmin[i], vmax[i]
+                        if ch_max > ch_min:
+                            C[:] = np.clip((C - ch_min) / (ch_max - ch_min), 0, 1)
+                        else:
+                            raise ValueError(
+                                f"{ch_name} channel: vmax ({ch_max}) must be > vmin ({ch_min})"
+                            )
+                    print(f"✨ Manual per-channel normalization applied:")
+                    print(f"   Red:   [{vmin[0]:.4f}, {vmax[0]:.4f}]")
+                    print(f"   Green: [{vmin[1]:.4f}, {vmax[1]:.4f}]")
+                    print(f"   Blue:  [{vmin[2]:.4f}, {vmax[2]:.4f}]")
+                else:
+                    # Single value normalization (same range for all channels)
+                    if vmax > vmin:
+                        for C in (R, G, B):
+                            C[:] = np.clip((C - vmin) / (vmax - vmin), 0, 1)
+                        print(
+                            f"✨ Manual normalization applied to all channels: [{vmin:.4f}, {vmax:.4f}]"
+                        )
+                    else:
+                        raise ValueError(f"vmax ({vmax}) must be > vmin ({vmin})")
+            else:
+                # Auto normalization: use global min/max per channel
+                for C in (R, G, B):
+                    if C.max() != C.min():
+                        C[:] = (C - C.min()) / (C.max() - C.min())
 
         # Create image for display
         if use_wavelength_colormap:
@@ -5331,12 +5729,19 @@ class CombinedTransectCube:
             half_width_slit = crop_width // 2
             half_width_track = int(crop_width / crop_aspect_ratio / 2)
 
-            crop_track_min = max(0, crop_center_track - half_width_track)
-            crop_track_max = min(n_tracks, crop_center_track + half_width_track)
+            # Convert global track indices to local indices (relative to this cube's data)
+            track_offset = getattr(self, "track_offset", 0)
+            crop_center_track_local = crop_center_track - track_offset
+
+            crop_track_min = max(0, crop_center_track_local - half_width_track)
+            crop_track_max = min(n_tracks, crop_center_track_local + half_width_track)
             crop_slit_min = max(0, crop_center_slit - half_width_slit)
             crop_slit_max = min(n_slits, crop_center_slit + half_width_slit)
 
-            print(f"📐 Aspect ratio correction: {crop_aspect_ratio:.2f}:1 (track:slit)")
+            print(
+                f"📐 Crop center: global track {crop_center_track} → local track {crop_center_track_local}, slit {crop_center_slit}"
+            )
+            print(f"   Aspect ratio correction: {crop_aspect_ratio:.2f}:1 (track:slit)")
             print(
                 f"   Slit pixels: {crop_slit_max - crop_slit_min}, Track pixels: {crop_track_max - crop_track_min}"
             )
@@ -5442,17 +5847,23 @@ class CombinedTransectCube:
 
         # Set up extent (defines coordinate range for axes) - keep axes consistent with actual data
         if crop_applied:
-            # Use cropped coordinate ranges (in original coordinates)
+            # Calculate REQUESTED global bounds (not clipped) for axis labels
+            # This ensures extent shows what user requested, even if crop was clipped at boundaries
+            requested_track_min_global = crop_center_track - half_width_track
+            requested_track_max_global = crop_center_track + half_width_track
+            requested_slit_min = crop_center_slit - half_width_slit
+            requested_slit_max = crop_center_slit + half_width_slit
+
             if flip_axes:
                 # After flip: horizontal=slits, vertical=tracks
-                x_min, x_max = crop_slit_min, crop_slit_max
-                y_min, y_max = crop_track_min, crop_track_max
+                x_min, x_max = requested_slit_min, requested_slit_max
+                y_min, y_max = requested_track_min_global, requested_track_max_global
                 xlabel_text = "Slit Pixel Index"
                 ylabel_text = "Track Index"
             else:
                 # Default: horizontal=tracks, vertical=slits
-                x_min, x_max = crop_track_min, crop_track_max
-                y_min, y_max = crop_slit_min, crop_slit_max
+                x_min, x_max = requested_track_min_global, requested_track_max_global
+                y_min, y_max = requested_slit_min, requested_slit_max
                 xlabel_text = "Track Index"
                 ylabel_text = "Slit Pixel Index"
         else:
@@ -5543,7 +5954,12 @@ class CombinedTransectCube:
                 vmax=1,
             )
             # Add colorbar for wavelength mode
-            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            if colorbar_fraction is None:
+                # Auto full-height colorbar
+                cbar = plt.colorbar(im, ax=ax, pad=0.02)
+            else:
+                # User-specified fraction
+                cbar = plt.colorbar(im, ax=ax, fraction=colorbar_fraction, pad=0.02)
             cbar.set_label(
                 f"{derivative_label if derivative_order > 0 else 'Intensity'}\n(white = min, color = max)",
                 fontsize=11,
@@ -5757,18 +6173,18 @@ class CombinedTransectCube:
                                 f"   Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]"
                             )
 
-                        # Plot ROI with unique color (using transformed coordinates)
+                        # Plot ROI with solid colors - FAST METHOD using scatter with square markers
                         plt.scatter(
                             roi_x_coords,
                             roi_y_coords,
                             c=color,
-                            s=roi_marker_size,
-                            marker=roi_marker_shape,
+                            s=roi_marker_size**2 * 50,  # Square marker size
+                            marker="s",  # Square marker for filled pixels
                             edgecolors=(
                                 "black" if roi_marker_edgewidth > 0 else "none"
                             ),
                             linewidths=roi_marker_edgewidth,
-                            alpha=0.8,
+                            alpha=1.0,  # Solid colors, no transparency
                             label=f"{roi_name} ({len(valid_rois)})",
                         )
 
@@ -5821,15 +6237,16 @@ class CombinedTransectCube:
                     roi_x_coords.append(x)
                     roi_y_coords.append(y)
 
+                # Plot ROI with solid colors - FAST METHOD
                 plt.scatter(
                     roi_x_coords,
                     roi_y_coords,
                     c=roi_colors[0],
-                    s=roi_marker_size,
-                    marker=roi_marker_shape,
+                    s=roi_marker_size**2 * 50,
+                    marker="s",
                     edgecolors="black" if roi_marker_edgewidth > 0 else "none",
                     linewidths=roi_marker_edgewidth,
-                    alpha=0.8,
+                    alpha=1.0,
                     label=f"ROI Pixels ({len(valid_rois)})",
                 )
 
@@ -5894,6 +6311,7 @@ class CombinedTransectCube:
             or roi_collection is not None
             or (roi_pixels is not None and len(roi_pixels) > 0)
         )
+        legend_outside = False
         if has_overlays and roi_legend_loc is not None:
             if roi_legend_loc == "outside":
                 # Place legend outside the plot area on the right
@@ -5902,6 +6320,7 @@ class CombinedTransectCube:
                     loc="upper left",
                     markerscale=roi_legend_markersize / 6,
                 )
+                legend_outside = True
             else:
                 legend = plt.legend(
                     loc=roi_legend_loc,
@@ -5915,7 +6334,21 @@ class CombinedTransectCube:
                         handle.set_edgecolor("none")
                         handle.set_linewidth(0)
 
-        plt.tight_layout()
+        # Handle layout adjustment based on legend position
+        if crop_applied:
+            # Set aspect ratio for all crops (with or without legend)
+            ax.set_aspect(display_aspect_ratio, adjustable="box")
+
+            if legend_outside:
+                # When the legend is outside, expand the figure width so the axes keep their aspect ratio
+                fig_width, fig_height = fig.get_size_inches()
+                legend_padding = 1.75  # Extra width (inches) devoted to legend area
+                fig.set_size_inches(
+                    fig_width + legend_padding, fig_height, forward=True
+                )
+        elif not legend_outside:
+            # Only use tight_layout for full transects without outside legend
+            plt.tight_layout()
         plt.show()
 
     def plot_line_intensity_profile(
@@ -7046,6 +7479,7 @@ class CombinedTransectCube:
             wavelengths = wavelengths[wl_mask]
             range_info = f" ({wl_start}-{wl_end}nm)"
         else:
+            # When wavelength_range=None, use slice(None) to select all wavelengths
             wl_mask = slice(None)
             range_info = ""
 
@@ -11041,6 +11475,7 @@ class CombinedTransectCube:
     def apply_mnf_transform(self, use_corrected=True, n_components=20, quiet=False):
         """
         Apply MNF (Minimum Noise Fraction) transformation to hyperspectral data.
+        MEMORY-EFFICIENT VERSION: Uses incremental PCA and chunked processing.
 
         MNF is a two-step process:
         1. Noise whitening: Decorrelate and scale noise based on noise covariance
@@ -11073,14 +11508,14 @@ class CombinedTransectCube:
             cube.apply_mnf_transform(use_corrected=True, n_components=20)
             print(f"Top 3 components explain {cube.mnf_cumulative_variance[2]*100:.1f}% of variance")
         """
-        from sklearn.decomposition import PCA
+        from sklearn.decomposition import IncrementalPCA
         import numpy as np
 
         if not quiet:
-            print("🔬 Computing MNF transformation...")
+            print("🔬 Computing MNF transformation (memory-efficient)...")
             print(f"   Using {'corrected' if use_corrected else 'raw'} data")
 
-        # Get data
+        # Get data source
         if (
             use_corrected
             and hasattr(self, "data_corrected")
@@ -11099,46 +11534,76 @@ class CombinedTransectCube:
             print(
                 f"   Data shape: {n_tracks} tracks × {n_slits} slits × {n_bands} bands"
             )
+            print(f"   💾 Memory-efficient mode: Processing in chunks")
 
-        # Reshape to 2D: (n_pixels, n_bands)
-        data_2d = data.reshape(-1, n_bands)
-        n_pixels = data_2d.shape[0]
-
-        # Remove NaN/Inf values
-        valid_mask = np.isfinite(data_2d).all(axis=1)
-        data_valid = data_2d[valid_mask]
-        n_valid = data_valid.shape[0]
-        if not quiet:
-            print(f"   Total pixels: {n_pixels:,}")
-            print(f"   Valid pixels: {n_valid:,} ({100*n_valid/n_pixels:.1f}%)")
-
-        # Step 1: Estimate noise covariance
+        # Step 1: Estimate noise covariance (MEMORY EFFICIENT VERSION)
         if not quiet:
             print("\n📊 Step 1: Estimating noise covariance...")
             print("   Using difference between adjacent pixels (track direction)")
 
-        # Reshape back temporarily to compute differences
-        data_3d_valid = np.full((n_tracks, n_slits, n_bands), np.nan)
-        data_3d_valid[valid_mask.reshape(n_tracks, n_slits)] = data_valid
-
-        # Compute differences along track direction (axis 0)
+        # Compute differences along track direction WITHOUT loading all data
         noise_samples = []
-        for i in range(n_tracks - 1):
-            diff = data_3d_valid[i + 1, :, :] - data_3d_valid[i, :, :]
-            diff_valid = diff[np.isfinite(diff).all(axis=1)]
-            if len(diff_valid) > 0:
-                noise_samples.append(diff_valid)
 
+        # Process in chunks to limit memory
+        chunk_size = 500  # Process 500 tracks at a time
+        for chunk_start in range(0, n_tracks - 1, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_tracks - 1)
+
+            # Load this chunk + next track
+            data_chunk = data[chunk_start : chunk_end + 1, :, :].astype(np.float32)
+
+            for i in range(chunk_end - chunk_start):
+                # Get valid pixels for track i and i+1 within chunk
+                track_i_data = data_chunk[i, :, :]
+                track_i_next_data = data_chunk[i + 1, :, :]
+
+                # Only use pixels where both are finite
+                valid_i = np.isfinite(track_i_data).all(axis=1)
+                valid_i_next = np.isfinite(track_i_next_data).all(axis=1)
+                both_valid = valid_i & valid_i_next
+
+                if both_valid.any():
+                    # Compute differences (noise estimate)
+                    diff = (
+                        track_i_next_data[both_valid, :] - track_i_data[both_valid, :]
+                    )
+
+                    # Subsample to save memory (keep at most 50 samples per track pair)
+                    if len(diff) > 50:
+                        step = max(1, len(diff) // 50)
+                        diff = diff[::step, :]
+
+                    noise_samples.append(diff)
+
+            # Free chunk memory
+            del data_chunk
+
+        # Combine noise samples
         noise_data = np.vstack(noise_samples)
+        del noise_samples
+
         if not quiet:
-            print(f"   Noise samples: {noise_data.shape[0]:,}")
+            print(f"   Noise samples collected: {noise_data.shape[0]:,}")
+
+        # Subsample if still too many (for covariance calculation)
+        max_noise_samples = 5000  # Sufficient for good covariance estimate
+        if noise_data.shape[0] > max_noise_samples:
+            if not quiet:
+                print(
+                    f"   Subsampling to {max_noise_samples:,} samples for covariance..."
+                )
+            indices = np.random.choice(
+                noise_data.shape[0], max_noise_samples, replace=False
+            )
+            noise_data = noise_data[indices, :]
 
         # Noise covariance matrix (differences have 2x noise variance)
-        noise_cov = np.cov(noise_data.T) / 2.0
+        noise_cov = np.cov(noise_data.T.astype(np.float32)) / 2.0
+        del noise_data
 
-        # Step 2: Noise whitening
+        # Step 2: Noise whitening transformation
         if not quiet:
-            print("\n🔄 Step 2: Noise whitening transformation...")
+            print("\n🔄 Step 2: Computing noise whitening transformation...")
 
         # Eigendecomposition of noise covariance
         noise_eigenvalues, noise_eigenvectors = np.linalg.eigh(noise_cov)
@@ -11149,40 +11614,117 @@ class CombinedTransectCube:
         noise_eigenvectors = noise_eigenvectors[:, idx]
 
         # Whitening matrix: D^(-1/2) * V^T where noise_cov = V * D * V^T
-        # Add small regularization to avoid division by very small values
         epsilon = 1e-10
         noise_inv_sqrt = np.diag(1.0 / np.sqrt(noise_eigenvalues + epsilon))
-        whitening_matrix = noise_inv_sqrt @ noise_eigenvectors.T
+        whitening_matrix = (noise_inv_sqrt @ noise_eigenvectors.T).astype(np.float32)
 
-        # Apply whitening
-        data_whitened = data_valid @ whitening_matrix.T
-        if not quiet:
-            print(f"   Whitened data shape: {data_whitened.shape}")
+        del noise_cov, noise_eigenvalues, noise_eigenvectors, noise_inv_sqrt
 
-        # Step 3: PCA on whitened data
+        # Step 3: Incremental PCA on whitened data (memory-efficient!)
         if not quiet:
-            print("\n📈 Step 3: PCA on whitened data...")
-        pca = PCA(n_components=min(n_components, n_bands))
-        mnf_scores = pca.fit_transform(data_whitened)
+            print("\n📈 Step 3: Incremental PCA on whitened data...")
+            print(f"   Processing data in chunks to minimize memory usage...")
+
+        ipca = IncrementalPCA(n_components=min(n_components, n_bands))
+
+        # First pass: Fit the PCA model incrementally
+        if not quiet:
+            print("   Phase 3a: Fitting PCA model...")
+
+        chunk_size = 500  # Process 500 tracks at a time
+        n_chunks = (n_tracks + chunk_size - 1) // chunk_size
+
+        for chunk_idx in range(n_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, n_tracks)
+
+            # Load chunk
+            data_chunk = data[chunk_start:chunk_end, :, :].astype(np.float32)
+
+            # Reshape to 2D and get valid pixels
+            chunk_2d = data_chunk.reshape(-1, n_bands)
+            valid_mask_chunk = np.isfinite(chunk_2d).all(axis=1)
+
+            if valid_mask_chunk.any():
+                chunk_valid = chunk_2d[valid_mask_chunk]
+
+                # Apply whitening
+                chunk_whitened = chunk_valid @ whitening_matrix.T
+
+                # Partial fit
+                ipca.partial_fit(chunk_whitened)
+
+                del chunk_valid, chunk_whitened
+
+            del data_chunk, chunk_2d, valid_mask_chunk
+
+            if not quiet and (chunk_idx + 1) % 5 == 0:
+                print(f"      Processed {chunk_idx + 1}/{n_chunks} chunks")
 
         if not quiet:
-            print(f"   MNF components computed: {pca.n_components_}")
-            print(f"   Explained variance (top 5): {pca.explained_variance_ratio_[:5]}")
+            print(f"   Phase 3b: Transforming data to MNF space...")
+            print(f"   MNF components: {ipca.n_components_}")
             print(
-                f"   Cumulative variance (top 5): {np.cumsum(pca.explained_variance_ratio_)[:5]}"
+                f"   Explained variance (top 5): {ipca.explained_variance_ratio_[:5]}"
             )
 
-        # Reshape back to 3D
-        mnf_data_3d = np.full((n_tracks, n_slits, pca.n_components_), np.nan)
-        mnf_data_3d[valid_mask.reshape(n_tracks, n_slits)] = mnf_scores
+        # Second pass: Transform data and store results
+        mnf_data_3d = np.full(
+            (n_tracks, n_slits, ipca.n_components_), np.nan, dtype=np.float32
+        )
+
+        for chunk_idx in range(n_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, n_tracks)
+
+            # Load chunk
+            data_chunk = data[chunk_start:chunk_end, :, :].astype(np.float32)
+            chunk_shape = data_chunk.shape
+
+            # Reshape to 2D and get valid pixels
+            chunk_2d = data_chunk.reshape(-1, n_bands)
+            valid_mask_chunk = np.isfinite(chunk_2d).all(axis=1)
+
+            if valid_mask_chunk.any():
+                chunk_valid = chunk_2d[valid_mask_chunk]
+
+                # Apply whitening + PCA transformation
+                chunk_whitened = chunk_valid @ whitening_matrix.T
+                chunk_mnf = ipca.transform(chunk_whitened).astype(np.float32)
+
+                # Store results
+                chunk_output = np.full(
+                    (chunk_shape[0] * chunk_shape[1], ipca.n_components_),
+                    np.nan,
+                    dtype=np.float32,
+                )
+                chunk_output[valid_mask_chunk] = chunk_mnf
+                chunk_output_3d = chunk_output.reshape(
+                    chunk_shape[0], chunk_shape[1], ipca.n_components_
+                )
+
+                mnf_data_3d[chunk_start:chunk_end, :, :] = chunk_output_3d
+
+                del (
+                    chunk_valid,
+                    chunk_whitened,
+                    chunk_mnf,
+                    chunk_output,
+                    chunk_output_3d,
+                )
+
+            del data_chunk, chunk_2d, valid_mask_chunk
+
+            if not quiet and (chunk_idx + 1) % 5 == 0:
+                print(f"      Transformed {chunk_idx + 1}/{n_chunks} chunks")
 
         # Store results
         self.mnf_data = mnf_data_3d
-        self.mnf_eigenvalues = pca.explained_variance_
-        self.mnf_explained_variance = pca.explained_variance_ratio_
-        self.mnf_cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
-        self.mnf_transformation_matrix = whitening_matrix.T @ pca.components_.T
-        self.mnf_pca_model = pca
+        self.mnf_eigenvalues = ipca.explained_variance_
+        self.mnf_explained_variance = ipca.explained_variance_ratio_
+        self.mnf_cumulative_variance = np.cumsum(ipca.explained_variance_ratio_)
+        self.mnf_transformation_matrix = whitening_matrix.T @ ipca.components_.T
+        self.mnf_pca_model = ipca
         self.mnf_whitening_matrix = whitening_matrix
 
         if not quiet:
