@@ -930,6 +930,8 @@ class CombinedTransectCube:
         roi_collection=None,  # Dict of named ROIs or 'all' to use self.roi_collection
         roi_colors=["yellow", "cyan", "magenta", "orange", "lime", "red", "blue"],
         roi_color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
+        roi_overlay_mode="markers",  # "markers" (scatter plot) or "solid" (overlay colored pixels on RGB)
+        roi_solid_pixel_size=1,  # Size of each pixel in solid overlay mode (must be odd: 1, 3, 5, 7, etc.)
         roi_marker_size=100,
         roi_marker_shape="s",  # Marker shape: 's'=square, 'o'=circle, '^'=triangle, 'D'=diamond, 'v'=triangle_down, '<'=triangle_left, '>'=triangle_right, 'p'=pentagon, '*'=star, 'h'=hexagon, '+'=plus, 'x'=x
         roi_marker_edgewidth=2,  # Edge width for ROI markers (0 = no edge)
@@ -984,6 +986,15 @@ class CombinedTransectCube:
             If True and coordinate_system=='NED', applies the alignment shift from
             config (UHI_ALIGNMENT_DX, UHI_ALIGNMENT_DY) to match MBES data.
             Default: False
+
+        roi_overlay_mode : str, optional
+            Mode for displaying ROI pixels: "markers" (scatter plot) or "solid" (overlay colored
+            pixels directly on RGB image). Default: "markers"
+
+        roi_solid_pixel_size : int, optional
+            Size of each pixel block in solid overlay mode (only used when roi_overlay_mode="solid").
+            Must be an odd number (1, 3, 5, 7, ...). Size 1 = single pixel (default), size 3 = 3×3 block
+            centered on original pixel, size 5 = 5×5 block, etc. Default: 1
 
         rotation_deg : float, optional
             Rotate the entire plot by this angle in degrees (counter-clockwise positive).
@@ -1145,6 +1156,22 @@ class CombinedTransectCube:
         def _silence():
             return contextlib.ExitStack()
 
+        # Validate roi_solid_pixel_size parameter
+        if roi_overlay_mode == "solid" and roi_solid_pixel_size != 1:
+            if not isinstance(roi_solid_pixel_size, int):
+                raise ValueError(
+                    f"roi_solid_pixel_size must be an integer, got {type(roi_solid_pixel_size).__name__}: {roi_solid_pixel_size}"
+                )
+            if roi_solid_pixel_size < 1:
+                raise ValueError(
+                    f"roi_solid_pixel_size must be >= 1, got {roi_solid_pixel_size}"
+                )
+            if roi_solid_pixel_size % 2 == 0:
+                raise ValueError(
+                    f"roi_solid_pixel_size must be an odd number (1, 3, 5, 7, ...), got {roi_solid_pixel_size}. "
+                    f"Use {roi_solid_pixel_size - 1} or {roi_solid_pixel_size + 1} instead."
+                )
+
         if coordinate_system is None:
             coordinate_system = "LATLON"
 
@@ -1167,8 +1194,14 @@ class CombinedTransectCube:
 
         # Initialize wavelength colormap variables (will be populated if use_wavelength_colormap=True)
         mesh = None
+        wavelength_colormap_obj = None
         wavelength_intensity_raw = None
+        wavelength_intensity_normalized = None
         actual_wl = None
+
+        print(
+            f"🔧 DEBUG: plot_georef called with use_wavelength_colormap={use_wavelength_colormap}, wavelength_colormap_target={wavelength_colormap_target}"
+        )
 
         with _silence() as stack:
             if quiet:
@@ -1178,6 +1211,8 @@ class CombinedTransectCube:
 
             # NEW: Single-wavelength colormap mode
             if use_wavelength_colormap:
+                print(f"🌈 Single-wavelength colormap mode activated!")
+                print(f"   Target wavelength: {wavelength_colormap_target} nm")
                 if wavelength_colormap_target is None:
                     raise ValueError(
                         "wavelength_colormap_target must be specified when use_wavelength_colormap=True"
@@ -1265,24 +1300,31 @@ class CombinedTransectCube:
                 # We need scalar values for single-wavelength normalization
                 vmin_for_wavelength = vmin
                 vmax_for_wavelength = vmax
-                
+
                 if isinstance(vmin, (tuple, list)) and len(vmin) > 1:
                     # Convert RGB tuple to scalar (use mean of the three channels)
                     vmin_for_wavelength = np.mean(vmin)
                     if not quiet:
-                        print(f"⚠️  Converted vmin tuple {vmin} to scalar {vmin_for_wavelength:.4f}")
-                
+                        print(
+                            f"⚠️  Converted vmin tuple {vmin} to scalar {vmin_for_wavelength:.4f}"
+                        )
+
                 if isinstance(vmax, (tuple, list)) and len(vmax) > 1:
                     # Convert RGB tuple to scalar (use mean of the three channels)
                     vmax_for_wavelength = np.mean(vmax)
                     if not quiet:
-                        print(f"⚠️  Converted vmax tuple {vmax} to scalar {vmax_for_wavelength:.4f}")
+                        print(
+                            f"⚠️  Converted vmax tuple {vmax} to scalar {vmax_for_wavelength:.4f}"
+                        )
 
                 # Normalize to [0, 1] range
                 if vmin_for_wavelength is not None and vmax_for_wavelength is not None:
                     # User-specified range
                     intensity_normalized = np.clip(
-                        (intensity_map - vmin_for_wavelength) / (vmax_for_wavelength - vmin_for_wavelength), 0, 1
+                        (intensity_map - vmin_for_wavelength)
+                        / (vmax_for_wavelength - vmin_for_wavelength),
+                        0,
+                        1,
                     )
                 else:
                     # Auto range
@@ -1295,16 +1337,28 @@ class CombinedTransectCube:
                     else:
                         intensity_normalized = np.zeros_like(intensity_map)
 
-                # Create RGB from normalized intensity using wavelength colormap
+                # Store normalized intensity for pcolormesh (don't convert to RGB yet!)
+                # pcolormesh will apply the colormap automatically, allowing colorbar to work
+                wavelength_intensity_normalized = intensity_normalized
+
+                # Create wavelength colormap
                 wavelength_cmap = create_wavelength_colormap(actual_wl)
-                wavelength_rgba = wavelength_cmap(intensity_normalized)
-                R = wavelength_rgba[:, :, 0]
-                G = wavelength_rgba[:, :, 1]
-                B = wavelength_rgba[:, :, 2]
 
                 # Store colormap info for later use
                 wavelength_colormap_obj = wavelength_cmap
                 wavelength_intensity_raw = intensity_map
+
+                # Print raw intensity range (same as plot_rgb)
+                print(f"   Derivative: {derivative_order}")
+                print(
+                    f"   Raw intensity range (before normalization): [{np.nanmin(intensity_map):.4f}, {np.nanmax(intensity_map):.4f}]"
+                )
+
+                # Create dummy R,G,B for compatibility with rest of code
+                # These won't be used in wavelength mode - we'll use intensity_normalized directly
+                R = intensity_normalized
+                G = intensity_normalized
+                B = intensity_normalized
 
             else:
                 # Standard RGB mode
@@ -1392,6 +1446,16 @@ class CombinedTransectCube:
             R = R[start_idx:end_idx, :]
             G = G[start_idx:end_idx, :]
             B = B[start_idx:end_idx, :]
+            # Also slice wavelength intensity data if in wavelength mode
+            if use_wavelength_colormap and wavelength_intensity_normalized is not None:
+                wavelength_intensity_normalized = wavelength_intensity_normalized[
+                    start_idx:end_idx, :
+                ]
+                # Also slice raw intensity for colorbar range calculation
+                if wavelength_intensity_raw is not None:
+                    wavelength_intensity_raw = wavelength_intensity_raw[
+                        start_idx:end_idx, :
+                    ]
             T, S = X_ecef.shape
 
         RGB = np.dstack([R, G, B]).astype(np.float64)
@@ -1507,11 +1571,125 @@ class CombinedTransectCube:
 
         fig, ax = plt.subplots(figsize=figsize)
 
-        # Store mesh object for colorbar (in wavelength mode)
+        # ========== SOLID ROI OVERLAY (applied to RGB before pcolormesh) ==========
+        if (
+            roi_overlay_mode == "solid"
+            and roi_collection is not None
+            and not use_wavelength_colormap
+        ):
+            # Convert RGB to uint8 for pixel manipulation
+            rgb_overlay = np.stack([R, G, B], axis=-1)
+            rgb_overlay = np.clip(rgb_overlay * 255, 0, 255).astype(np.uint8)
+
+            # Prepare ROI collection
+            if roi_collection == "all":
+                rois_to_plot = self.roi_collection
+            elif isinstance(roi_collection, list):
+                rois_to_plot = {
+                    name: self.roi_collection[name]
+                    for name in roi_collection
+                    if name in self.roi_collection
+                }
+            elif isinstance(roi_collection, dict):
+                rois_to_plot = roi_collection
+            else:
+                rois_to_plot = {}
+
+            # Apply solid colors to ROI pixels
+            roi_pixel_counts = {}  # Track counts for legend
+
+            # Calculate pixel radius for block painting (e.g., size=3 → radius=1, size=5 → radius=2)
+            pixel_radius = roi_solid_pixel_size // 2
+
+            for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
+                if roi_pixels_list:
+                    # Get color for this ROI
+                    color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
+
+                    # Convert matplotlib color to RGB tuple
+                    from matplotlib.colors import to_rgb
+
+                    rgb_color = np.array(to_rgb(color)) * 255
+                    rgb_color = rgb_color.astype(np.uint8)
+
+                    pixel_count = 0
+                    # Apply color to each ROI pixel (and surrounding pixels if size > 1)
+                    for slit, track in roi_pixels_list:
+                        # Adjust track by start_idx
+                        t = track - start_idx
+
+                        # Bounds check for center pixel
+                        if 0 <= t < T and 0 <= slit < S:
+                            # Paint center pixel and surrounding block
+                            for dt in range(-pixel_radius, pixel_radius + 1):
+                                for ds in range(-pixel_radius, pixel_radius + 1):
+                                    t_paint = t + dt
+                                    s_paint = slit + ds
+
+                                    # Bounds check for each pixel in the block
+                                    if 0 <= t_paint < T and 0 <= s_paint < S:
+                                        rgb_overlay[t_paint, s_paint] = rgb_color
+
+                            pixel_count += 1
+
+                    roi_pixel_counts[roi_name] = pixel_count
+
+            # Convert back to [0, 1] range for pcolormesh
+            R = rgb_overlay[:, :, 0] / 255.0
+            G = rgb_overlay[:, :, 1] / 255.0
+            B = rgb_overlay[:, :, 2] / 255.0
+            RGB = np.dstack([R, G, B])
+
+        # Remove roi_overlay_mode from pcolor_kwargs if present (it's not a valid pcolormesh parameter)
+        pcolor_kwargs.pop("roi_overlay_mode", None)
+
+        # Create mesh object - use different approach for wavelength mode vs RGB mode
         if use_wavelength_colormap:
-            mesh = ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
+            # Wavelength mode: pass raw intensity data with actual vmin/vmax
+            # This provides proper dynamic range control for visualization
+
+            # Use raw intensity values directly (not normalized)
+            display_data = wavelength_intensity_raw
+
+            # DEBUG: Show what type vmin/vmax are
+            print(f"🔍 DEBUG vmin type: {type(vmin)}, value: {vmin}")
+            print(f"🔍 DEBUG vmax type: {type(vmax)}, value: {vmax}")
+
+            # For wavelength mode, check if vmin/vmax are scalars (user-specified)
+            # If they're tuples, they're the RGB defaults - ignore them and use data range
+            if isinstance(vmin, (tuple, list)) or isinstance(vmax, (tuple, list)):
+                # RGB tuple defaults - not applicable for single wavelength
+                # Use actual data range instead
+                display_vmin = np.nanmin(display_data)
+                display_vmax = np.nanmax(display_data)
+                print(f"✨ Auto-computed vmin/vmax from wavelength data:")
+                print(f"   Intensity range: [{display_vmin:.6f}, {display_vmax:.6f}]")
+            elif vmin is not None and vmax is not None:
+                # User specified scalar vmin/vmax - use them
+                display_vmin = vmin
+                display_vmax = vmax
+                print(f"✨ Using user-specified vmin/vmax:")
+                print(f"   Intensity range: [{display_vmin:.6f}, {display_vmax:.6f}]")
+            else:
+                # No vmin/vmax specified at all - use data range
+                display_vmin = np.nanmin(display_data)
+                display_vmax = np.nanmax(display_data)
+                print(f"✨ Auto-computed vmin/vmax from wavelength data:")
+                print(f"   Intensity range: [{display_vmin:.6f}, {display_vmax:.6f}]")
+
+            mesh = ax.pcolormesh(
+                Xc,
+                Yc,
+                display_data,
+                shading="flat",
+                cmap=wavelength_colormap_obj,
+                vmin=display_vmin,
+                vmax=display_vmax,
+                **pcolor_kwargs,
+            )
         else:
-            ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
+            # RGB mode: pass 3D RGB array
+            mesh = ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
 
         # Store coordinate arrays for interactive tools (e.g., plot_georef_interactive_lines)
         ax._gref_coord_arrays = (Xp, Yp, start_idx)
@@ -1628,62 +1806,104 @@ class CombinedTransectCube:
             # Sort ROIs for consistent legend order
             rois_to_plot = sort_rois_by_category(rois_to_plot)
 
-            # Plot each ROI with different color
-            for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
-                if roi_pixels_list:
-                    # Convert (slit, track) to georeferenced coordinates
-                    roi_x_coords = []
-                    roi_y_coords = []
+            # Check overlay mode: solid or markers
+            if roi_overlay_mode == "solid":
+                # Solid overlay mode: ROI pixels already colored in RGB above
+                # Just add legend entries without scatter plots
+                from matplotlib.patches import Patch
 
-                    for slit, track in roi_pixels_list:
-                        # Adjust track by start_idx
-                        t = track - start_idx
-
-                        # Bounds check
-                        if 0 <= t < T and 0 <= slit < S:
-                            roi_x_coords.append(Xp[t, slit])
-                            roi_y_coords.append(Yp[t, slit])
-
-                    if roi_x_coords:
-                        # NEW: Get consistent color across all plots
+                legend_handles = []
+                for roi_name, roi_pixels_list in rois_to_plot.items():
+                    if roi_name in roi_pixel_counts and roi_pixel_counts[roi_name] > 0:
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
-
-                        # Plot ROI with solid colors - FAST METHOD
-                        ax.scatter(
-                            roi_x_coords,
-                            roi_y_coords,
-                            c=color,
-                            s=roi_marker_size**2 * 50,
-                            marker="s",
-                            edgecolors="black" if roi_marker_edgewidth > 0 else "none",
-                            linewidths=roi_marker_edgewidth,
-                            alpha=1.0,
-                            label=f"{roi_name} ({len(roi_x_coords)})",
-                            zorder=11,
+                        legend_handles.append(
+                            Patch(
+                                facecolor=color,
+                                label=f"{roi_name} ({roi_pixel_counts[roi_name]})",
+                            )
                         )
 
-                        # Optional: Add numbers
-                        if roi_show_numbers:
-                            for i, (x, y) in enumerate(
-                                zip(roi_x_coords, roi_y_coords), 1
-                            ):
-                                ax.text(
-                                    x,
-                                    y,
-                                    str(i),
-                                    ha="center",
-                                    va="center",
-                                    fontsize=8,
-                                    fontweight="bold",
-                                    color="white",
-                                    bbox=dict(
-                                        boxstyle="round,pad=0.3",
-                                        facecolor=color,
-                                        edgecolor="black",
-                                        linewidth=1,
-                                    ),
-                                    zorder=12,
-                                )
+                # Add legend if we have entries
+                if legend_handles and roi_legend_loc is not None:
+                    if roi_legend_loc == "outside":
+                        ax.legend(
+                            handles=legend_handles,
+                            loc="center left",
+                            bbox_to_anchor=(1.02, 0.5),
+                            fontsize=9,
+                            framealpha=0.9,
+                        )
+                    else:
+                        ax.legend(
+                            handles=legend_handles,
+                            loc=roi_legend_loc,
+                            fontsize=9,
+                            framealpha=0.9,
+                        )
+            else:
+                # Marker mode: Plot each ROI with scatter (original behavior)
+                # Plot each ROI with different color
+                for roi_idx, (roi_name, roi_pixels_list) in enumerate(
+                    rois_to_plot.items()
+                ):
+                    if roi_pixels_list:
+                        # Convert (slit, track) to georeferenced coordinates
+                        roi_x_coords = []
+                        roi_y_coords = []
+
+                        for slit, track in roi_pixels_list:
+                            # Adjust track by start_idx
+                            t = track - start_idx
+
+                            # Bounds check
+                            if 0 <= t < T and 0 <= slit < S:
+                                roi_x_coords.append(Xp[t, slit])
+                                roi_y_coords.append(Yp[t, slit])
+
+                        if roi_x_coords:
+                            # NEW: Get consistent color across all plots
+                            color = self._get_roi_color(
+                                roi_name, roi_colors, roi_color_map
+                            )
+
+                            # Plot ROI with solid colors - FAST METHOD
+                            ax.scatter(
+                                roi_x_coords,
+                                roi_y_coords,
+                                c=color,
+                                s=roi_marker_size**2 * 50,
+                                marker="s",
+                                edgecolors=(
+                                    "black" if roi_marker_edgewidth > 0 else "none"
+                                ),
+                                linewidths=roi_marker_edgewidth,
+                                alpha=1.0,
+                                label=f"{roi_name} ({len(roi_x_coords)})",
+                                zorder=11,
+                            )
+
+                            # Optional: Add numbers
+                            if roi_show_numbers:
+                                for i, (x, y) in enumerate(
+                                    zip(roi_x_coords, roi_y_coords), 1
+                                ):
+                                    ax.text(
+                                        x,
+                                        y,
+                                        str(i),
+                                        ha="center",
+                                        va="center",
+                                        fontsize=8,
+                                        fontweight="bold",
+                                        color="white",
+                                        bbox=dict(
+                                            boxstyle="round,pad=0.3",
+                                            facecolor=color,
+                                            edgecolor="black",
+                                            linewidth=1,
+                                        ),
+                                        zorder=12,
+                                    )
 
         if coordinate_system.upper() == "LATLON":
             if origin and origin[0] != 0:
@@ -1893,9 +2113,11 @@ class CombinedTransectCube:
             fig.canvas.mpl_connect("button_press_event", on_click)
             print("💡 Interactive mode: Click on the plot to display coordinates")
 
-        # Add legend if perimeter lines or ROIs are shown
+        # Add legend if perimeter lines or ROIs are shown (only for marker mode)
+        # Note: In solid overlay mode, legend is already created in the ROI plotting section above
         if (
-            perimeter_line is not None or roi_collection is not None
+            perimeter_line is not None
+            or (roi_collection is not None and roi_overlay_mode != "solid")
         ) and roi_legend_loc is not None:
             if roi_legend_loc == "outside":
                 # Place legend outside the plot area on the right
@@ -2131,6 +2353,47 @@ class CombinedTransectCube:
                 color=north_arrow_color,
                 weight="bold",
                 zorder=1000,
+            )
+
+        # -------- Colorbar for wavelength mode --------
+        if use_wavelength_colormap:
+            # Add colorbar with wavelength information
+            cbar = plt.colorbar(mesh, ax=ax, fraction=colorbar_fraction, pad=0.04)
+
+            # Compute actual range - use the raw intensity values, not normalized [0,1]
+            if vmin is not None and vmax is not None:
+                # If vmin/vmax were tuples, they were already converted to scalars earlier
+                # Use the original vmin/vmax (not the normalized 0-1 range)
+                if isinstance(vmin, (tuple, list)):
+                    range_min = np.mean(vmin)
+                else:
+                    range_min = vmin
+                if isinstance(vmax, (tuple, list)):
+                    range_max = np.mean(vmax)
+                else:
+                    range_max = vmax
+            else:
+                range_min = np.nanmin(wavelength_intensity_raw)
+                range_max = np.nanmax(wavelength_intensity_raw)
+
+            # Set colorbar label
+            if derivative_order == 0:
+                cbar.set_label(
+                    f"Intensity at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                )
+            elif derivative_order == 1:
+                cbar.set_label(
+                    f"dI/dλ at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                )
+            elif derivative_order == 2:
+                cbar.set_label(
+                    f"d²I/dλ² at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                )
+
+            # Update tick labels to show actual intensity values
+            cbar_ticks = cbar.get_ticks()
+            cbar.set_ticklabels(
+                [f"{range_min + t * (range_max - range_min):.3f}" for t in cbar_ticks]
             )
 
         fig.tight_layout()
@@ -2578,9 +2841,18 @@ class CombinedTransectCube:
             # Add colorbar with wavelength information
             cbar = plt.colorbar(mesh, ax=ax, fraction=colorbar_fraction, pad=0.04)
 
-            # Compute actual range
+            # Compute actual range - use the raw intensity values, not normalized [0,1]
             if vmin is not None and vmax is not None:
-                range_min, range_max = vmin, vmax
+                # If vmin/vmax were tuples, they were already converted to scalars earlier
+                # Use the original vmin/vmax (not the normalized 0-1 range)
+                if isinstance(vmin, (tuple, list)):
+                    range_min = np.mean(vmin)
+                else:
+                    range_min = vmin
+                if isinstance(vmax, (tuple, list)):
+                    range_max = np.mean(vmax)
+                else:
+                    range_max = vmax
             else:
                 range_min = np.nanmin(wavelength_intensity_raw)
                 range_max = np.nanmax(wavelength_intensity_raw)
