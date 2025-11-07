@@ -635,10 +635,11 @@ class MBESDetrender:
             OUTPUT_FOLDER = None
             UHI_FILES = None
             UHI_TRACK_RANGE = None
-            
+
             try:
                 # Try mjosa_code config first (preferred)
                 from utils.common import config
+
                 OUTPUT_FOLDER = config.OUTPUT_FOLDER
                 UHI_FILES = config.UHI_FILES
                 UHI_TRACK_RANGE = config.UHI_TRACK_RANGE
@@ -684,19 +685,25 @@ class MBESDetrender:
 
         try:
             # Import georef module
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            georef_dir = os.path.join(
-                os.path.dirname(os.path.dirname(current_dir)), "gref_pipeline"
-            )
+            # Try to find gref4hsi/final_act/utils/gref_pipeline from mjosa_code location
+            current_dir = os.path.dirname(
+                os.path.abspath(__file__)
+            )  # mjosa_code/utils/mbes
+            mjosa_code_root = os.path.dirname(
+                os.path.dirname(current_dir)
+            )  # mjosa_code
+            gref4hsi_root = os.path.dirname(mjosa_code_root)  # gref4hsi
+            georef_dir = os.path.join(gref4hsi_root, "gref4hsi", "final_act", "utils")
+
             if georef_dir not in sys.path:
                 sys.path.insert(0, georef_dir)
-            from utils.gref_pipeline import georef
-            from utils.gref_pipeline.georef import _ecef_to_ned_arrays
+            from gref_pipeline import georef
+            from gref_pipeline.georef import _ecef_to_ned_arrays
         except ImportError:
             try:
-                # Alternative import path
-                import georef
-                from georef import _ecef_to_ned_arrays
+                # Alternative: try direct import (if gref_pipeline is in sys.path)
+                from utils.gref_pipeline import georef
+                from utils.gref_pipeline.georef import _ecef_to_ned_arrays
             except ImportError:
                 warnings.warn(
                     "Could not import georef module. Skipping UHI footprint loading."
@@ -863,23 +870,43 @@ class MBESDetrender:
             import sys
             import os
 
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            gref_pipeline_dir = os.path.join(
-                os.path.dirname(os.path.dirname(current_dir)), "gref_pipeline"
-            )
-            if gref_pipeline_dir not in sys.path:
-                sys.path.insert(0, gref_pipeline_dir)
-            from config import OUTPUT_FOLDER, UHI_FILES, UHI_TRACK_RANGE
-            from utils.gref_pipeline import georef
-        except ImportError:
+            # Try mjosa_code config first
             try:
-                from config import OUTPUT_FOLDER, UHI_FILES, UHI_TRACK_RANGE
-                import georef
+                from utils.common import config
+
+                OUTPUT_FOLDER = config.OUTPUT_FOLDER
+                UHI_FILES = config.UHI_FILES
+                UHI_TRACK_RANGE = config.UHI_TRACK_RANGE
             except ImportError:
-                raise ImportError(
-                    "Could not import required modules (config, georef). "
-                    "Check your Python path."
+                # Fall back to gref_pipeline config
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                mjosa_code_root = os.path.dirname(os.path.dirname(current_dir))
+                gref4hsi_root = os.path.dirname(mjosa_code_root)
+                gref_pipeline_dir = os.path.join(
+                    gref4hsi_root, "gref4hsi", "final_act", "utils", "gref_pipeline"
                 )
+                if gref_pipeline_dir not in sys.path:
+                    sys.path.insert(0, gref_pipeline_dir)
+                from config import OUTPUT_FOLDER, UHI_FILES, UHI_TRACK_RANGE
+
+            # Try importing georef
+            try:
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                mjosa_code_root = os.path.dirname(os.path.dirname(current_dir))
+                gref4hsi_root = os.path.dirname(mjosa_code_root)
+                georef_dir = os.path.join(
+                    gref4hsi_root, "gref4hsi", "final_act", "utils"
+                )
+                if georef_dir not in sys.path:
+                    sys.path.insert(0, georef_dir)
+                from gref_pipeline import georef
+            except ImportError:
+                from utils.gref_pipeline import georef
+        except ImportError:
+            raise ImportError(
+                "Could not import required modules (config, georef). "
+                "Check your Python path."
+            )
 
         transect_folder = self.uhi_transect_folder or OUTPUT_FOLDER
         uhi_files = self.uhi_files or UHI_FILES
@@ -1211,7 +1238,7 @@ class MBESDetrender:
         axs[0].set_title("Original")
         axs[0].set_xlabel(xlabel)
         axs[0].set_ylabel(ylabel)
-        fig.colorbar(im0, ax=axs[0], label="Depth (m)", fraction=0.025, pad=0.02)
+        fig.colorbar(im0, ax=axs[0], label="Depth [m]", fraction=0.025, pad=0.02)
         # Trend panel
         im1 = axs[1].imshow(
             np.ma.masked_invalid(self.trend),
@@ -1228,7 +1255,7 @@ class MBESDetrender:
         )
         axs[1].set_xlabel(xlabel)
         axs[1].set_ylabel(ylabel)
-        fig.colorbar(im1, ax=axs[1], label="Depth (m)", fraction=0.025, pad=0.02)
+        fig.colorbar(im1, ax=axs[1], label="Depth [m]", fraction=0.025, pad=0.02)
         # Residual panel
         vmin, vmax = _robust_sym_vlim(self.residuals, q=0.98)
         im2 = axs[2].imshow(
@@ -1565,7 +1592,10 @@ class MBESDetrender:
         outline_width: float = 1.2,
         outline_alpha: float = 0.9,
         cmap: str = "RdBu_r",
-        figsize: Tuple[int, int] = (9, 11),
+        figsize: Tuple[int, int] = (11, 9),  # Match plot_georef default
+        vmin: Optional[float] = None,  # Manual color scale min
+        vmax: Optional[float] = None,  # Manual color scale max
+        use_adjusted: bool = False,  # Use alignment-adjusted UHI coordinates
         show: bool = True,
     ) -> plt.Figure:
         """Plot MBES residuals zoomed to UHI footprint with pixel-perfect outline.
@@ -1625,8 +1655,11 @@ class MBESDetrender:
         if self.ned_origin is None:
             raise ValueError("plot_zoomed_residuals() requires ned_origin to be set.")
 
-        # Extract UHI footprint
-        E_uhi, N_uhi, mask_uhi = self.uhi_footprint
+        # Extract UHI footprint (use adjusted if requested)
+        if use_adjusted and self.uhi_footprint_adjusted is not None:
+            E_uhi, N_uhi, mask_uhi = self.uhi_footprint_adjusted
+        else:
+            E_uhi, N_uhi, mask_uhi = self.uhi_footprint
 
         # MBES is already in NED coordinates (x_cols = East, y_rows = North)
         # No coordinate transformation needed since load() already converted to NED
@@ -1652,7 +1685,11 @@ class MBESDetrender:
         )
 
         # Determine color limits for residuals
-        vmin, vmax = _robust_sym_vlim(self.residuals, q=0.98)
+        if vmin is None or vmax is None:
+            # Auto-calculate symmetric limits
+            auto_vmin, auto_vmax = _robust_sym_vlim(self.residuals, q=0.98)
+            vmin = vmin if vmin is not None else auto_vmin
+            vmax = vmax if vmax is not None else auto_vmax
 
         # Create MBES meshgrid for extent calculation
         extent_ned = [
@@ -1688,12 +1725,16 @@ class MBESDetrender:
             )
             ax.add_collection(lc)
 
-        # Zoom to footprint bounding box with padding
+        # Zoom to footprint bounding box WITHOUT padding (to match plot_georef behavior)
         xs_outline = comp_path.vertices[:, 0]
         ys_outline = comp_path.vertices[:, 1]
         x_min, x_max = np.nanmin(xs_outline), np.nanmax(xs_outline)
         y_min, y_max = np.nanmin(ys_outline), np.nanmax(ys_outline)
-        _pad_limits(ax, x_min, x_max, y_min, y_max, pad_frac=0.03, equal_aspect=True)
+
+        # Set tight limits without padding (like plot_georef)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_aspect("equal", adjustable="box")
 
         # Labels and title
         ax.set_title(
@@ -1704,7 +1745,333 @@ class MBESDetrender:
         ax.set_ylabel("North (m)")
 
         # Colorbar
-        cbar = fig.colorbar(im, ax=ax, label="MBES Residuals (m)")
+        cbar = fig.colorbar(im, ax=ax, label="Residuals [m]")
+
+        fig.tight_layout()
+
+        if show:
+            plt.show(block=False)
+
+        return fig
+
+    def plot_colorbar_only(
+        self,
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+        cmap: str = "RdBu_r",
+        label: str = "MBES Residuals [m]",
+        figsize: Tuple[float, float] = (2, 6),
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot standalone colorbar for MBES residuals.
+
+        Creates a separate figure with just the colorbar, useful for combining
+        with other plots or creating legends.
+
+        Parameters
+        ----------
+        vmin : float, optional
+            Minimum value for colorbar. If None, auto-calculated.
+        vmax : float, optional
+            Maximum value for colorbar. If None, auto-calculated.
+        cmap : str, optional
+            Colormap name. Defaults to 'RdBu_r'.
+        label : str, optional
+            Colorbar label. Defaults to 'MBES Residuals [m]'.
+        figsize : tuple, optional
+            Figure size (width, height). Defaults to (2, 6).
+        show : bool, optional
+            If True, display immediately. Defaults to True.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The colorbar figure.
+        """
+        assert self.trend is not None, "Run detrend() first."
+
+        # Determine color limits
+        if vmin is None or vmax is None:
+            auto_vmin, auto_vmax = _robust_sym_vlim(self.residuals, q=0.98)
+            vmin = vmin if vmin is not None else auto_vmin
+            vmax = vmax if vmax is not None else auto_vmax
+
+        # Create figure with just colorbar
+        fig, ax = plt.subplots(figsize=figsize, num="MBES Residuals Colorbar")
+
+        # Create a dummy mappable for the colorbar
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        sm = ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+
+        # Create colorbar
+        cbar = fig.colorbar(sm, cax=ax, label=label)
+
+        fig.tight_layout()
+
+        if show:
+            plt.show(block=False)
+
+        return fig
+
+    def plot_z_normalized_comparison(
+        self,
+        outline_color: str = "black",
+        outline_width: float = 1.2,
+        outline_alpha: float = 0.9,
+        figsize: Tuple[int, int] = (11, 9),
+        use_adjusted: bool = False,
+        flip_uhi_sign: bool = False,
+        normalization_method: str = "zscore",
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+        show: bool = True,
+    ) -> plt.Figure:
+        """Plot z-score normalized comparison of MBES and UHI data.
+
+        Creates a single heatmap showing the difference between MBES residuals
+        and UHI depth data after normalizing both to z-scores (or minmax).
+        This is equivalent to panel 4 from plot_uhi_mbes_comparison().
+
+        Parameters
+        ----------
+        outline_color : str, optional
+            Color of footprint outline. Defaults to 'black'.
+        outline_width : float, optional
+            Width of outline. Defaults to 1.2.
+        outline_alpha : float, optional
+            Opacity of outline. Defaults to 0.9.
+        figsize : tuple, optional
+            Figure size (width, height). Defaults to (11, 9) to match plot_georef.
+        use_adjusted : bool, optional
+            Use alignment-adjusted UHI coordinates. Defaults to False.
+        flip_uhi_sign : bool, optional
+            Flip sign of UHI data (depth → negative depth). Defaults to False.
+        normalization_method : str, optional
+            'zscore' or 'minmax'. Defaults to 'zscore'.
+        vmin : float, optional
+            Minimum color scale value. If None, uses robust percentile.
+        vmax : float, optional
+            Maximum color scale value. If None, uses robust percentile.
+        show : bool, optional
+            Display immediately. Defaults to True.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The comparison figure.
+        """
+        # Validation
+        if self.coord_system.lower() != "ned":
+            raise ValueError(
+                "plot_z_normalized_comparison() requires coord_system='ned'. "
+                f"Current coord_system='{self.coord_system}'"
+            )
+
+        if self.uhi_footprint is None:
+            raise ValueError("UHI footprint required.")
+
+        if self.residuals is None:
+            raise ValueError("Residuals not computed. Call .detrend() first.")
+
+        if self.ned_origin is None:
+            raise ValueError("ned_origin required for NED coordinate system.")
+
+        # Select footprint (original or adjusted)
+        using_adjusted = use_adjusted and self.uhi_footprint_adjusted is not None
+        if using_adjusted:
+            E_uhi, N_uhi, mask_valid = self.uhi_footprint_adjusted
+        else:
+            E_uhi, N_uhi, mask_valid = self.uhi_footprint
+
+        # Load UHI cube (cached after first call)
+        _, uhi_mean, _, _ = self._ensure_uhi_cube_loaded(window_size=1000, strength=1.0)
+
+        # Build pixel-perfect footprint path
+        Xc_uhi, Yc_uhi = pcolormesh_pad(E_uhi, N_uhi)
+        segs_xy, segs_idx = _boundary_segments_from_mask(mask_valid, Xc_uhi, Yc_uhi)
+
+        if len(segs_idx) == 0:
+            warnings.warn("No valid UHI footprint boundary.")
+            fig, ax = plt.subplots(figsize=figsize)
+            ax.text(0.5, 0.5, "No valid footprint", ha="center", va="center")
+            return fig
+
+        loops = _trace_loops_from_segments(segs_idx)
+        footprint_path = _compound_path_from_loops(loops, Xc_uhi, Yc_uhi)
+        xs_outline = footprint_path.vertices[:, 0]
+        ys_outline = footprint_path.vertices[:, 1]
+        x_min, x_max = np.nanmin(xs_outline), np.nanmax(xs_outline)
+        y_min, y_max = np.nanmin(ys_outline), np.nanmax(ys_outline)
+
+        # MBES grid in NED
+        from scipy.spatial import cKDTree
+
+        mbes_e_ned = self.x_cols
+        mbes_n_ned = self.y_rows
+        extent_ned = [
+            np.min(mbes_e_ned),
+            np.max(mbes_e_ned),
+            np.min(mbes_n_ned),
+            np.max(mbes_n_ned),
+        ]
+
+        # Create MBES grid for inside check
+        MBES_E, MBES_N = np.meshgrid(mbes_e_ned, mbes_n_ned)
+
+        # Determine which MBES pixels are inside UHI footprint
+        pts_mbes = np.column_stack([MBES_E.ravel(), MBES_N.ravel()])
+        inside = footprint_path.contains_points(pts_mbes).reshape(MBES_E.shape)
+
+        # Resample UHI mean to MBES grid (reuse cache if available)
+        if self._uhi_resampled_cache is not None and not using_adjusted:
+            uhi_on_mbes = self._uhi_resampled_cache
+        else:
+            valid_uhi = (
+                mask_valid
+                & np.isfinite(uhi_mean)
+                & np.isfinite(E_uhi)
+                & np.isfinite(N_uhi)
+            )
+            uhi_on_mbes = np.full(self.residuals.shape, np.nan, dtype=float)
+            if np.any(valid_uhi):
+                uhi_pts = np.column_stack([E_uhi[valid_uhi], N_uhi[valid_uhi]])
+                uhi_vals = uhi_mean[valid_uhi]
+                tree = cKDTree(uhi_pts)
+                idx_inside = np.where(inside.ravel())[0]
+                d, nn = tree.query(pts_mbes[idx_inside], k=1)
+                flat = uhi_on_mbes.ravel()
+                flat[idx_inside] = uhi_vals[nn]
+                uhi_on_mbes = flat.reshape(MBES_E.shape)
+            if not using_adjusted:
+                # Cache only if not adjusted
+                self._uhi_resampled_cache = uhi_on_mbes
+
+        # Compute normalized values for comparison
+        mbes_in = np.where(inside, self.residuals, np.nan)
+        uhi_in = np.where(inside, uhi_on_mbes, np.nan)
+
+        # Optionally flip UHI sign
+        if flip_uhi_sign:
+            uhi_in = -uhi_in
+
+        # Extract valid paired samples BEFORE normalization
+        valid_pairs_mask = np.isfinite(mbes_in) & np.isfinite(uhi_in)
+        mbes_valid = mbes_in[valid_pairs_mask]
+        uhi_valid = uhi_in[valid_pairs_mask]
+
+        # Normalize each dataset INDEPENDENTLY
+        if normalization_method.lower() == "minmax":
+            # Normalize to [0, 1] then center at 0
+            mbes_min, mbes_max = np.nanmin(mbes_valid), np.nanmax(mbes_valid)
+            uhi_min, uhi_max = np.nanmin(uhi_valid), np.nanmax(uhi_valid)
+            mbes_norm = (mbes_valid - mbes_min) / (mbes_max - mbes_min) - 0.5
+            uhi_norm = (uhi_valid - uhi_min) / (uhi_max - uhi_min) - 0.5
+            norm_label = "normalized [0-1]"
+        elif normalization_method.lower() == "zscore":
+            # Robust z-score: (x - median) / MAD
+            from scipy.stats import median_abs_deviation
+
+            mbes_med = np.nanmedian(mbes_valid)
+            uhi_med = np.nanmedian(uhi_valid)
+            mbes_mad = median_abs_deviation(mbes_valid, nan_policy="omit")
+            uhi_mad = median_abs_deviation(uhi_valid, nan_policy="omit")
+            mbes_norm = (mbes_valid - mbes_med) / mbes_mad
+            uhi_norm = (uhi_valid - uhi_med) / uhi_mad
+            norm_label = "z-units"
+        else:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Choose 'zscore' or 'minmax'."
+            )
+
+        # Reconstruct grids with normalized values
+        z_mbes = np.full_like(mbes_in, np.nan)
+        z_uhi = np.full_like(uhi_in, np.nan)
+        z_mbes[valid_pairs_mask] = mbes_norm
+        z_uhi[valid_pairs_mask] = uhi_norm
+
+        # Δ = MBES - UHI
+        diff_z = z_mbes - z_uhi
+
+        # Determine color limits
+        finite_diff = np.isfinite(diff_z)
+
+        if vmin is None or vmax is None:
+            if normalization_method.lower() == "minmax":
+                # Use symmetric limits for minmax
+                if np.any(finite_diff):
+                    diff_data = diff_z[finite_diff]
+                    p2 = float(np.nanpercentile(diff_data, 2.0))
+                    p98 = float(np.nanpercentile(diff_data, 98.0))
+                    vlim = max(abs(p2), abs(p98))
+                    vmin_auto, vmax_auto = -vlim, vlim
+                else:
+                    vmin_auto, vmax_auto = -1.0, 1.0
+            else:
+                # Zscore: robust symmetric
+                vmax_auto = (
+                    np.nanpercentile(np.abs(diff_z[finite_diff]), 98.0)
+                    if np.any(finite_diff)
+                    else 1.0
+                )
+                vmin_auto = -vmax_auto
+
+            if vmin is None:
+                vmin = vmin_auto
+            if vmax is None:
+                vmax = vmax_auto
+
+        # Create figure
+        fig, ax = plt.subplots(
+            figsize=figsize, num="Z-Normalized Comparison: MBES − UHI"
+        )
+
+        # Plot difference heatmap
+        im = ax.imshow(
+            np.ma.masked_invalid(diff_z),
+            extent=extent_ned,
+            origin="upper",
+            cmap="RdBu_r",
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        # Clip to footprint
+        im.set_clip_path(
+            PathPatch(footprint_path, transform=ax.transData, facecolor="none")
+        )
+
+        # Draw outline
+        if len(segs_xy) > 0:
+            lc = LineCollection(
+                segs_xy,
+                colors=outline_color,
+                linewidths=outline_width,
+                alpha=outline_alpha,
+                zorder=10,
+            )
+            ax.add_collection(lc)
+
+        # Set limits (tight, no padding)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_aspect("equal", adjustable="box")
+
+        # Labels
+        ax.set_title(f"Δ ({norm_label}): MBES − UHI")
+        ax.set_xlabel("East (m)")
+        ax.set_ylabel("North (m)")
+
+        # Colorbar
+        fig.colorbar(
+            im,
+            ax=ax,
+            label=f"Δ ({norm_label})\n+ve=MBES shallower",
+        )
 
         fig.tight_layout()
 
@@ -1808,12 +2175,17 @@ class MBESDetrender:
 
         # Get track range (use config if not explicitly set)
         try:
-            from gref_pipeline.config import UHI_TRACK_RANGE
+            from utils.common import config
+
+            UHI_TRACK_RANGE = config.UHI_TRACK_RANGE
         except ImportError:
             try:
-                from config import UHI_TRACK_RANGE
+                from gref_pipeline.config import UHI_TRACK_RANGE
             except ImportError:
-                raise ImportError("Could not import UHI_TRACK_RANGE from config")
+                try:
+                    from config import UHI_TRACK_RANGE
+                except ImportError:
+                    raise ImportError("Could not import UHI_TRACK_RANGE from config")
 
         track_range = self.uhi_track_range or UHI_TRACK_RANGE
         track_start, track_end = track_range
@@ -2059,7 +2431,7 @@ class MBESDetrender:
         axM.set_xlabel("East (m)")
         axM.set_ylabel("North (m)")
         fig.colorbar(
-            im_mbes, ax=axM, fraction=0.025, pad=0.02, label="MBES Residuals (m)"
+            im_mbes, ax=axM, fraction=0.025, pad=0.02, label="MBES Residuals [m]"
         )
 
         # Panel 4: Δz heatmap (normalized difference)
