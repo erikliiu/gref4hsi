@@ -1595,6 +1595,9 @@ class MBESDetrender:
         figsize: Tuple[int, int] = (11, 9),  # Match plot_georef default
         vmin: Optional[float] = None,  # Manual color scale min
         vmax: Optional[float] = None,  # Manual color scale max
+        cbar_fraction: float = 0.046,  # Colorbar width as fraction of axis width
+        cbar_pad: float = 0.04,  # Colorbar padding from axis
+        cbar_shrink: float = 1.0,  # Colorbar height as fraction of axis height
         use_adjusted: bool = False,  # Use alignment-adjusted UHI coordinates
         show: bool = True,
     ) -> plt.Figure:
@@ -1622,6 +1625,12 @@ class MBESDetrender:
             Colormap for the residuals. Defaults to 'RdBu_r' (red-blue reversed).
         figsize : tuple, optional
             Figure size in inches (width, height). Defaults to (9, 11).
+        cbar_fraction : float, optional
+            Colorbar width as fraction of axis width. Defaults to 0.046.
+        cbar_pad : float, optional
+            Colorbar padding from axis. Defaults to 0.04.
+        cbar_shrink : float, optional
+            Colorbar height as fraction of axis height (0.0-1.0). Defaults to 1.0.
         show : bool, optional
             If True, display the figure immediately. Defaults to True.
 
@@ -1691,6 +1700,11 @@ class MBESDetrender:
             vmin = vmin if vmin is not None else auto_vmin
             vmax = vmax if vmax is not None else auto_vmax
 
+        # Print colorbar limits for user reference
+        print(
+            f"🎨 MBES plot_zoomed_residuals colorbar range: vmin={vmin:.4f}, vmax={vmax:.4f}"
+        )
+
         # Create MBES meshgrid for extent calculation
         extent_ned = [
             np.min(mbes_e_ned),
@@ -1744,8 +1758,15 @@ class MBESDetrender:
         ax.set_xlabel("East (m)")
         ax.set_ylabel("North (m)")
 
-        # Colorbar
-        cbar = fig.colorbar(im, ax=ax, label="Residuals [m]")
+        # Colorbar with adjustable size
+        cbar = fig.colorbar(
+            im,
+            ax=ax,
+            label="Residuals [m]",
+            fraction=cbar_fraction,
+            pad=cbar_pad,
+            shrink=cbar_shrink,
+        )
 
         fig.tight_layout()
 

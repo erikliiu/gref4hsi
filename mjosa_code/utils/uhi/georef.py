@@ -746,36 +746,54 @@ class CombinedTransectCube:
         str : Color code for this ROI
         """
         # Hardcoded colors for specific ROIs (always used unless overridden by custom_color_map)
+        # 🎨 COLOR PALETTE - Define once, reuse everywhere
+        COLOR_BOMBS = "#1E90FF"  # dodger blue (main bomb color)
+        COLOR_DARK = "#000000"  # black (main dark feature color)
+        COLOR_SEDIMENT = "#8b4513"  # saddle brown (main sediment color)
+        COLOR_UNKNOWN = "#8A2BE2"  # violet purple (for unknown/rejected)
+        COLOR_FILTERED_DARK = "#FFFF00"  # yellow (for filtered dark pixels)
+
         HARDCODED_ROI_COLORS = {
-            "single bomb ring": "#1E90FF",  # dodger blue
-            "single bomb inside": "#00FFFF",  # neon cyan blue
+            # Individual bomb features
+            "single bomb ring": COLOR_BOMBS,
+            "single bomb inside": "#00FFFF",  # neon cyan blue (lighter variant)
             "double bomb 1": "#FF8C00",  # dark orange
             "double bomb 2": "#FFD700",  # gold
             "tripple bomb 1": "#800080",  # purple
             "tripple bomb 2": "#8A2BE2",  # violet
             "tripple bomb 3": "#FF00FF",  # bright magenta
-            "all bombs": "#1E90FF",  # blue (group class)
-            "dark bomb": "#000000",  # black
-            "dark spots": "#000000",  # pure black
-            "dark sediment": "#555555",  # medium-dark gray
-            "sediment": "#8B4513",  # brown
-            "brown leaf": "#8B4513",  # brown (same as sediment)
-            "yellow leaf": "#FFD700",  # gold/yellow (same as double bomb 2)
-            # 🔥 Training ROIs (base colors)
-            "training_bombs": "#FF0000",  # red
-            "training_dark": "#000000",  # black
-            "training_sediment": "#8B4513",  # brown (same as sediment)
-            # 🔥 Classification output (same colors as training_*)
-            "classified_unknown": "#8A2BE2",  # red (same as training_bombs)
-            "classified_bombs": "#FF0000",  # red (same as training_bombs)
-            "classified_dark": "#000000",  # black (same as training_dark)
-            "classified_sediment": "#8B4513",  # brown (same as training_sediment)
-            # 🔥 Filtered classes (distinct colors for visibility)
-            "filtered_bombs": "#0000FF",  # blue
-            "filtered_dark": "#FFFF00",  # yellow
+            "all bombs": COLOR_BOMBS,
+            "dark bomb": COLOR_DARK,
+            # Dark features
+            "dark spots": COLOR_DARK,
+            "dark sediment": "#555555",  # medium-dark gray (distinct from pure black)
+            # Sediment variants
+            "sediment": COLOR_SEDIMENT,
+            "brown leaf": COLOR_SEDIMENT,
+            "yellow leaf": "#FFD700",  # gold/yellow
+            # 🔥 VALIDATION ROIs (inherit colors from training)
+            "validation_bombs": COLOR_BOMBS,
+            "validation_dark": COLOR_DARK,
+            "validation_sediment": COLOR_SEDIMENT,
+            # 🔥 TRAINING ROIs (base colors)
+            "training_bombs": COLOR_BOMBS,
+            "training_dark": COLOR_DARK,
+            "training_sediment": COLOR_SEDIMENT,
+            # 🔥 CLASSIFICATION output (same colors as training)
+            "classified_unknown": COLOR_UNKNOWN,
+            "classified_bombs": COLOR_BOMBS,
+            "classified_dark": COLOR_DARK,
+            "classified_sediment": COLOR_SEDIMENT,
+            # 🔥 FILTERED classes (filtered_dark is distinct for visibility)
+            "filtered_bombs": COLOR_BOMBS,
+            "filtered_dark": COLOR_FILTERED_DARK,  # yellow (stands out)
             "filtered_sediment": "#D2B48C",  # tan (lighter brown)
-            # 🔥 Merged class for validation
-            "new_sediment": "#8B4513",  # brown (same as training_sediment)
+            # 🔥 MERGED class for validation
+            "new_sediment": COLOR_SEDIMENT,
+            # 🔥 DISPLAY names (for plot_classification_map after name mapping)
+            "bombs": COLOR_BOMBS,
+            "dark": COLOR_DARK,
+            "sediment": COLOR_SEDIMENT,
         }
 
         # NEW: Smart pattern matching for consistent color hues by feature type
@@ -844,10 +862,21 @@ class CombinedTransectCube:
             return custom_color_map[roi_name]
 
         # Priority 2: Hardcoded colors for known ROIs
+        # Strip pixel count suffix if present (e.g., "bombs (2369 px)" → "bombs")
+        base_roi_name = roi_name
+        if " px)" in roi_name:
+            # Extract base name before pixel count
+            base_roi_name = roi_name.rsplit(" (", 1)[0]
+        
+        # Check both the full name and the base name
         if roi_name in HARDCODED_ROI_COLORS:
             # Save to persistent map for consistency
             self.roi_color_map[roi_name] = HARDCODED_ROI_COLORS[roi_name]
             return HARDCODED_ROI_COLORS[roi_name]
+        elif base_roi_name in HARDCODED_ROI_COLORS:
+            # Found base name, use that color
+            self.roi_color_map[roi_name] = HARDCODED_ROI_COLORS[base_roi_name]
+            return HARDCODED_ROI_COLORS[base_roi_name]
 
         # Priority 3: Persistent color map (already assigned)
         if roi_name in self.roi_color_map:
@@ -909,6 +938,13 @@ class CombinedTransectCube:
         track_start=None,  # inclusive
         track_end=None,  # exclusive
         use_corrected=False,  # use illumination corrected data if available
+        depth_overlay=False,  # NEW: Display Beer-Lambert depth heatmap instead of RGB
+        depth_cmap="RdBu_r",  # Colormap for depth (blue=elevated/shallow, red=deep/pits)
+        depth_vmin=None,  # Manual min depth (meters), auto if None
+        depth_vmax=None,  # Manual max depth (meters), auto if None
+        depth_cbar_fraction=0.046,  # Colorbar width as fraction of axis width
+        depth_cbar_pad=0.04,  # Colorbar padding from axis
+        depth_cbar_shrink=1.0,  # Colorbar height as fraction of axis height (0.0-1.0)
         apply_alignment_shift=False,  # apply UHI alignment shift from config (NED only)
         # trajectory options
         show_trajectory=False,
@@ -943,10 +979,13 @@ class CombinedTransectCube:
         scale_bar_position="lower left",  # Position: 'lower left', 'lower right', 'upper left', 'upper right'
         scale_bar_color="black",  # Color of scale bar
         scale_bar_fontsize=10,  # Font size for scale bar text
+        scale_bar_linewidth=4,  # Thickness of scale bar line
         add_north_arrow=False,  # Add north arrow to plot
         north_arrow_position="upper right",  # Position: 'lower left', 'lower right', 'upper left', 'upper right'
         north_arrow_size=0.08,  # Size of north arrow relative to plot (0.0-1.0)
         north_arrow_color="black",  # Color of north arrow
+        north_arrow_linewidth=4,  # Thickness of north arrow line
+        north_arrow_head_size=40,  # Size of arrow head (mutation_scale)
         # Single-wavelength colormap options (NEW - from plot_rgb)
         use_wavelength_colormap=False,  # If True, plot single wavelength with natural color
         wavelength_colormap_target=None,  # Target wavelength (nm) for single-wavelength mode
@@ -962,7 +1001,9 @@ class CombinedTransectCube:
             1.37,
             1.73,
         ),  # Manual max value for colormap normalization (single value or per-channel tuple)
-        colorbar_fraction=0.046,  # Size of colorbar relative to main plot
+        colorbar_fraction=0.046,  # Size of colorbar relative to main plot (width control)
+        colorbar_pad=0.04,  # Padding between plot and colorbar
+        colorbar_shrink=1.0,  # Shrink factor for colorbar height (1.0 = full height)
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -1016,6 +1057,9 @@ class CombinedTransectCube:
         scale_bar_fontsize : int, optional
             Font size for scale bar label. Default: 10
 
+        scale_bar_linewidth : float, optional
+            Thickness of the scale bar line and ticks. Default: 4
+
         add_north_arrow : bool, optional
             Add a north arrow to the plot. Arrow automatically adjusts for rotation_deg.
             Default: False
@@ -1029,6 +1073,13 @@ class CombinedTransectCube:
 
         north_arrow_color : str, optional
             Color of north arrow and label. Default: 'black'
+
+        north_arrow_linewidth : float, optional
+            Thickness of the north arrow line. Default: 4
+
+        north_arrow_head_size : float, optional
+            Size of the arrow head (mutation_scale parameter). Larger values create
+            bigger arrow heads. Default: 40
         """
         # Check if georef data is available
         if not self.has_georef:
@@ -1455,12 +1506,89 @@ class CombinedTransectCube:
                     ]
             T, S = X_ecef.shape
 
+        # ============================================================================
+        # NEW: Beer-Lambert Depth Overlay
+        # ============================================================================
+        if depth_overlay:
+            # Check if depth data has been computed
+            if not hasattr(self, "depth_map") or self.depth_map is None:
+                raise RuntimeError(
+                    "❌ ERROR: Depth map not computed!\\n"
+                    "   Please run: cube.compute_beer_lambert_depth()\\n"
+                    "   before using depth_overlay=True"
+                )
+
+            if not quiet:
+                print("🌊 Using Beer-Lambert depth overlay instead of RGB")
+                print(
+                    f"   Depth range requested: {self.depth_track_start} to {self.depth_track_end}"
+                )
+                print(f"   Plot range requested: {start_idx} to {end_idx}")
+
+            # Verify track ranges match
+            if start_idx < self.depth_track_start or end_idx > self.depth_track_end:
+                raise RuntimeError(
+                    f"❌ ERROR: Track range mismatch!\\n"
+                    f"   Depth computed for tracks [{self.depth_track_start}, {self.depth_track_end}]\\n"
+                    f"   But plot requests tracks [{start_idx}, {end_idx}]\\n"
+                    f"   Please recompute depth with matching track range."
+                )
+
+            # Extract depth data for requested track range (relative to depth_track_start)
+            depth_start_offset = start_idx - self.depth_track_start
+            depth_end_offset = end_idx - self.depth_track_start
+            depth_data = self.depth_map[
+                depth_start_offset:depth_end_offset, :
+            ]  # (T, S)
+
+            if not quiet:
+                print(f"   Depth data shape: {depth_data.shape}")
+                print(
+                    f"   Depth range: {depth_data.min():.3f} to {depth_data.max():.3f} m"
+                )
+
+            # Determine colormap range
+            if depth_vmin is None:
+                depth_vmin = np.percentile(depth_data[np.isfinite(depth_data)], 2)
+            if depth_vmax is None:
+                depth_vmax = np.percentile(depth_data[np.isfinite(depth_data)], 98)
+
+            # Always print colorbar limits for user reference
+            print(
+                f"🎨 UHI plot_georef depth colorbar range: depth_vmin={depth_vmin:.4f}, depth_vmax={depth_vmax:.4f}"
+            )
+
+            if not quiet:
+                print(f"   Colormap range: [{depth_vmin:.3f}, {depth_vmax:.3f}] m")
+
+            # Normalize depth to [0, 1] for colormap
+            depth_normalized = np.clip(
+                (depth_data - depth_vmin) / (depth_vmax - depth_vmin), 0, 1
+            )
+
+            # Apply colormap
+            import matplotlib.cm as cm
+
+            cmap = cm.get_cmap(depth_cmap)
+            depth_rgba = cmap(depth_normalized)  # (T, S, 4) RGBA
+
+            # Extract RGB channels (discard alpha)
+            R = depth_rgba[:, :, 0]
+            G = depth_rgba[:, :, 1]
+            B = depth_rgba[:, :, 2]
+
+            if not quiet:
+                print(f"✅ Depth colormap applied ({depth_cmap})")
+
+            # Override wavelength colormap mode if it was set
+            use_wavelength_colormap = False
+
         RGB = np.dstack([R, G, B]).astype(np.float64)
         alpha = np.ones((T, S), dtype=np.float64)
         alpha[~(np.isfinite(R) & np.isfinite(G) & np.isfinite(B))] = 0.0
 
-        # Apply contrast stretch if requested
-        if contrast_stretch is not None and contrast_stretch > 0:
+        # Apply contrast stretch if requested (skip for depth overlay as it has its own normalization)
+        if contrast_stretch is not None and contrast_stretch > 0 and not depth_overlay:
             for i in range(3):  # Apply to R, G, B channels separately
                 channel = RGB[:, :, i]
                 valid_data = channel[np.isfinite(channel)]
@@ -1813,10 +1941,18 @@ class CombinedTransectCube:
                 for roi_name, roi_pixels_list in rois_to_plot.items():
                     if roi_name in roi_pixel_counts and roi_pixel_counts[roi_name] > 0:
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
+                        # Check if roi_name already contains pixel count (e.g., "bombs (2369 px)")
+                        # If so, don't add it again to avoid duplication
+                        if " px)" in roi_name:
+                            # Already has pixel count, use as-is
+                            label = roi_name
+                        else:
+                            # Add pixel count
+                            label = f"{roi_name} ({roi_pixel_counts[roi_name]})"
                         legend_handles.append(
                             Patch(
                                 facecolor=color,
-                                label=f"{roi_name} ({roi_pixel_counts[roi_name]})",
+                                label=label,
                             )
                         )
 
@@ -2236,12 +2372,12 @@ class CombinedTransectCube:
             else:  # right
                 x_pos = xlim[1] - margin_x - scale_bar_length_plot
 
-            # Draw thicker scale bar
+            # Draw scale bar with user-specified thickness
             ax.plot(
                 [x_pos, x_pos + scale_bar_length_plot],
                 [y_pos, y_pos],
                 color=scale_bar_color,
-                linewidth=4,
+                linewidth=scale_bar_linewidth,
                 solid_capstyle="butt",
                 zorder=1000,
             )
@@ -2252,14 +2388,14 @@ class CombinedTransectCube:
                 [x_pos, x_pos],
                 [y_pos - tick_height, y_pos + tick_height],
                 color=scale_bar_color,
-                linewidth=4,
+                linewidth=scale_bar_linewidth,
                 zorder=1000,
             )
             ax.plot(
                 [x_pos + scale_bar_length_plot, x_pos + scale_bar_length_plot],
                 [y_pos - tick_height, y_pos + tick_height],
                 color=scale_bar_color,
-                linewidth=4,
+                linewidth=scale_bar_linewidth,
                 zorder=1000,
             )
 
@@ -2323,13 +2459,13 @@ class CombinedTransectCube:
             dx = arrow_length * np.sin(north_angle_rad)
             dy = arrow_length * np.cos(north_angle_rad)
 
-            # Draw arrow using FancyArrowPatch - thicker with larger head
+            # Draw arrow using FancyArrowPatch with user-specified head size and line thickness
             arrow = FancyArrowPatch(
                 (x_start, y_start),
                 (x_start + dx, y_start + dy),
                 arrowstyle="->",
-                mutation_scale=40,
-                linewidth=4,
+                mutation_scale=north_arrow_head_size,
+                linewidth=north_arrow_linewidth,
                 color=north_arrow_color,
                 zorder=1000,
             )
@@ -2354,8 +2490,14 @@ class CombinedTransectCube:
 
         # -------- Colorbar for wavelength mode --------
         if use_wavelength_colormap:
-            # Add colorbar with wavelength information
-            cbar = plt.colorbar(mesh, ax=ax, fraction=colorbar_fraction, pad=0.04)
+            # Add colorbar with wavelength information (with size controls)
+            cbar = plt.colorbar(
+                mesh,
+                ax=ax,
+                fraction=colorbar_fraction,
+                pad=colorbar_pad,
+                shrink=colorbar_shrink,
+            )
 
             # Compute actual range - use the raw intensity values, not normalized [0,1]
             if vmin is not None and vmax is not None:
@@ -2391,6 +2533,32 @@ class CombinedTransectCube:
             cbar_ticks = cbar.get_ticks()
             cbar.set_ticklabels(
                 [f"{range_min + t * (range_max - range_min):.3f}" for t in cbar_ticks]
+            )
+
+        # -------- Colorbar for depth overlay mode --------
+        if depth_overlay:
+            # Create a scalar mappable for the colorbar
+            import matplotlib.cm as cm
+            from matplotlib.colors import Normalize
+
+            norm = Normalize(vmin=depth_vmin, vmax=depth_vmax)
+            sm = cm.ScalarMappable(cmap=depth_cmap, norm=norm)
+            sm.set_array([])
+
+            # Add colorbar with adjustable size (width, height, padding)
+            cbar = plt.colorbar(
+                sm,
+                ax=ax,
+                fraction=depth_cbar_fraction,
+                pad=depth_cbar_pad,
+                shrink=depth_cbar_shrink,
+            )
+            cbar.set_label(
+                "Relative Depth Δz (m)",
+                rotation=270,
+                labelpad=20,
+                fontsize=12,
+                fontweight="bold",
             )
 
         fig.tight_layout()
@@ -2835,8 +3003,14 @@ class CombinedTransectCube:
 
         # -------- Colorbar for wavelength mode --------
         if use_wavelength_colormap:
-            # Add colorbar with wavelength information
-            cbar = plt.colorbar(mesh, ax=ax, fraction=colorbar_fraction, pad=0.04)
+            # Add colorbar with wavelength information (with size controls)
+            cbar = plt.colorbar(
+                mesh,
+                ax=ax,
+                fraction=colorbar_fraction,
+                pad=colorbar_pad,
+                shrink=colorbar_shrink,
+            )
 
             # Compute actual range - use the raw intensity values, not normalized [0,1]
             if vmin is not None and vmax is not None:
@@ -3309,8 +3483,66 @@ class CombinedTransectCube:
 
         return self.data_corrected
 
+    @staticmethod
+    def _compute_ref_for_slit_band(args):
+        """
+        Helper function for parallel computation of reference values.
+        Computes reference for a single (slit, band) pair.
+
+        Args:
+            args: Tuple of (s, b, file_paths, dset_name, use_global, window_size)
+
+        Returns:
+            Tuple of (s, b, ref_value) where ref_value is either a scalar or array
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+
+        s, b, file_paths, dset_name, use_global, window_size = args
+
+        # Collect values across all files for this slit-band
+        values = []
+        for file_path in file_paths:
+            with h5py.File(file_path, "r") as f:
+                if dset_name not in f:
+                    raise ValueError(f"Dataset {dset_name} not found in {file_path}")
+                values.append(f[dset_name][:, s, b])
+
+        ts = np.concatenate(values)
+
+        if use_global:
+            # Global: compute single median
+            ref = np.nanmedian(ts)
+            if not np.isfinite(ref) or ref == 0:
+                ref = 1.0
+            return (s, b, ref)
+        else:
+            # Rolling: compute rolling median
+            ref_vec = (
+                pd.Series(ts)
+                .rolling(window=int(window_size), center=True, min_periods=1)
+                .median()
+                .values
+            )
+            ref_vec[ref_vec == 0] = 1.0
+            ref_vec[~np.isfinite(ref_vec)] = 1.0
+            return (s, b, ref_vec.astype(np.float32))
+
     def apply_illumination_correction_v2(
-        self, window_size=500, strength=1.0, force_recompute=False
+        self,
+        window_size=500,
+        strength=1.0,
+        force_recompute=False,
+        use_smoothed_input=False,  # NEW: Use smoothed raw data as input
+        smooth_method="gaussian",  # NEW: Smoothing method used
+        smooth_sigma=2,  # NEW: For gaussian
+        smooth_window=10,  # NEW: For moving_average/savgol
+        smooth_polyorder=2,  # NEW: For savgol
+        smooth_kernel=5,  # NEW: For median
+        smooth_lambda=1e4,  # NEW: For whittaker
+        smooth_sigma_spatial=2,  # NEW: For bilateral
+        smooth_sigma_intensity=0.1,  # NEW: For bilateral
     ):
         """
         V2: Memory-efficient version using file-by-file processing and direct disk writes.
@@ -3326,31 +3558,118 @@ class CombinedTransectCube:
             Correction strength in [0,1]: 0=no change, 1=full correction.
         force_recompute : bool
             If True, recompute even if saved correction exists.
+        use_smoothed_input : bool, default=False
+            NEW: If True, uses smoothed raw data as input instead of raw data.
+            Requires that apply_spectral_smoothing(apply_to_raw=True) was run first.
+        smooth_method : str
+            NEW: Smoothing method to look for ('gaussian', 'moving_average', etc.)
+        smooth_sigma, smooth_window, etc. : various
+            NEW: Parameters for the smoothing method used.
+
+        Example:
+        --------
+        # Standard workflow (no smoothing):
+        >>> cube.apply_illumination_correction_v2()
+
+        # NEW: With pre-smoothed raw data:
+        >>> cube.apply_spectral_smoothing(method="gaussian", gaussian_sigma=5, apply_to_raw=True)
+        >>> cube.apply_illumination_correction_v2(use_smoothed_input=True, smooth_method="gaussian", smooth_sigma=5)
         """
         import h5py
         import numpy as np
         import pandas as pd
 
+        # Build smooth_params dictionary for naming
+        smooth_params = None
+        if use_smoothed_input:
+            smooth_params = {
+                "gaussian_sigma": smooth_sigma,
+                "wavelength_smoothing": smooth_window,
+                "savgol_polyorder": smooth_polyorder,
+                "median_kernel_size": smooth_kernel,
+                "whittaker_lambda": smooth_lambda,
+                "bilateral_sigma_spatial": smooth_sigma_spatial,
+                "bilateral_sigma_intensity": smooth_sigma_intensity,
+            }
+
         print("🔄 Using V2 algorithm (pandas rolling median, memory-efficient)")
+        if use_smoothed_input:
+            print(f"   📊 Using smoothed raw data as input (method={smooth_method})")
 
         # --- Check if already computed and saved ---
         if not force_recompute and self.has_illumination_correction(
-            window_size, strength
+            window_size, strength, use_smoothed_input, smooth_method, smooth_params
         ):
             print(
                 f"✅ Illumination correction already applied with window={window_size}, strength={strength}"
             )
+            if use_smoothed_input:
+                print(f"   (with smoothed input: {smooth_method})")
             print(f"   Loading from disk...")
-            return self.load_illumination_correction(window_size, strength)
+            return self.load_illumination_correction(
+                window_size, strength, use_smoothed_input, smooth_method, smooth_params
+            )
+
+        # NEW: Check if smoothed raw data exists when use_smoothed_input=True
+        if use_smoothed_input:
+            # Check if smoothed raw data cache exists
+            if not self.has_spectral_smoothing(
+                method=smooth_method,
+                wavelength_smoothing=smooth_window,
+                gaussian_sigma=smooth_sigma,
+                savgol_polyorder=smooth_polyorder,
+                median_kernel_size=smooth_kernel,
+                whittaker_lambda=smooth_lambda,
+                bilateral_sigma_spatial=smooth_sigma_spatial,
+                bilateral_sigma_intensity=smooth_sigma_intensity,
+                apply_to_raw=True,  # Check for RAW smoothing cache
+            ):
+                raise ValueError(
+                    f"❌ Smoothed raw data not found (method={smooth_method}).\n"
+                    f"   You must run apply_spectral_smoothing(method='{smooth_method}', ..., apply_to_raw=True) first!\n"
+                    f"   Example:\n"
+                    f"   >>> cube.apply_spectral_smoothing(method='{smooth_method}', gaussian_sigma={smooth_sigma}, apply_to_raw=True)\n"
+                    f"   >>> cube.apply_illumination_correction_v2(use_smoothed_input=True, smooth_method='{smooth_method}', smooth_sigma={smooth_sigma})"
+                )
+
+            print(f"✅ Found smoothed raw data cache (method={smooth_method})")
+
+            # Determine smoothed raw data dataset name
+            smoothed_raw_dset = self._get_smoothing_dataset_name(
+                method=smooth_method,
+                wavelength_smoothing=smooth_window,
+                gaussian_sigma=smooth_sigma,
+                savgol_polyorder=smooth_polyorder,
+                median_kernel_size=smooth_kernel,
+                whittaker_lambda=smooth_lambda,
+                bilateral_sigma_spatial=smooth_sigma_spatial,
+                bilateral_sigma_intensity=smooth_sigma_intensity,
+                apply_to_raw=True,
+            )
+        else:
+            smoothed_raw_dset = None
 
         # --- sizes ---
         T_total = 0
         S = B = None
         for gf in self.geofiles:
             with h5py.File(gf.path, "r") as f:
-                dset_name = gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
-                if dset_name not in f:
-                    dset_name = gf.DSET_RGB_MAIN
+                # NEW: Use smoothed raw data if requested
+                if use_smoothed_input and smoothed_raw_dset:
+                    if smoothed_raw_dset in f:
+                        dset_name = smoothed_raw_dset
+                    else:
+                        raise ValueError(
+                            f"❌ Smoothed raw data not found in {gf.name}: {smoothed_raw_dset}"
+                        )
+                else:
+                    # Original logic: use raw or corrected data
+                    dset_name = (
+                        gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
+                    )
+                    if dset_name not in f:
+                        dset_name = gf.DSET_RGB_MAIN
+
                 t, s, b = f[dset_name].shape
                 T_total += t
                 if S is None:
@@ -3367,6 +3686,14 @@ class CombinedTransectCube:
         # PHASE 1: Compute reference statistics across all files (memory-efficient)
         print("📊 Phase 1/2: Computing reference statistics...")
 
+        # Determine number of parallel workers
+        # Use ThreadPool instead of multiprocessing.Pool to avoid file locking issues on Windows
+        from multiprocessing.pool import ThreadPool
+        import multiprocessing as mp
+
+        n_workers = min(mp.cpu_count() - 1, 8)  # Use all CPUs minus 1, max 8
+        print(f"   Using {n_workers} parallel workers (thread-based)")
+
         try:
             from tqdm import tqdm
 
@@ -3376,71 +3703,85 @@ class CombinedTransectCube:
             use_tqdm = False
             pbar = None
 
+        # Determine dataset name to use
+        file_paths = [gf.path for gf in self.geofiles]
+
+        # Determine which dataset to load from
+        if use_smoothed_input and smoothed_raw_dset:
+            dset_name_to_use = smoothed_raw_dset
+        else:
+            # Check first file for dataset name
+            with h5py.File(file_paths[0], "r") as f:
+                gf0 = self.geofiles[0]
+                dset_name_to_use = (
+                    gf0.DSET_RGB_CORR if gf0.use_corrected else gf0.DSET_RGB_MAIN
+                )
+                if dset_name_to_use not in f:
+                    dset_name_to_use = gf0.DSET_RGB_MAIN
+
         # Store reference values (small memory footprint: S × B × 4 bytes)
         if use_global:
             # Global: one value per (slit, band)
             ref_values = np.ones((S, B), dtype=np.float32)
 
-            for s in range(S):
-                for b in range(B):
-                    # Collect values across all files for this slit-band
-                    values = []
-                    for gf in self.geofiles:
-                        with h5py.File(gf.path, "r") as f:
-                            dset_name = (
-                                gf.DSET_RGB_CORR
-                                if gf.use_corrected
-                                else gf.DSET_RGB_MAIN
-                            )
-                            if dset_name not in f:
-                                dset_name = gf.DSET_RGB_MAIN
-                            values.append(f[dset_name][:, s, b])
+            # Prepare arguments for parallel processing
+            args_list = [
+                (s, b, file_paths, dset_name_to_use, True, None)
+                for s in range(S)
+                for b in range(B)
+            ]
 
-                    ts = np.concatenate(values)
-                    ref = np.nanmedian(ts)
-                    if not np.isfinite(ref) or ref == 0:
-                        ref = 1.0
-                    ref_values[s, b] = ref
-                    del ts, values
-
-                    if use_tqdm:
+            # Process in parallel (using ThreadPool to avoid Windows file locking)
+            with ThreadPool(processes=n_workers) as pool:
+                if use_tqdm:
+                    results = []
+                    for result in pool.imap_unordered(
+                        self._compute_ref_for_slit_band, args_list
+                    ):
+                        results.append(result)
                         pbar.update(1)
+                else:
+                    results = pool.map(self._compute_ref_for_slit_band, args_list)
+
+            # Fill in results
+            for s, b, ref in results:
+                ref_values[s, b] = ref
         else:
             # Rolling: one vector per (slit, band)
             ref_values = {}
 
-            for s in range(S):
-                for b in range(B):
-                    # Collect values across all files
-                    values = []
-                    for gf in self.geofiles:
-                        with h5py.File(gf.path, "r") as f:
-                            dset_name = (
-                                gf.DSET_RGB_CORR
-                                if gf.use_corrected
-                                else gf.DSET_RGB_MAIN
-                            )
-                            if dset_name not in f:
-                                dset_name = gf.DSET_RGB_MAIN
-                            values.append(f[dset_name][:, s, b])
+            # Prepare arguments for parallel processing
+            args_list = [
+                (s, b, file_paths, dset_name_to_use, False, window_size)
+                for s in range(S)
+                for b in range(B)
+            ]
 
-                    ts = np.concatenate(values)
-                    ref_vec = (
-                        pd.Series(ts)
-                        .rolling(window=int(window_size), center=True, min_periods=1)
-                        .median()
-                        .values
-                    )
-                    ref_vec[ref_vec == 0] = 1.0
-                    ref_vec[~np.isfinite(ref_vec)] = 1.0
-                    ref_values[(s, b)] = ref_vec.astype(np.float32)
-                    del ts, values
-
-                    if use_tqdm:
+            # Process in parallel (using ThreadPool to avoid Windows file locking)
+            with ThreadPool(processes=n_workers) as pool:
+                if use_tqdm:
+                    for result in pool.imap_unordered(
+                        self._compute_ref_for_slit_band, args_list
+                    ):
+                        s, b, ref_vec = result
+                        ref_values[(s, b)] = ref_vec
                         pbar.update(1)
+                else:
+                    results = pool.map(self._compute_ref_for_slit_band, args_list)
+                    for s, b, ref_vec in results:
+                        ref_values[(s, b)] = ref_vec
 
         if use_tqdm:
             pbar.close()
+
+        # Force cleanup: ensure all threads have released file handles
+        # Windows can be slow to release HDF5 file locks even after closing
+        import time
+        import gc
+
+        gc.collect()  # Force garbage collection to close any lingering file handles
+        time.sleep(1.0)  # Give Windows time to release file locks (increased from 0.5s)
+        print("   ✓ Phase 1 complete, waiting for file locks to release...")
 
         # PHASE 2: Apply correction file-by-file and save directly to disk
         print("💾 Phase 2/2: Applying correction and saving to disk...")
@@ -3450,47 +3791,93 @@ class CombinedTransectCube:
         for gf in self.geofiles:
             print(f"   Processing {gf.name}...")
 
+            # First, determine input dataset name and get dimensions
             with h5py.File(gf.path, "r") as f_in:
-                dset_name_in = (
-                    gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
-                )
-                if dset_name_in not in f_in:
-                    dset_name_in = gf.DSET_RGB_MAIN
+                # NEW: Use smoothed raw data if requested
+                if use_smoothed_input and smoothed_raw_dset:
+                    if smoothed_raw_dset in f_in:
+                        dset_name_in = smoothed_raw_dset
+                    else:
+                        raise ValueError(
+                            f"❌ Smoothed raw data not found in {gf.name}: {smoothed_raw_dset}"
+                        )
+                else:
+                    # Original logic
+                    dset_name_in = (
+                        gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
+                    )
+                    if dset_name_in not in f_in:
+                        dset_name_in = gf.DSET_RGB_MAIN
 
                 T_file, S_file, B_file = f_in[dset_name_in].shape
 
-                # Process in chunks to limit memory
-                chunk_size = 500  # Process 500 tracks at a time
+            # File is now closed - safe to open for writing
+            # Process in chunks to limit memory
+            chunk_size = 500  # Process 500 tracks at a time
 
-                # Create output dataset
-                with h5py.File(gf.path, "a") as f_out:
-                    if dset_name_out in f_out:
-                        del f_out[dset_name_out]
+            # Create output dataset with retry logic (Windows file locking can be sticky)
+            max_retries = 3
+            retry_delay = 1.0
 
-                    dset_out = f_out.create_dataset(
-                        dset_name_out,
-                        shape=(T_file, S_file, B_file),
-                        dtype=np.float32,
-                        chunks=(min(100, T_file), S_file, B_file),
-                        compression="gzip",
-                        compression_opts=1,
-                    )
+            for attempt in range(max_retries):
+                try:
+                    f_out = h5py.File(gf.path, "a")
+                    break  # Success!
+                except BlockingIOError as e:
+                    if attempt < max_retries - 1:
+                        print(
+                            f"      ⏳ File locked, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})"
+                        )
+                        import time
 
-                    # Add metadata
-                    dset_out.attrs["window_size"] = (
-                        window_size if window_size is not None else -1
-                    )
-                    dset_out.attrs["strength"] = strength
-                    dset_out.attrs["correction_method"] = (
-                        "rolling_v2" if not use_global else "global_v2"
-                    )
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        raise RuntimeError(
+                            f"❌ Could not open {gf.name} after {max_retries} attempts. "
+                            "File may be open in another notebook or process. "
+                            "Close other notebooks using this file and try again."
+                        ) from e
 
-                    # Find track offset for this file
-                    t_offset = 0
-                    for gf_prev in self.geofiles:
-                        if gf_prev == gf:
-                            break
-                        with h5py.File(gf_prev.path, "r") as f_tmp:
+            # Now we have the file open
+            with f_out:
+                if dset_name_out in f_out:
+                    del f_out[dset_name_out]
+
+                dset_out = f_out.create_dataset(
+                    dset_name_out,
+                    shape=(T_file, S_file, B_file),
+                    dtype=np.float32,
+                    chunks=(min(100, T_file), S_file, B_file),
+                    compression="gzip",
+                    compression_opts=1,
+                )
+
+                # Add metadata
+                dset_out.attrs["window_size"] = (
+                    window_size if window_size is not None else -1
+                )
+                dset_out.attrs["strength"] = strength
+                dset_out.attrs["correction_method"] = (
+                    "rolling_v2" if not use_global else "global_v2"
+                )
+
+                # Find track offset for this file
+                t_offset = 0
+                for gf_prev in self.geofiles:
+                    if gf_prev == gf:
+                        break
+                    with h5py.File(gf_prev.path, "r") as f_tmp:
+                        # NEW: Use smoothed raw data if requested
+                        if use_smoothed_input and smoothed_raw_dset:
+                            if smoothed_raw_dset in f_tmp:
+                                dset_tmp = smoothed_raw_dset
+                            else:
+                                raise ValueError(
+                                    f"❌ Smoothed raw data not found in {gf_prev.name}: {smoothed_raw_dset}"
+                                )
+                        else:
+                            # Original logic
                             dset_tmp = (
                                 gf_prev.DSET_RGB_CORR
                                 if gf_prev.use_corrected
@@ -3498,8 +3885,10 @@ class CombinedTransectCube:
                             )
                             if dset_tmp not in f_tmp:
                                 dset_tmp = gf_prev.DSET_RGB_MAIN
-                            t_offset += f_tmp[dset_tmp].shape[0]
+                        t_offset += f_tmp[dset_tmp].shape[0]
 
+                # Reopen file for reading to get input data
+                with h5py.File(gf.path, "r") as f_in:
                     # Process in chunks
                     for chunk_start in range(0, T_file, chunk_size):
                         chunk_end = min(chunk_start + chunk_size, T_file)
@@ -3539,24 +3928,76 @@ class CombinedTransectCube:
         # Load the corrected data (uses existing load function)
         return self.load_illumination_correction(window_size, strength)
 
-    def _get_correction_dataset_name(self, window_size=1000, strength=1.0):
+    def _get_correction_dataset_name(
+        self,
+        window_size=1000,
+        strength=1.0,
+        use_smoothed_input=False,
+        smooth_method=None,
+        smooth_params=None,
+    ):
         """
         Generate dataset name for illumination correction with specific parameters.
         Allows multiple cached versions with different parameters.
+
+        NEW: Includes smoothing parameters in name if use_smoothed_input=True.
         """
         # Convert window_size to string (None -> 'global')
         w_str = "global" if window_size is None else str(int(window_size))
-        s_str = f"{strength:.2f}".replace(".", "p")  # 1.0 -> "1p00"
-        return f"processed/radiance/dataCube_illum_corrected_w{w_str}_s{s_str}"
 
-    def has_illumination_correction(self, window_size=1000, strength=1.0):
+        # Base name (removed strength since always 1.0, removed "illum" as requested)
+        base_name = f"processed/radiance/dataCube_corrected_w{w_str}"
+
+        # Add smoothing suffix if applicable
+        if use_smoothed_input and smooth_method and smooth_params:
+            if smooth_method == "gaussian":
+                sigma = int(smooth_params.get("gaussian_sigma", 2))
+                return f"{base_name}_smooth_gaussian_sig{sigma}"
+
+            elif smooth_method == "moving_average":
+                window = int(smooth_params.get("wavelength_smoothing", 10))
+                return f"{base_name}_smooth_movavg_w{window}"
+
+            elif smooth_method == "savgol":
+                window = int(smooth_params.get("wavelength_smoothing", 10))
+                poly = int(smooth_params.get("savgol_polyorder", 2))
+                return f"{base_name}_smooth_savgol_w{window}_p{poly}"
+
+            elif smooth_method == "median":
+                kernel = int(smooth_params.get("median_kernel_size", 5))
+                return f"{base_name}_smooth_median_k{kernel}"
+
+            elif smooth_method == "whittaker":
+                lam = smooth_params.get("whittaker_lambda", 1e4)
+                lam_str = f"{lam:.0e}".replace("+", "")
+                return f"{base_name}_smooth_whittaker_lam{lam_str}"
+
+            elif smooth_method == "bilateral":
+                ss = int(smooth_params.get("bilateral_sigma_spatial", 2))
+                si_str = f"{smooth_params.get('bilateral_sigma_intensity', 0.1):.2f}".replace(
+                    ".", "p"
+                )
+                return f"{base_name}_smooth_bilateral_ss{ss}_si{si_str}"
+
+        return base_name
+
+    def has_illumination_correction(
+        self,
+        window_size=1000,
+        strength=1.0,
+        use_smoothed_input=False,
+        smooth_method=None,
+        smooth_params=None,
+    ):
         """
         Check if illumination correction with these parameters has already been applied.
         Returns True if all files have the corrected dataset with matching metadata.
         """
         import h5py
 
-        dset_name = self._get_correction_dataset_name(window_size, strength)
+        dset_name = self._get_correction_dataset_name(
+            window_size, strength, use_smoothed_input, smooth_method, smooth_params
+        )
 
         for gf in self.geofiles:
             try:
@@ -3585,14 +4026,23 @@ class CombinedTransectCube:
 
         return True
 
-    def load_illumination_correction(self, window_size=1000, strength=1.0):
+    def load_illumination_correction(
+        self,
+        window_size=1000,
+        strength=1.0,
+        use_smoothed_input=False,
+        smooth_method=None,
+        smooth_params=None,
+    ):
         """
         Load previously saved illumination-corrected data from HDF5 files.
         Populates self.data_corrected.
         """
         import h5py
 
-        dset_name = self._get_correction_dataset_name(window_size, strength)
+        dset_name = self._get_correction_dataset_name(
+            window_size, strength, use_smoothed_input, smooth_method, smooth_params
+        )
 
         # Calculate total size
         T_total = sum(gf.shape[0] for gf in self.geofiles)
@@ -3713,14 +4163,40 @@ class CombinedTransectCube:
         print("=" * 80)
 
         corrections_found = False
+        legacy_found = False
+
         for gf in self.geofiles:
             file_corrections = []
+            file_legacy = []
 
             with h5py.File(gf.path, "r") as f:
                 # Look for all datasets matching the pattern
                 if "processed/radiance" in f:
                     for key in f["processed/radiance"].keys():
-                        if key.startswith("dataCube_illum_corrected_"):
+                        # Check for NEW format
+                        if key.startswith("dataCube_corrected_"):
+                            dset = f[f"processed/radiance/{key}"]
+
+                            # Extract metadata
+                            window = dset.attrs.get("window_size", "unknown")
+                            if window == -1:
+                                window = "global"
+
+                            # Get size info
+                            shape = dset.shape
+                            size_mb = dset.nbytes / (1024 * 1024)
+
+                            file_corrections.append(
+                                {
+                                    "dataset": key,
+                                    "window": window,
+                                    "shape": shape,
+                                    "size_mb": size_mb,
+                                }
+                            )
+
+                        # Check for OLD/LEGACY format
+                        elif key.startswith("dataCube_illum_corrected_"):
                             dset = f[f"processed/radiance/{key}"]
 
                             # Extract metadata
@@ -3733,7 +4209,7 @@ class CombinedTransectCube:
                             shape = dset.shape
                             size_mb = dset.nbytes / (1024 * 1024)
 
-                            file_corrections.append(
+                            file_legacy.append(
                                 {
                                     "dataset": key,
                                     "window": window,
@@ -3747,16 +4223,34 @@ class CombinedTransectCube:
                 corrections_found = True
                 print(f"\n📁 File: {gf.name}")
                 for corr in file_corrections:
-                    print(
-                        f"   ✓ window={corr['window']}, strength={corr['strength']:.1f}"
-                    )
+                    print(f"   ✓ window={corr['window']}")
                     print(f"     Dataset: {corr['dataset']}")
                     print(
                         f"     Shape: {corr['shape']}, Size: {corr['size_mb']:.1f} MB"
                     )
 
-        if not corrections_found:
+            if file_legacy:
+                legacy_found = True
+                if not file_corrections:  # Only print filename if not already printed
+                    print(f"\n📁 File: {gf.name}")
+                print(
+                    f"   ⚠️  LEGACY FORMAT (use cube.rename_legacy_corrections() to migrate):"
+                )
+                for corr in file_legacy:
+                    print(
+                        f"      window={corr['window']}, strength={corr['strength']:.1f}"
+                    )
+                    print(f"      Dataset: {corr['dataset']}")
+                    print(
+                        f"      Shape: {corr['shape']}, Size: {corr['size_mb']:.1f} MB"
+                    )
+
+        if not corrections_found and not legacy_found:
             print("\n   No cached corrections found in any files.")
+        elif legacy_found:
+            print(
+                "\n💡 Tip: Run cube.rename_legacy_corrections() to convert old format to new format"
+            )
 
         print("=" * 80)
 
@@ -3821,6 +4315,397 @@ class CombinedTransectCube:
         print(f"✅ Correction deleted successfully")
         return True
 
+    def rename_legacy_corrections(self, confirm=True):
+        """
+        Rename old 'dataCube_illum_corrected_*' datasets to new 'dataCube_corrected_*' format.
+
+        This is a one-time utility to migrate old cached corrections to the new naming scheme.
+        Old format: dataCube_illum_corrected_w{window}_s{strength}
+        New format: dataCube_corrected_w{window} (strength removed since always 1.0)
+
+        Parameters:
+        -----------
+        confirm : bool, default=True
+            If True, asks for confirmation before renaming.
+
+        Returns:
+        --------
+        int : Number of datasets renamed
+        """
+        import h5py
+
+        print("\n🔄 Searching for legacy correction datasets...")
+        print("=" * 80)
+
+        rename_plan = []  # List of (file, old_path, new_path) tuples
+
+        for gf in self.geofiles:
+            with h5py.File(gf.path, "r") as f:
+                if "processed/radiance" in f:
+                    for key in f["processed/radiance"].keys():
+                        if key.startswith("dataCube_illum_corrected_"):
+                            # Parse old name to extract parameters
+                            # Format: dataCube_illum_corrected_w{window}_s{strength}
+                            parts = key.split("_")
+
+                            # Find window size
+                            window_str = None
+                            for part in parts:
+                                if part.startswith("w"):
+                                    window_str = part[1:]  # Remove 'w' prefix
+                                    break
+
+                            if window_str:
+                                # Generate new name (no strength, no "illum")
+                                new_key = f"dataCube_corrected_w{window_str}"
+                                old_path = f"processed/radiance/{key}"
+                                new_path = f"processed/radiance/{new_key}"
+
+                                # Check if new name already exists
+                                if new_key in f["processed/radiance"]:
+                                    print(f"⚠️  File: {gf.name}")
+                                    print(f"   Old: {key}")
+                                    print(
+                                        f"   New: {new_key} (ALREADY EXISTS - skipping)"
+                                    )
+                                else:
+                                    rename_plan.append(
+                                        (
+                                            gf.path,
+                                            gf.name,
+                                            old_path,
+                                            new_path,
+                                            key,
+                                            new_key,
+                                        )
+                                    )
+
+        if not rename_plan:
+            print("\n✅ No legacy corrections found (or all already renamed)")
+            print("=" * 80)
+            return 0
+
+        # Show rename plan
+        print(f"\n📋 Found {len(rename_plan)} dataset(s) to rename:\n")
+        for _, fname, _, _, old_key, new_key in rename_plan:
+            print(f"📁 File: {fname}")
+            print(f"   Old: {old_key}")
+            print(f"   New: {new_key}")
+            print()
+
+        if confirm:
+            response = input("Proceed with renaming? (yes/no): ").strip().lower()
+            if response not in ["yes", "y"]:
+                print("❌ Renaming cancelled.")
+                return 0
+
+        # Perform renames
+        print("\n🔄 Renaming datasets...")
+        renamed_count = 0
+
+        for fpath, fname, old_path, new_path, old_key, new_key in rename_plan:
+            try:
+                with h5py.File(fpath, "a") as f:
+                    # Copy dataset to new location (HDF5 doesn't support direct rename)
+                    f.copy(old_path, new_path)
+
+                    # Delete old dataset
+                    del f[old_path]
+
+                    print(f"   ✓ Renamed in {fname}")
+                    renamed_count += 1
+            except Exception as e:
+                print(f"   ❌ Error renaming in {fname}: {e}")
+
+        print(f"\n✅ Successfully renamed {renamed_count} dataset(s)")
+        print("=" * 80)
+        return renamed_count
+
+    # ============================================================================
+    # 🌊 Beer-Lambert Depth Estimation
+    # ============================================================================
+
+    def compute_beer_lambert_depth(
+        self,
+        track_start=None,
+        track_end=None,
+        window_size=500,
+        wavelength_range=(500, 650),
+        quiet=False,
+    ):
+        """
+        Compute relative seafloor depth (Δz) using Beer-Lambert attenuation law.
+
+        This method estimates local height variations from pseudo-reflectance by modeling
+        underwater light attenuation. Bright pixels indicate shallow/elevated areas (bombs/mounds),
+        dark pixels indicate deeper areas (pits).
+
+        Physics:
+        --------
+        Double-pass Beer-Lambert attenuation: L(λ) = L0(λ) * exp(-2 * c(λ) * z)
+        Relative depth: Δz(x,y,λ) = - (1 / (2 * c(λ))) * ln(L(x,y,λ) / L_ref(x,y,λ))
+
+        where:
+          - L(x,y,λ): pseudo-reflectance per pixel (illumination-corrected data)
+          - L_ref(x,y,λ): local reference intensity (rolling mean baseline)
+          - c(λ): spectral attenuation coefficient [m^-1] (Holbach 2025; Løvås 2023)
+          - Δz: relative depth in meters
+
+        Parameters
+        ----------
+        track_start : int, optional
+            Start track index (inclusive). If None, uses beginning of data.
+        track_end : int, optional
+            End track index (exclusive). If None, uses end of data.
+        window_size : int, default=500
+            Rolling mean window size (pixels) for computing local reference intensity.
+            Default matches illumination correction window.
+        wavelength_range : tuple, default=(500, 650)
+            Wavelength range (nm) for averaging depth maps. This "optical window"
+            has stable attenuation and good signal. Default: (500, 650) nm.
+        quiet : bool, default=False
+            If True, suppress progress messages.
+
+        Returns
+        -------
+        None
+            Stores results in:
+            - self.depth_map : 2D array (tracks, pixels) of mean relative depth [meters]
+            - self.depth_spectral : 3D array (tracks, pixels, bands) of per-wavelength depth [meters]
+            - self.depth_wavelengths : 1D array of wavelengths used for depth computation
+            - self.depth_attenuation : 1D array of c(λ) values used
+
+        Raises
+        ------
+        RuntimeError
+            If illumination-corrected data is not available (must run apply_illumination_correction_v2 first)
+            If invalid/NaN pixels are found in the data
+
+        Notes
+        -----
+        - Must run after apply_illumination_correction_v2()
+        - Typical Δz range: 0 to 0.5 meters
+        - Positive Δz = elevated (shallow), negative Δz = depressed (deep)
+        - Use plot_georef(depth_overlay=True) to visualize
+
+        References
+        ----------
+        - Holbach, A. et al. (2025). Coastal Case 2 water optics
+        - Løvås, H. (2023). UHI attenuation measurements, Mjøsa fjord
+
+        Example
+        -------
+        >>> cube.apply_illumination_correction_v2(window_size=500)
+        >>> cube.compute_beer_lambert_depth(
+        ...     track_start=config.UHI_TRACK_RANGE[0],
+        ...     track_end=config.UHI_TRACK_RANGE[1],
+        ...     window_size=500
+        ... )
+        >>> cube.plot_georef(depth_overlay=True, coordinate_system='NED')
+        """
+        from scipy.ndimage import uniform_filter1d
+
+        if not quiet:
+            print("🌊 Computing Beer-Lambert relative depth estimation...")
+            print("=" * 80)
+
+        # Check that illumination correction has been applied
+        if self.data_corrected is None:
+            raise RuntimeError(
+                "❌ ERROR: Illumination-corrected data not found!\\n"
+                "   Beer-Lambert depth estimation requires illumination correction.\\n"
+                "   Please run: cube.apply_illumination_correction_v2()\\n"
+                "   before computing depth."
+            )
+
+        # Determine track range
+        T_total = self.data_corrected.shape[0]
+        if track_start is None:
+            track_start = 0
+        if track_end is None:
+            track_end = T_total
+
+        # Extract region of interest
+        data_region = self.data_corrected[track_start:track_end, :, :]  # (T, S, B)
+        T, S, B = data_region.shape
+
+        if not quiet:
+            print(f"Track range: {track_start} to {track_end} ({T} tracks)")
+            print(f"Spatial pixels: {S}")
+            print(f"Spectral bands: {B}")
+
+        # Define attenuation coefficients (Coastal Case 2 water, Holbach 2025; Løvås 2023)
+        attenuation_wavelengths = np.array([400, 450, 500, 520, 550, 600, 650, 700])
+        attenuation_coefficients = np.array(
+            [0.58, 0.50, 0.38, 0.34, 0.32, 0.35, 0.42, 0.55]
+        )
+
+        # Interpolate attenuation coefficients to match data wavelengths
+        c_lambda = np.interp(
+            self.wavelengths, attenuation_wavelengths, attenuation_coefficients
+        )
+
+        if not quiet:
+            print(f"\\nAttenuation coefficients c(λ):")
+            print(
+                f"   Interpolated from {len(attenuation_wavelengths)} reference points"
+            )
+            print(f"   Range: {c_lambda.min():.3f} to {c_lambda.max():.3f} m⁻¹")
+            print(
+                f"   Mean (500-650 nm): {c_lambda[(self.wavelengths >= 500) & (self.wavelengths <= 650)].mean():.3f} ± {c_lambda[(self.wavelengths >= 500) & (self.wavelengths <= 650)].std():.3f} m⁻¹"
+            )
+
+        # Plot attenuation curve
+        if not quiet:
+            import matplotlib.pyplot as plt
+
+            fig_atten, ax_atten = plt.subplots(1, 1, figsize=(8, 4))
+            ax_atten.plot(
+                attenuation_wavelengths,
+                attenuation_coefficients,
+                "ro",
+                markersize=10,
+                label="Reference data (Holbach 2025; Løvås 2023)",
+            )
+            ax_atten.plot(
+                self.wavelengths, c_lambda, "b-", linewidth=2, label="Interpolated c(λ)"
+            )
+            ax_atten.axvspan(
+                wavelength_range[0],
+                wavelength_range[1],
+                alpha=0.2,
+                color="green",
+                label="Analysis range",
+            )
+            ax_atten.set_xlabel("Wavelength [nm]", fontsize=12, fontweight="bold")
+            ax_atten.set_ylabel(
+                "Attenuation coefficient c(λ) [m⁻¹]", fontsize=12, fontweight="bold"
+            )
+            ax_atten.set_title(
+                "Beer-Lambert Attenuation Coefficients (Coastal Case 2 Water)",
+                fontsize=13,
+                fontweight="bold",
+            )
+            ax_atten.legend(loc="best", fontsize=10)
+            ax_atten.grid(alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+            print(f"✅ Attenuation curve plotted")
+
+        # Check for invalid pixels
+        if np.any(np.isnan(data_region)) or np.any(np.isinf(data_region)):
+            n_invalid = np.sum(np.isnan(data_region) | np.isinf(data_region))
+            raise RuntimeError(
+                f"❌ ERROR: Found {n_invalid} invalid (NaN/Inf) pixels in illumination-corrected data!\\n"
+                f"   All pixels must be valid for Beer-Lambert depth estimation.\\n"
+                f"   Please check your illumination correction step."
+            )
+
+        # Check for non-positive values (would cause ln() to fail)
+        if np.any(data_region <= 0):
+            n_nonpositive = np.sum(data_region <= 0)
+            print(
+                f"⚠️  WARNING: Found {n_nonpositive} non-positive pixels ({100*n_nonpositive/data_region.size:.3f}%)"
+            )
+            print(f"   Setting to small positive value (1e-10) to avoid ln() errors")
+            data_region = np.maximum(data_region, 1e-10)
+
+        if not quiet:
+            print(
+                f"\\n🔄 Computing local reference intensity (rolling mean, window={window_size} px)..."
+            )
+
+        # Compute local reference intensity using rolling mean along track (per slit-band)
+        # Shape: (T, S, B)
+        L_ref = np.zeros_like(data_region)
+
+        for s in range(S):
+            for b in range(B):
+                # Rolling mean along track direction
+                L_ref[:, s, b] = uniform_filter1d(
+                    data_region[:, s, b], size=window_size, mode="nearest"
+                )
+
+        if not quiet:
+            print(f"✅ Local reference computed")
+
+        # Avoid division by zero
+        L_ref = np.maximum(L_ref, 1e-10)
+
+        if not quiet:
+            print(f"\\n🧮 Computing per-wavelength relative depth Δz(λ)...")
+
+        # Compute relative depth per wavelength
+        # Beer-Lambert: L = L0 * exp(-2*c*z)
+        # Solving: Δz = -ln(L/L_ref) / (2*c)
+        # BUT we want POSITIVE Δz for elevated (brighter), so flip sign:
+        # Δz = +ln(L/L_ref) / (2*c)
+        # Result: Brighter → positive Δz (elevated), Darker → negative Δz (deep)
+        ratio = data_region / L_ref
+        ratio = np.clip(ratio, 1e-10, None)  # Avoid log(0)
+
+        ln_ratio = np.log(ratio)
+
+        # Broadcast c_lambda to match shape (T, S, B)
+        c_lambda_broadcast = c_lambda[np.newaxis, np.newaxis, :]  # (1, 1, B)
+
+        # Compute depth with FLIPPED sign (so brighter = positive = elevated)
+        depth_spectral = (1.0 / (2.0 * c_lambda_broadcast)) * ln_ratio  # (T, S, B)
+
+        if not quiet:
+            print(f"✅ Per-wavelength depth computed")
+            print(f"   Shape: {depth_spectral.shape}")
+            print(
+                f"   Range: {depth_spectral.min():.3f} to {depth_spectral.max():.3f} m"
+            )
+
+        # Select wavelengths in the analysis range
+        wl_mask = (self.wavelengths >= wavelength_range[0]) & (
+            self.wavelengths <= wavelength_range[1]
+        )
+        n_bands_used = np.sum(wl_mask)
+
+        if n_bands_used == 0:
+            raise RuntimeError(
+                f"❌ ERROR: No wavelengths found in range {wavelength_range} nm!\\n"
+                f"   Available range: {self.wavelengths.min():.1f} to {self.wavelengths.max():.1f} nm"
+            )
+
+        if not quiet:
+            print(
+                f"\\n📊 Averaging depth across wavelength range {wavelength_range[0]}-{wavelength_range[1]} nm..."
+            )
+            print(f"   Using {n_bands_used} bands")
+
+        # Compute mean depth across selected wavelengths
+        depth_mean = np.mean(depth_spectral[:, :, wl_mask], axis=2)  # (T, S)
+
+        if not quiet:
+            print(f"✅ Mean depth computed")
+            print(f"   Shape: {depth_mean.shape}")
+            print(f"   Mean: {depth_mean.mean():.3f} m")
+            print(f"   Std:  {depth_mean.std():.3f} m")
+            print(f"   Min:  {depth_mean.min():.3f} m (deepest/darkest)")
+            print(f"   Max:  {depth_mean.max():.3f} m (shallowest/brightest)")
+
+        # Store results
+        self.depth_map = depth_mean
+        self.depth_spectral = depth_spectral
+        self.depth_wavelengths = self.wavelengths[wl_mask]
+        self.depth_attenuation = c_lambda
+        self.depth_track_start = track_start
+        self.depth_track_end = track_end
+
+        if not quiet:
+            print(f"\\n✅ Beer-Lambert depth estimation complete!")
+            print(f"   Results stored in:")
+            print(f"   - cube.depth_map (2D array, mean depth)")
+            print(f"   - cube.depth_spectral (3D array, per-wavelength depth)")
+            print(f"   - cube.depth_wavelengths (wavelengths used)")
+            print(f"   - cube.depth_attenuation (c(λ) coefficients)")
+            print(f"\\n💡 Visualize with: cube.plot_georef(depth_overlay=True)")
+            print("=" * 80)
+
     # ============================================================================
     # � Spectral Smoothing Cache Functions
     # ============================================================================
@@ -3835,6 +4720,7 @@ class CombinedTransectCube:
         whittaker_lambda=1e4,
         bilateral_sigma_spatial=2.0,
         bilateral_sigma_intensity=0.1,
+        apply_to_raw=False,  # NEW: Distinguish raw vs corrected data smoothing
     ):
         """
         Generate dataset name for spectral smoothing with specific parameters.
@@ -3860,7 +4746,9 @@ class CombinedTransectCube:
         else:
             params = "unknown"
 
-        return f"processed/radiance/dataCube_smoothed_{method}_{params}"
+        # NEW: Different cache names for raw vs corrected data
+        data_type = "raw" if apply_to_raw else "corrected"
+        return f"processed/radiance/dataCube_{data_type}_smoothed_{method}_{params}"
 
     def has_spectral_smoothing(
         self,
@@ -3872,6 +4760,7 @@ class CombinedTransectCube:
         whittaker_lambda=1e4,
         bilateral_sigma_spatial=2.0,
         bilateral_sigma_intensity=0.1,
+        apply_to_raw=False,  # NEW: Check for raw or corrected data cache
     ):
         """
         Check if spectral smoothing with these parameters has already been applied.
@@ -3888,6 +4777,7 @@ class CombinedTransectCube:
             whittaker_lambda=whittaker_lambda,
             bilateral_sigma_spatial=bilateral_sigma_spatial,
             bilateral_sigma_intensity=bilateral_sigma_intensity,
+            apply_to_raw=apply_to_raw,  # NEW: Pass through
         )
 
         for gf in self.geofiles:
@@ -3969,10 +4859,11 @@ class CombinedTransectCube:
         whittaker_lambda=1e4,
         bilateral_sigma_spatial=2.0,
         bilateral_sigma_intensity=0.1,
+        apply_to_raw=False,  # NEW: Load raw or corrected data cache
     ):
         """
         Load previously saved spectral smoothing from HDF5 files.
-        Populates self.data_corrected.
+        Populates self.data_corrected (or self.data if apply_to_raw=True).
         """
         import h5py
 
@@ -3985,17 +4876,19 @@ class CombinedTransectCube:
             whittaker_lambda=whittaker_lambda,
             bilateral_sigma_spatial=bilateral_sigma_spatial,
             bilateral_sigma_intensity=bilateral_sigma_intensity,
+            apply_to_raw=apply_to_raw,  # NEW: Pass through
         )
 
         # Calculate total size
         T_total = sum(gf.shape[0] for gf in self.geofiles)
         S, B = self.geofiles[0].shape[1], self.geofiles[0].shape[2]
 
+        data_type = "raw" if apply_to_raw else "corrected"
         print(
-            f"📂 Loading saved spectral smoothing ({method}) from {len(self.geofiles)} files..."
+            f"📂 Loading saved spectral smoothing ({method}, {data_type} data) from {len(self.geofiles)} files..."
         )
 
-        self.data_corrected = np.zeros((T_total, S, B), dtype=np.float32)
+        smoothed_data = np.zeros((T_total, S, B), dtype=np.float32)
 
         t_offset = 0
         for gf in self.geofiles:
@@ -4007,7 +4900,7 @@ class CombinedTransectCube:
 
                 dset = f[dset_name]
                 T_file = dset.shape[0]
-                self.data_corrected[t_offset : t_offset + T_file, :, :] = dset[()]
+                smoothed_data[t_offset : t_offset + T_file, :, :] = dset[()]
 
                 # Print metadata
                 if "method" in dset.attrs:
@@ -4015,8 +4908,14 @@ class CombinedTransectCube:
 
                 t_offset += T_file
 
+        # Assign to correct attribute
+        if apply_to_raw:
+            self.data = smoothed_data
+        else:
+            self.data_corrected = smoothed_data
+
         print(f"✅ Loaded spectral smoothing from disk (saved computation time!)")
-        return self.data_corrected
+        return smoothed_data
 
     def save_spectral_smoothing(
         self,
@@ -4028,18 +4927,23 @@ class CombinedTransectCube:
         whittaker_lambda=1e4,
         bilateral_sigma_spatial=2.0,
         bilateral_sigma_intensity=0.1,
+        apply_to_raw=False,  # NEW: Save raw or corrected data
     ):
         """
         Save the spectrally smoothed data to HDF5 files.
-        Splits self.data_corrected back into individual files and saves with
-        unique names based on method and parameters.
+        Splits self.data_corrected (or self.data if apply_to_raw=True) back into individual files
+        and saves with unique names based on method and parameters.
         """
         import h5py
         import time
 
-        if self.data_corrected is None:
+        # Determine which data to save
+        data_to_save = self.data if apply_to_raw else self.data_corrected
+        data_type = "raw" if apply_to_raw else "corrected"
+
+        if data_to_save is None:
             raise RuntimeError(
-                "No corrected data to save. Run apply_spectral_smoothing first."
+                f"No {data_type} data to save. Run apply_spectral_smoothing first."
             )
 
         dset_path = self._get_smoothing_dataset_name(
@@ -4051,15 +4955,18 @@ class CombinedTransectCube:
             whittaker_lambda=whittaker_lambda,
             bilateral_sigma_spatial=bilateral_sigma_spatial,
             bilateral_sigma_intensity=bilateral_sigma_intensity,
+            apply_to_raw=apply_to_raw,  # NEW: Pass through
         )
 
-        print(f"💾 Saving spectral smoothing to {len(self.geofiles)} files...")
+        print(
+            f"💾 Saving spectral smoothing ({data_type} data) to {len(self.geofiles)} files..."
+        )
         print(f"   Dataset: {dset_path}")
 
         t_offset = 0
         for gf in self.geofiles:
             T_file = gf.shape[0]
-            smoothed_chunk = self.data_corrected[t_offset : t_offset + T_file, :, :]
+            smoothed_chunk = data_to_save[t_offset : t_offset + T_file, :, :]
 
             # Retry mechanism in case file is temporarily locked
             max_retries = 3
@@ -4625,11 +5532,12 @@ class CombinedTransectCube:
         bilateral_sigma_intensity=0.1,
         force_recompute=False,
         quiet=False,
+        apply_to_raw=False,  # NEW: Apply to raw data instead of corrected data
     ):
         """
         Smooth each pixel's spectrum along the wavelength axis.
 
-        This permanently modifies data_corrected (in memory only, but can be cached to disk).
+        This permanently modifies data_corrected (or self.data if apply_to_raw=True) in memory.
         Smoothing is applied to ALL wavelengths currently in the datacube.
 
         Results are automatically cached to disk. Use force_recompute=True to recalculate.
@@ -4670,6 +5578,11 @@ class CombinedTransectCube:
             If False, load from cache if available (much faster!)
         quiet : bool, default=False
             If True, suppresses progress messages
+        apply_to_raw : bool, default=False
+            NEW: If True, applies smoothing to raw data (self.data) instead of corrected data
+            This is useful for smoothing BEFORE illumination correction.
+            When True, saves to 'data_raw_smooth_...' cache.
+            When False (default), works on data_corrected as before.
 
         Returns:
         --------
@@ -4677,16 +5590,27 @@ class CombinedTransectCube:
 
         Example:
         --------
+        # Standard workflow (smooth AFTER illumination):
         >>> cube.apply_illumination_correction_v2()
-        >>> cube.apply_wavelength_filter(wavelength_range=(490, 680))
-        >>> cube.apply_spectral_normalization(method="l2")
         >>> cube.apply_spectral_smoothing(method="gaussian", gaussian_sigma=2.0)
-        >>> cube.train_svm_with_cv(...)  # Train on normalized+smoothed spectra
+
+        # NEW: Smooth BEFORE illumination:
+        >>> cube.apply_spectral_smoothing(method="gaussian", gaussian_sigma=5.0, apply_to_raw=True)
+        >>> cube.apply_illumination_correction_v2(use_smoothed_raw=True, smooth_method="gaussian", smooth_sigma=5.0)
         """
-        if self.data_corrected is None:
-            raise ValueError(
-                "No corrected data available. Run apply_illumination_correction_v2() first."
-            )
+        # Determine which data to work on
+        if apply_to_raw:
+            if self.data is None:
+                raise ValueError("No raw data available. Load data first.")
+            target_data = self.data
+            data_type = "raw"
+        else:
+            if self.data_corrected is None:
+                raise ValueError(
+                    "No corrected data available. Run apply_illumination_correction_v2() first."
+                )
+            target_data = self.data_corrected
+            data_type = "corrected"
 
         # Check if smoothing has already been computed and saved
         if not force_recompute and self.has_spectral_smoothing(
@@ -4698,10 +5622,12 @@ class CombinedTransectCube:
             whittaker_lambda=whittaker_lambda,
             bilateral_sigma_spatial=bilateral_sigma_spatial,
             bilateral_sigma_intensity=bilateral_sigma_intensity,
+            apply_to_raw=apply_to_raw,  # NEW: Check correct cache
         ):
             if not quiet:
+                cache_type = "raw" if apply_to_raw else "corrected"
                 print(
-                    f"💾 Found cached smoothing ({method}) - loading from disk (much faster!)"
+                    f"💾 Found cached smoothing ({method}, {cache_type} data) - loading from disk (much faster!)"
                 )
             return self.load_spectral_smoothing(
                 method=method,
@@ -4712,6 +5638,7 @@ class CombinedTransectCube:
                 whittaker_lambda=whittaker_lambda,
                 bilateral_sigma_spatial=bilateral_sigma_spatial,
                 bilateral_sigma_intensity=bilateral_sigma_intensity,
+                apply_to_raw=apply_to_raw,  # NEW: Load from correct cache
             )
 
         # Only check wavelength_smoothing for methods that use it
@@ -4722,9 +5649,11 @@ class CombinedTransectCube:
 
         if not quiet:
             print("=" * 60)
-            print(f"🌊 SPECTRAL SMOOTHING: {method.upper()}")
+            print(
+                f"🌊 SPECTRAL SMOOTHING: {method.upper()} ({'RAW' if apply_to_raw else 'CORRECTED'} data)"
+            )
             print("=" * 60)
-            print(f"📊 Datacube shape: {self.data_corrected.shape}")
+            print(f"📊 Datacube shape: {target_data.shape}")
             if method in ["moving_average", "savgol"]:
                 print(f"🪟 Window size: {wavelength_smoothing}")
             if method == "savgol":
@@ -4740,7 +5669,7 @@ class CombinedTransectCube:
                     f"📐 Bilateral sigma (spatial/intensity): {bilateral_sigma_spatial}/{bilateral_sigma_intensity}"
                 )
 
-        T, S, B = self.data_corrected.shape
+        T, S, B = target_data.shape
 
         if method == "savgol":
             from scipy.signal import savgol_filter
@@ -4760,8 +5689,8 @@ class CombinedTransectCube:
                     print(f"   ⚠️  Adjusted polyorder to: {savgol_polyorder}")
 
             # Apply savgol filter along wavelength axis
-            self.data_corrected = savgol_filter(
-                self.data_corrected,
+            smoothed_data = savgol_filter(
+                target_data,
                 window_length=wavelength_smoothing,
                 polyorder=savgol_polyorder,
                 axis=2,  # Wavelength axis
@@ -4772,37 +5701,37 @@ class CombinedTransectCube:
             from tqdm import tqdm
 
             # Apply rolling mean along wavelength axis for each pixel
-            smoothed = np.zeros_like(self.data_corrected)
+            smoothed_data = np.zeros_like(target_data)
 
             # Progress bar over temporal dimension
             for t in tqdm(
                 range(T), desc="Smoothing spectra (moving average)", disable=quiet
             ):
                 for s in range(S):
-                    spectrum = pd.Series(self.data_corrected[t, s, :])
+                    spectrum = pd.Series(target_data[t, s, :])
                     smoothed_spectrum = spectrum.rolling(
                         window=wavelength_smoothing, center=True, min_periods=1
                     ).mean()
-                    smoothed[t, s, :] = smoothed_spectrum.values
+                    smoothed_data[t, s, :] = smoothed_spectrum.values
 
-            self.data_corrected = smoothed.astype(np.float32)
+            smoothed_data = smoothed_data.astype(np.float32)
 
         elif method == "gaussian":
             from scipy.ndimage import gaussian_filter1d
             from tqdm import tqdm
 
             # Apply Gaussian filter along wavelength axis
-            smoothed = np.zeros_like(self.data_corrected)
+            smoothed_data = np.zeros_like(target_data)
 
             # Progress bar over temporal dimension
             for t in tqdm(range(T), desc="Smoothing spectra (gaussian)", disable=quiet):
                 for s in range(S):
-                    spectrum = self.data_corrected[t, s, :]
-                    smoothed[t, s, :] = gaussian_filter1d(
+                    spectrum = target_data[t, s, :]
+                    smoothed_data[t, s, :] = gaussian_filter1d(
                         spectrum, sigma=gaussian_sigma, mode="nearest"
                     )
 
-            self.data_corrected = smoothed.astype(np.float32)
+            smoothed_data = smoothed_data.astype(np.float32)
 
         elif method == "median":
             from scipy.ndimage import median_filter
@@ -4816,16 +5745,16 @@ class CombinedTransectCube:
                     print(f"   ⚠️  Adjusted kernel size to odd number: {kernel_size}")
 
             # Apply median filter along wavelength axis
-            smoothed = np.zeros_like(self.data_corrected)
+            smoothed_data = np.zeros_like(target_data)
 
             for t in tqdm(range(T), desc="Smoothing spectra (median)", disable=quiet):
                 for s in range(S):
-                    spectrum = self.data_corrected[t, s, :]
-                    smoothed[t, s, :] = median_filter(
+                    spectrum = target_data[t, s, :]
+                    smoothed_data[t, s, :] = median_filter(
                         spectrum, size=kernel_size, mode="nearest"
                     )
 
-            self.data_corrected = smoothed.astype(np.float32)
+            smoothed_data = smoothed_data.astype(np.float32)
 
         elif method == "whittaker":
             from scipy.sparse import diags, eye
@@ -4833,7 +5762,7 @@ class CombinedTransectCube:
             from tqdm import tqdm
 
             # Apply Whittaker smoother along wavelength axis
-            smoothed = np.zeros_like(self.data_corrected)
+            smoothed_data = np.zeros_like(target_data)
 
             # Pre-compute the Whittaker matrix once (same for all spectra)
             m = B
@@ -4845,26 +5774,26 @@ class CombinedTransectCube:
                 range(T), desc="Smoothing spectra (whittaker)", disable=quiet
             ):
                 for s in range(S):
-                    spectrum = self.data_corrected[t, s, :]
+                    spectrum = target_data[t, s, :]
                     try:
-                        smoothed[t, s, :] = spsolve(W, spectrum)
+                        smoothed_data[t, s, :] = spsolve(W, spectrum)
                     except Exception:
                         # If Whittaker fails, keep original spectrum
-                        smoothed[t, s, :] = spectrum
+                        smoothed_data[t, s, :] = spectrum
 
-            self.data_corrected = smoothed.astype(np.float32)
+            smoothed_data = smoothed_data.astype(np.float32)
 
         elif method == "bilateral":
             from tqdm import tqdm
 
             # Apply bilateral filter along wavelength axis
-            smoothed = np.zeros_like(self.data_corrected)
+            smoothed_data = np.zeros_like(target_data)
 
             for t in tqdm(
                 range(T), desc="Smoothing spectra (bilateral)", disable=quiet
             ):
                 for s in range(S):
-                    spectrum = self.data_corrected[t, s, :]
+                    spectrum = target_data[t, s, :]
 
                     # Bilateral filter
                     for i in range(B):
@@ -4885,11 +5814,11 @@ class CombinedTransectCube:
                         combined_weight = spatial_weight * intensity_weight
                         combined_weight /= np.sum(combined_weight)
 
-                        smoothed[t, s, i] = np.sum(
+                        smoothed_data[t, s, i] = np.sum(
                             spectrum[start:end] * combined_weight
                         )
 
-            self.data_corrected = smoothed.astype(np.float32)
+            smoothed_data = smoothed_data.astype(np.float32)
 
         else:
             raise ValueError(
@@ -4897,8 +5826,19 @@ class CombinedTransectCube:
                 f"Choose from: gaussian, savgol, moving_average, median, whittaker, bilateral"
             )
 
+        # Assign smoothed data to the correct attribute
+        if apply_to_raw:
+            self.data = smoothed_data
+            if not quiet:
+                print(f"\n✅ Raw data smoothing complete! (self.data updated)")
+        else:
+            self.data_corrected = smoothed_data
+            if not quiet:
+                print(
+                    f"\n✅ Corrected data smoothing complete! (self.data_corrected updated)"
+                )
+
         if not quiet:
-            print(f"\n✅ Smoothing complete!")
             print(f"   Method: {method}")
             if method == "savgol":
                 print(
@@ -4922,7 +5862,8 @@ class CombinedTransectCube:
 
         # Save smoothed data to disk for future use
         if not quiet:
-            print(f"\n💾 Caching smoothed data to disk for future use...")
+            cache_type = "raw" if apply_to_raw else "corrected"
+            print(f"\n💾 Caching smoothed {cache_type} data to disk for future use...")
         self.save_spectral_smoothing(
             method=method,
             wavelength_smoothing=wavelength_smoothing,
@@ -4932,9 +5873,11 @@ class CombinedTransectCube:
             whittaker_lambda=whittaker_lambda,
             bilateral_sigma_spatial=bilateral_sigma_spatial,
             bilateral_sigma_intensity=bilateral_sigma_intensity,
+            apply_to_raw=apply_to_raw,  # NEW: Save to correct cache
         )
 
-        return self.data_corrected
+        # Return the smoothed data (either raw or corrected)
+        return smoothed_data
 
     def save_as_pseudo_reflectance(
         self,
@@ -5659,6 +6602,8 @@ class CombinedTransectCube:
         roi_collection=None,  # NEW: Multiple ROIs with names
         roi_colors=["yellow", "cyan", "magenta", "orange", "lime", "red", "blue"],
         roi_color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
+        roi_overlay_mode="markers",  # "markers" (scatter plot) or "solid" (overlay colored pixels on RGB)
+        roi_solid_pixel_size=1,  # Size of each pixel in solid overlay mode (must be odd: 1, 3, 5, 7, etc.)
         roi_marker_size=100,
         roi_marker_shape="s",  # Marker shape: 's'=square, 'o'=circle, '^'=triangle, 'D'=diamond, etc.
         roi_marker_edgewidth=0,  # Edge width for ROI markers (0 = no edge)
@@ -5951,6 +6896,81 @@ class CombinedTransectCube:
             rgb_image = np.stack([R, G, B], axis=-1)
             display_image = rgb_image
             n_tracks, n_slits = cube_data.shape[0], cube_data.shape[1]
+
+        # Initialize roi_pixel_counts at function scope (needed for legend in solid mode)
+        roi_pixel_counts = {}
+
+        # ========== SOLID ROI OVERLAY (applied to RGB before transformations) ==========
+        if (
+            roi_overlay_mode == "solid"
+            and roi_collection is not None
+            and not use_wavelength_colormap
+        ):
+            # Convert RGB to uint8 for pixel manipulation
+            rgb_overlay = np.clip(display_image * 255, 0, 255).astype(np.uint8)
+
+            # Prepare ROI collection
+            if roi_collection == "all":
+                if hasattr(self, "roi_collection") and self.roi_collection:
+                    rois_to_plot = self.roi_collection
+                else:
+                    rois_to_plot = {}
+            elif isinstance(roi_collection, list):
+                if hasattr(self, "roi_collection") and self.roi_collection:
+                    rois_to_plot = {
+                        name: self.roi_collection[name]
+                        for name in roi_collection
+                        if name in self.roi_collection
+                    }
+                else:
+                    rois_to_plot = {}
+            elif isinstance(roi_collection, dict):
+                rois_to_plot = roi_collection
+            else:
+                rois_to_plot = {}
+
+            # Apply solid colors to ROI pixels (roi_pixel_counts already initialized above)
+
+            # Calculate pixel radius for block painting (e.g., size=3 → radius=1, size=5 → radius=2)
+            pixel_radius = roi_solid_pixel_size // 2
+
+            for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
+                if roi_pixels_list:
+                    # Get color for this ROI
+                    color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
+
+                    # Convert matplotlib color to RGB tuple
+                    from matplotlib.colors import to_rgb
+
+                    rgb_color = np.array(to_rgb(color)) * 255
+                    rgb_color = rgb_color.astype(np.uint8)
+
+                    pixel_count = 0
+                    # Apply color to each ROI pixel (and surrounding pixels if size > 1)
+                    for slit, track in roi_pixels_list:
+                        # Bounds check for center pixel
+                        if 0 <= track < n_tracks and 0 <= slit < n_slits:
+                            # Paint center pixel and surrounding block
+                            for dt in range(-pixel_radius, pixel_radius + 1):
+                                for ds in range(-pixel_radius, pixel_radius + 1):
+                                    t_paint = track + dt
+                                    s_paint = slit + ds
+
+                                    # Bounds check for each pixel in the block
+                                    if (
+                                        0 <= t_paint < n_tracks
+                                        and 0 <= s_paint < n_slits
+                                    ):
+                                        # Note: display_image is (slits, tracks, 3) but we're in (track, slit) coords
+                                        # Need to swap indices: display[slit, track, :]
+                                        rgb_overlay[s_paint, t_paint] = rgb_color
+
+                            pixel_count += 1
+
+                    roi_pixel_counts[roi_name] = pixel_count
+
+            # Convert back to [0, 1] range
+            display_image = rgb_overlay.astype(np.float64) / 255.0
 
         # Apply axis transformations
         if flip_axes:
@@ -6392,90 +7412,137 @@ class CombinedTransectCube:
             # Sort ROIs for consistent legend order
             rois_to_plot = sort_rois_by_category(rois_to_plot)
 
-            # Plot each ROI with different color
-            for roi_idx, (roi_name, roi_pixels_list) in enumerate(rois_to_plot.items()):
-                if roi_pixels_list:
-                    # NEW: Filter ROIs based on crop boundaries (if cropping is applied)
-                    if crop_applied:
-                        # Filter ROIs that fall within the crop region (using ORIGINAL coordinates)
-                        valid_rois = [
-                            (slit, track)
-                            for slit, track in roi_pixels_list
-                            if crop_slit_min <= slit < crop_slit_max
-                            and crop_track_min <= track < crop_track_max
-                        ]
-                    else:
-                        # No cropping: validate against full image bounds
-                        valid_rois = [
-                            (slit, track)
-                            for slit, track in roi_pixels_list
-                            if 0 <= slit < n_slits and 0 <= track < n_tracks
-                        ]
+            # Check overlay mode: solid or markers
+            if roi_overlay_mode == "solid":
+                # Solid overlay mode: ROI pixels already colored in RGB above
+                # Just add legend entries without scatter plots
+                from matplotlib.patches import Patch
 
-                    if valid_rois:
-                        roi_tracks = [track for slit, track in valid_rois]
-                        roi_slits = [slit for slit, track in valid_rois]
-
-                        # NEW: Get consistent color across all plots
+                legend_handles = []
+                for roi_name, roi_pixels_list in rois_to_plot.items():
+                    if roi_name in roi_pixel_counts and roi_pixel_counts[roi_name] > 0:
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
-
-                        # Transform ROI coordinates based on flip settings
-                        roi_x_coords = []
-                        roi_y_coords = []
-                        for track, slit in zip(roi_tracks, roi_slits):
-                            x, y = transform_coords(track, slit)
-                            roi_x_coords.append(x)
-                            roi_y_coords.append(y)
-
-                        # DEBUG: Print first few transformed coordinates
-                        if crop_applied and len(valid_rois) > 0:
-                            print(
-                                f"🔍 DEBUG ROI '{roi_name}': {len(valid_rois)} pixels"
+                        # Check if roi_name already contains pixel count (e.g., "bombs (2369 px)")
+                        # If so, don't add it again to avoid duplication
+                        if " px)" in roi_name:
+                            # Already has pixel count, use as-is
+                            label = roi_name
+                        else:
+                            # Add pixel count
+                            label = f"{roi_name} ({roi_pixel_counts[roi_name]})"
+                        legend_handles.append(
+                            Patch(
+                                facecolor=color,
+                                label=label,
                             )
-                            print(
-                                f"   First 3 original: slit={roi_slits[:3]}, track={roi_tracks[:3]}"
-                            )
-                            print(
-                                f"   First 3 transformed: x={roi_x_coords[:3]}, y={roi_y_coords[:3]}"
-                            )
-                            print(
-                                f"   Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]"
-                            )
-
-                        # Plot ROI with solid colors - FAST METHOD using scatter with square markers
-                        plt.scatter(
-                            roi_x_coords,
-                            roi_y_coords,
-                            c=color,
-                            s=roi_marker_size**2 * 50,  # Square marker size
-                            marker="s",  # Square marker for filled pixels
-                            edgecolors=(
-                                "black" if roi_marker_edgewidth > 0 else "none"
-                            ),
-                            linewidths=roi_marker_edgewidth,
-                            alpha=1.0,  # Solid colors, no transparency
-                            label=f"{roi_name} ({len(valid_rois)})",
                         )
 
-                        # Optional: Add numbers for each ROI (using transformed coordinates)
-                        if roi_show_numbers:
-                            for i, (slit, track) in enumerate(valid_rois, 1):
+                # Add legend if we have entries
+                if legend_handles and roi_legend_loc is not None:
+                    if roi_legend_loc == "outside":
+                        ax.legend(
+                            handles=legend_handles,
+                            loc="center left",
+                            bbox_to_anchor=(1.02, 0.5),
+                            fontsize=9,
+                            framealpha=0.9,
+                        )
+                    else:
+                        ax.legend(
+                            handles=legend_handles,
+                            loc=roi_legend_loc,
+                            fontsize=9,
+                            framealpha=0.9,
+                        )
+            else:
+                # Marker mode: Plot each ROI with scatter (original behavior)
+                for roi_idx, (roi_name, roi_pixels_list) in enumerate(
+                    rois_to_plot.items()
+                ):
+                    if roi_pixels_list:
+                        # NEW: Filter ROIs based on crop boundaries (if cropping is applied)
+                        if crop_applied:
+                            # Filter ROIs that fall within the crop region (using ORIGINAL coordinates)
+                            valid_rois = [
+                                (slit, track)
+                                for slit, track in roi_pixels_list
+                                if crop_slit_min <= slit < crop_slit_max
+                                and crop_track_min <= track < crop_track_max
+                            ]
+                        else:
+                            # No cropping: validate against full image bounds
+                            valid_rois = [
+                                (slit, track)
+                                for slit, track in roi_pixels_list
+                                if 0 <= slit < n_slits and 0 <= track < n_tracks
+                            ]
+
+                        if valid_rois:
+                            roi_tracks = [track for slit, track in valid_rois]
+                            roi_slits = [slit for slit, track in valid_rois]
+
+                            # NEW: Get consistent color across all plots
+                            color = self._get_roi_color(
+                                roi_name, roi_colors, roi_color_map
+                            )
+
+                            # Transform ROI coordinates based on flip settings
+                            roi_x_coords = []
+                            roi_y_coords = []
+                            for track, slit in zip(roi_tracks, roi_slits):
                                 x, y = transform_coords(track, slit)
-                                plt.text(
-                                    x,
-                                    y + 3,
-                                    str(i),
-                                    ha="center",
-                                    va="bottom",
-                                    fontsize=8,
-                                    fontweight="bold",
-                                    color="black",
-                                    bbox=dict(
-                                        boxstyle="round,pad=0.2",
-                                        facecolor="white",
-                                        alpha=0.8,
-                                    ),
+                                roi_x_coords.append(x)
+                                roi_y_coords.append(y)
+
+                            # DEBUG: Print first few transformed coordinates
+                            if crop_applied and len(valid_rois) > 0:
+                                print(
+                                    f"🔍 DEBUG ROI '{roi_name}': {len(valid_rois)} pixels"
                                 )
+                                print(
+                                    f"   First 3 original: slit={roi_slits[:3]}, track={roi_tracks[:3]}"
+                                )
+                                print(
+                                    f"   First 3 transformed: x={roi_x_coords[:3]}, y={roi_y_coords[:3]}"
+                                )
+                                print(
+                                    f"   Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]"
+                                )
+
+                            # Plot ROI with solid colors - FAST METHOD using scatter with square markers
+                            plt.scatter(
+                                roi_x_coords,
+                                roi_y_coords,
+                                c=color,
+                                s=roi_marker_size**2 * 50,  # Square marker size
+                                marker="s",  # Square marker for filled pixels
+                                edgecolors=(
+                                    "black" if roi_marker_edgewidth > 0 else "none"
+                                ),
+                                linewidths=roi_marker_edgewidth,
+                                alpha=1.0,  # Solid colors, no transparency
+                                label=f"{roi_name} ({len(valid_rois)})",
+                            )
+
+                            # Optional: Add numbers for each ROI (using transformed coordinates)
+                            if roi_show_numbers:
+                                for i, (slit, track) in enumerate(valid_rois, 1):
+                                    x, y = transform_coords(track, slit)
+                                    plt.text(
+                                        x,
+                                        y + 3,
+                                        str(i),
+                                        ha="center",
+                                        va="bottom",
+                                        fontsize=8,
+                                        fontweight="bold",
+                                        color="black",
+                                        bbox=dict(
+                                            boxstyle="round,pad=0.2",
+                                            facecolor="white",
+                                            alpha=0.8,
+                                        ),
+                                    )
 
         # Backward compatibility: single ROI support
         elif roi_pixels is not None and len(roi_pixels) > 0:
@@ -6707,7 +7774,7 @@ class CombinedTransectCube:
             # Define wavelength ranges for averaging
             if wavelength_range is None or wavelength_range == "all":
                 wl_mask = np.ones(len(self.wavelengths), dtype=bool)
-                range_label = "all wavelengths"
+                range_label = ""
             elif wavelength_range == "red":
                 wl_mask = (self.wavelengths >= 640) & (self.wavelengths <= 680)
                 range_label = "red (640-680nm)"
@@ -6927,7 +7994,7 @@ class CombinedTransectCube:
 
         # Plot formatting
         plt.xlabel("Sample Index")
-        plt.ylabel(ylabel)
+        plt.ylabel("Average pseudo-reflectance intensity")
 
         # Smart title with normalization info
         if len(lines_to_plot) == 1:
@@ -7278,7 +8345,7 @@ class CombinedTransectCube:
             else:
                 ylabel = "Normalized Intensity"
         else:
-            ylabel = "Average Intensity"
+            ylabel = "Pseudo-reflectance intensity"
 
         plt.ylabel(ylabel, fontsize=12)
 
@@ -7713,12 +8780,12 @@ class CombinedTransectCube:
             "#B8860B",
         ],
         color_map=None,  # Dict mapping ROI names to specific colors, e.g., {"Sediment": "brown", "dark1": "black"}
-        use_inline_labels=True,
+        use_inline_labels=False,
         normalize=False,  # DEPRECATED: Use normalize_method instead (kept for backward compatibility)
         normalize_method=None,  # NEW: Advanced normalization options
         show_std=True,  # NEW: Control standard deviation bands
         interpolate_wavelengths=None,  # NEW: List of wavelength indices to interpolate (e.g., [104] for 560nm dip)
-        legend_loc="best",  # NEW: Legend location ('best', 'upper right', 'outside', etc., or None to hide)
+        legend_loc="outside",  # NEW: Legend location ('best', 'upper right', 'outside', etc., or None to hide)
         ylim=None,  # NEW: Y-axis limits - tuple (ymin, ymax) or float for ±range around mean
         derivative_order=0,  # NEW: Derivative order (0=raw, 1=first derivative, 2=second derivative)
         derivative_window=2,  # NEW: Window size for derivative computation (default=2)
@@ -8558,7 +9625,7 @@ class CombinedTransectCube:
                 else:
                     title += f" ({smooth_label}: {wavelength_smoothing})"
 
-        plt.xlabel("Wavelength (nm)")
+        plt.xlabel("Wavelength [nm]")
         plt.ylabel(ylabel)
         plt.title(title)
         plt.grid(True, alpha=0.3)
@@ -10485,8 +11552,8 @@ class CombinedTransectCube:
 
             # 7. Write cleaned mask back to classification map
             # Pixels that don't pass the filter are RENAMED to filtered_* (not removed!)
-            # First, find all pixels of this class in cleaned_map
-            class_mask = cleaned_map == class_name
+            # FIXED: Use ORIGINAL classification_map, not cleaned_map!
+            class_mask = classification_map == class_name
             # Pixels that should be removed: in original class but NOT in cleaned_mask
             pixels_to_remove = class_mask & (~cleaned_mask.astype(bool))
             n_pixels_to_remove = np.sum(pixels_to_remove)
@@ -13155,3 +14222,296 @@ def print_processing_statistics(stats_file_path=None, track_start=None, track_en
     print("=" * 80)
 
     return stats
+
+
+# ============================================================================
+# 🎨 HELPER FUNCTIONS FOR CLASSIFICATION VISUALIZATION
+# ============================================================================
+
+
+def plot_classification_map(
+    cube,
+    classification_map,
+    class_names,
+    track_start,
+    track_end,
+    figsize=(50, 20),
+    class_name_mapping=None,
+    show_pixel_counts=True,
+    roi_legend_loc="upper left",
+    roi_marker_size=1,
+    roi_marker_edgewidth=0,
+    roi_legend_markersize=50,
+    roi_solid_pixel_size=1,
+    **plot_kwargs,
+):
+    """
+    Plot a classification map with customizable class names and legend.
+
+    Parameters
+    ----------
+    cube : CombinedTransectCube
+        The cube object with plot_georef method
+    classification_map : np.ndarray
+        2D array with class labels (strings)
+    class_names : list
+        List of class names present in the map
+    track_start : int
+        Starting track index
+    track_end : int
+        Ending track index
+    figsize : tuple, optional
+        Figure size (width, height)
+    class_name_mapping : dict, optional
+        Dictionary to rename classes for display, e.g.:
+        {"classified_bombs": "bombs", "classified_dark": "dark", "new_sediment": "sediment"}
+        If None, original names are used
+    show_pixel_counts : bool, optional
+        If True, show pixel counts in legend labels. Default True.
+    roi_legend_loc : str, optional
+        Legend location. Default "upper left"
+    roi_marker_size : int, optional
+        Marker size for ROI points. Default 1
+    roi_marker_edgewidth : int, optional
+        Edge width for ROI markers. Default 0
+    roi_legend_markersize : int, optional
+        Marker size in legend. Default 50
+    roi_solid_pixel_size : int, optional
+        Pixel size for solid overlay. Default 1
+    **plot_kwargs : optional
+        Additional arguments passed to plot_georef
+
+    Returns
+    -------
+    None
+        Displays the plot
+    """
+    import numpy as np
+
+    # 🎨 SMART COLOR INHERITANCE: Map validation/training ROI colors to classification names
+    # This ensures colors stay consistent across validation and classification plots
+    roi_color_map = {}
+
+    if hasattr(cube, "roi_color_map") and cube.roi_color_map:
+        # Build mapping from class names to their display names (after mapping)
+        for class_name in class_names:
+            display_name = class_name
+            if class_name_mapping and class_name in class_name_mapping:
+                display_name = class_name_mapping[class_name]
+
+            # Check if we can inherit color from validation/training ROIs
+            # e.g., "classified_bombs" → look for "validation_bombs" or "training_bombs" color
+            possible_sources = []
+
+            # Extract base name (e.g., "bombs" from "classified_bombs")
+            if class_name.startswith("classified_"):
+                base_name = class_name.replace("classified_", "")
+                possible_sources.extend(
+                    [
+                        f"validation_{base_name}",
+                        f"training_{base_name}",
+                        class_name,  # exact match
+                        display_name,  # mapped name
+                    ]
+                )
+            elif class_name.startswith("new_"):
+                # "new_sediment" → look for "validation_sediment" or "training_sediment"
+                base_name = class_name.replace("new_", "")
+                possible_sources.extend(
+                    [
+                        f"validation_{base_name}",
+                        f"training_{base_name}",
+                        class_name,
+                        display_name,
+                    ]
+                )
+            else:
+                possible_sources = [class_name, display_name]
+
+            # Find first matching color
+            for source_name in possible_sources:
+                if source_name in cube.roi_color_map:
+                    roi_color_map[display_name] = cube.roi_color_map[source_name]
+                    break
+
+    # Create ROI collection from classification map
+    classification_rois = {}
+    for class_name in class_names:
+        mask = classification_map == class_name
+        rows, cols = np.where(mask)
+        pixels = [(col, row + track_start) for row, col in zip(rows, cols)]
+        if len(pixels) > 0:
+            # Apply name mapping if provided
+            display_name = class_name
+            if class_name_mapping and class_name in class_name_mapping:
+                display_name = class_name_mapping[class_name]
+
+            # Add pixel count to name if requested
+            display_name_with_count = display_name
+            if show_pixel_counts:
+                display_name_with_count = f"{display_name} ({len(pixels)} px)"
+
+            # 🔥 UPDATE roi_color_map: Copy color from base name to name with pixel count
+            if display_name in roi_color_map:
+                roi_color_map[display_name_with_count] = roi_color_map[display_name]
+
+            classification_rois[display_name_with_count] = pixels
+
+    print(f"📊 Plotting classification map...")
+    print(f"   Classes: {list(classification_rois.keys())}")
+
+    # Debug: Show inherited colors
+    if roi_color_map:
+        print(f"   🎨 Inherited colors from validation/training ROIs:")
+        for display_name_with_count in classification_rois.keys():
+            if display_name_with_count in roi_color_map:
+                print(
+                    f"      {display_name_with_count}: {roi_color_map[display_name_with_count]}"
+                )
+
+    # Plot with plot_georef (pass inherited color map)
+    cube.plot_georef(
+        use_corrected=True,
+        coordinate_system="NED",
+        track_start=track_start,
+        track_end=track_end,
+        figsize=figsize,
+        roi_collection=classification_rois,
+        roi_color_map=(
+            roi_color_map if roi_color_map else None
+        ),  # 🎨 Pass inherited colors
+        roi_marker_size=roi_marker_size,
+        roi_legend_loc=roi_legend_loc,
+        roi_marker_edgewidth=roi_marker_edgewidth,
+        roi_legend_markersize=roi_legend_markersize,
+        roi_solid_pixel_size=roi_solid_pixel_size,
+        roi_overlay_mode="solid",
+        **plot_kwargs,
+    )
+
+
+def plot_confusion_matrix(
+    confusion_matrix,
+    class_names,
+    class_name_mapping=None,
+    figsize=(10, 8),
+    cmap="Greens",
+    title="Confusion Matrix",
+    normalize=True,
+    show_counts=True,
+    fontsize_labels=12,
+    fontsize_title=14,
+    fontsize_cells=12,
+    show_colorbar=True,
+):
+    """
+    Plot a confusion matrix with customizable appearance and class names.
+
+    Parameters
+    ----------
+    confusion_matrix : np.ndarray
+        2D confusion matrix (rows=true class, cols=predicted class)
+    class_names : list
+        List of class names corresponding to matrix rows/cols
+    class_name_mapping : dict, optional
+        Dictionary to rename classes for display, e.g.:
+        {"classified_bombs": "bombs", "classified_dark": "dark", "new_sediment": "sediment"}
+        If None, original names are used
+    figsize : tuple, optional
+        Figure size (width, height). Default (10, 8)
+    cmap : str, optional
+        Colormap name. Default "Greens"
+    title : str, optional
+        Plot title. Default "Confusion Matrix"
+    normalize : bool, optional
+        If True, also print normalized confusion matrix (percentages by row).
+        Default True
+    show_counts : bool, optional
+        If True, show pixel counts in cells. Default True
+    fontsize_labels : int, optional
+        Font size for axis labels. Default 12
+    fontsize_title : int, optional
+        Font size for title. Default 14
+    fontsize_cells : int, optional
+        Font size for cell text. Default 12
+    show_colorbar : bool, optional
+        If True, show colorbar. Default True
+
+    Returns
+    -------
+    fig, ax : matplotlib figure and axes
+        The figure and axes objects
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Apply class name mapping if provided
+    display_names = []
+    for name in class_names:
+        if class_name_mapping and name in class_name_mapping:
+            display_names.append(class_name_mapping[name])
+        else:
+            display_names.append(name)
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot confusion matrix as image
+    im = ax.imshow(confusion_matrix, cmap=cmap, aspect="auto")
+
+    # Add colorbar if requested
+    if show_colorbar:
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label("Pixel Count", fontsize=fontsize_labels)
+
+    # Set ticks and labels
+    ax.set_xticks(np.arange(len(display_names)))
+    ax.set_yticks(np.arange(len(display_names)))
+    ax.set_xticklabels(display_names, fontsize=fontsize_labels)
+    ax.set_yticklabels(display_names, fontsize=fontsize_labels)
+
+    # Rotate x-axis labels
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    # Add text annotations if requested
+    if show_counts:
+        for i in range(len(display_names)):
+            for j in range(len(display_names)):
+                text = ax.text(
+                    j,
+                    i,
+                    f"{confusion_matrix[i, j]}",
+                    ha="center",
+                    va="center",
+                    color="black",
+                    fontsize=fontsize_cells,
+                )
+
+    ax.set_xlabel("Predicted Class", fontsize=fontsize_labels)
+    ax.set_ylabel("True Class", fontsize=fontsize_labels)
+    ax.set_title(title, fontsize=fontsize_title, fontweight="bold")
+    plt.tight_layout()
+    plt.show()
+
+    # Print normalized confusion matrix (percentages) if requested
+    if normalize:
+        cm_normalized = (
+            confusion_matrix.astype("float")
+            / confusion_matrix.sum(axis=1)[:, np.newaxis]
+            * 100
+        )
+
+        print(f"\n📊 Confusion Matrix (Normalized by True Class - Row %):")
+        print(f"{'':20s}", end="")
+        for pred_class in display_names:
+            print(f"{pred_class:>20s}", end="")
+        print()
+        print("-" * (20 + 20 * len(display_names)))
+
+        for i, true_class in enumerate(display_names):
+            print(f"{true_class:20s}", end="")
+            for j in range(len(display_names)):
+                print(f"{cm_normalized[i, j]:19.1f}%", end="")
+            print()
+
+    return fig, ax
