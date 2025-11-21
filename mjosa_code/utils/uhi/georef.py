@@ -752,6 +752,9 @@ class CombinedTransectCube:
         COLOR_SEDIMENT = "#8b4513"  # saddle brown (main sediment color)
         COLOR_UNKNOWN = "#8A2BE2"  # violet purple (for unknown/rejected)
         COLOR_FILTERED_DARK = "#FFFF00"  # yellow (for filtered dark pixels)
+        COLOR_FILTERED_DARK = "#FFFF00"  # yellow (for filtered dark pixels)
+        COLOR_DARK_SEDIMENT = "#3F3F3F"  # medium-dark gray (distinct from pure black)
+        COLOR_HALO = "#e5e57f"  # medium-dark gray (distinct from pure black)
 
         HARDCODED_ROI_COLORS = {
             # Individual bomb features
@@ -766,7 +769,7 @@ class CombinedTransectCube:
             "dark bomb": COLOR_DARK,
             # Dark features
             "dark spots": COLOR_DARK,
-            "dark sediment": "#555555",  # medium-dark gray (distinct from pure black)
+            "dark sediment": COLOR_DARK_SEDIMENT,  # medium-dark gray (distinct from pure black)
             # Sediment variants
             "sediment": COLOR_SEDIMENT,
             "brown leaf": COLOR_SEDIMENT,
@@ -781,6 +784,7 @@ class CombinedTransectCube:
             "training_sediment": COLOR_SEDIMENT,
             # 🔥 CLASSIFICATION output (same colors as training)
             "classified_unknown": COLOR_UNKNOWN,
+            "unclassified": COLOR_UNKNOWN,
             "classified_bombs": COLOR_BOMBS,
             "classified_dark": COLOR_DARK,
             "classified_sediment": COLOR_SEDIMENT,
@@ -793,7 +797,16 @@ class CombinedTransectCube:
             # 🔥 DISPLAY names (for plot_classification_map after name mapping)
             "bombs": COLOR_BOMBS,
             "dark": COLOR_DARK,
+            "dark areas": COLOR_DARK,
             "sediment": COLOR_SEDIMENT,
+            "dark_bomb": COLOR_DARK,
+            "dark ": COLOR_DARK,
+            "dark_pit": COLOR_DARK_SEDIMENT,
+            "dark area near bomb": COLOR_DARK,
+            "isolated dark area": COLOR_DARK_SEDIMENT,
+            "halo": COLOR_HALO,
+            "radial features a": "#FF00FF",
+            "rust": "#b12222",
         }
 
         # NEW: Smart pattern matching for consistent color hues by feature type
@@ -867,7 +880,7 @@ class CombinedTransectCube:
         if " px)" in roi_name:
             # Extract base name before pixel count
             base_roi_name = roi_name.rsplit(" (", 1)[0]
-        
+
         # Check both the full name and the base name
         if roi_name in HARDCODED_ROI_COLORS:
             # Save to persistent map for consistency
@@ -972,6 +985,7 @@ class CombinedTransectCube:
         roi_legend_loc="best",  # Legend location: 'best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center', 'outside', or None to hide
         roi_legend_markersize=10,  # Size of color markers in legend (default=10)
         roi_legend_marker_border=True,  # Whether to show black border on legend markers
+        roi_legend_show_counts=True,  # Whether to show pixel counts in legend labels (e.g., "bombs (2369)")
         # Cartographic options (NEW - map-style features)
         rotation_deg=0,  # Rotate plot by yaw angle in degrees (counter-clockwise positive)
         add_scale_bar=False,  # Add scale bar to plot
@@ -1001,9 +1015,10 @@ class CombinedTransectCube:
             1.37,
             1.73,
         ),  # Manual max value for colormap normalization (single value or per-channel tuple)
-        colorbar_fraction=0.046,  # Size of colorbar relative to main plot (width control)
+        colorbar_fraction=0.046,  # Size of colorbar relative to main plot (width for vertical, height for horizontal)
         colorbar_pad=0.04,  # Padding between plot and colorbar
-        colorbar_shrink=1.0,  # Shrink factor for colorbar height (1.0 = full height)
+        colorbar_shrink=1.0,  # Shrink factor for colorbar length (1.0 = full length)
+        colorbar_orientation="vertical",  # Orientation: "vertical" or "horizontal"
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -1941,14 +1956,21 @@ class CombinedTransectCube:
                 for roi_name, roi_pixels_list in rois_to_plot.items():
                     if roi_name in roi_pixel_counts and roi_pixel_counts[roi_name] > 0:
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
-                        # Check if roi_name already contains pixel count (e.g., "bombs (2369 px)")
+                        # Check if roi_name already contains pixel count (e.g., "bombs (2369 px)" or "bombs (2369)")
                         # If so, don't add it again to avoid duplication
-                        if " px)" in roi_name:
+                        if " px)" in roi_name or (
+                            roi_legend_show_counts
+                            and ")" in roi_name
+                            and "(" in roi_name
+                        ):
                             # Already has pixel count, use as-is
                             label = roi_name
-                        else:
-                            # Add pixel count
+                        elif roi_legend_show_counts:
+                            # Add pixel count if requested
                             label = f"{roi_name} ({roi_pixel_counts[roi_name]})"
+                        else:
+                            # Don't add pixel count
+                            label = roi_name
                         legend_handles.append(
                             Patch(
                                 facecolor=color,
@@ -2497,6 +2519,7 @@ class CombinedTransectCube:
                 fraction=colorbar_fraction,
                 pad=colorbar_pad,
                 shrink=colorbar_shrink,
+                orientation=colorbar_orientation,
             )
 
             # Compute actual range - use the raw intensity values, not normalized [0,1]
@@ -3010,6 +3033,7 @@ class CombinedTransectCube:
                 fraction=colorbar_fraction,
                 pad=colorbar_pad,
                 shrink=colorbar_shrink,
+                orientation=colorbar_orientation,
             )
 
             # Compute actual range - use the raw intensity values, not normalized [0,1]
@@ -6611,6 +6635,7 @@ class CombinedTransectCube:
         roi_legend_loc="best",  # Legend location: 'best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center', 'outside', or None to hide
         roi_legend_markersize=10,  # Size of color markers in legend (default=10)
         roi_legend_marker_border=True,  # Whether to show black border on legend markers
+        roi_legend_show_counts=True,  # Whether to show pixel counts in legend labels (e.g., "bombs (2369)")
         line_colors=["red", "blue", "orange", "magenta"],
         line_width=2,
         line_style="-",
@@ -6632,6 +6657,9 @@ class CombinedTransectCube:
         vmin=(0.53, 0.58, 0.2),
         vmax=(1.35, 1.37, 1.73),
         colorbar_fraction=0.046,  # NEW: Fraction of axes width for colorbar (default 0.046, use 0.15 for larger, None for auto full-height)
+        colorbar_orientation="vertical",  # NEW: Orientation: "vertical" or "horizontal"
+        colorbar_pad=0.04,  # Padding between plot and colorbar
+        colorbar_shrink=1.0,  # Shrink factor for colorbar length (1.0 = full length)
     ):
         """
         Enhanced RGB plot supporting multiple named ROIs with different colors.
@@ -7245,10 +7273,23 @@ class CombinedTransectCube:
             # Add colorbar for wavelength mode
             if colorbar_fraction is None:
                 # Auto full-height colorbar
-                cbar = plt.colorbar(im, ax=ax, pad=0.02)
+                cbar = plt.colorbar(
+                    im,
+                    ax=ax,
+                    pad=colorbar_pad,
+                    shrink=colorbar_shrink,
+                    orientation=colorbar_orientation,
+                )
             else:
                 # User-specified fraction
-                cbar = plt.colorbar(im, ax=ax, fraction=colorbar_fraction, pad=0.02)
+                cbar = plt.colorbar(
+                    im,
+                    ax=ax,
+                    fraction=colorbar_fraction,
+                    pad=colorbar_pad,
+                    shrink=colorbar_shrink,
+                    orientation=colorbar_orientation,
+                )
             cbar.set_label(
                 f"{derivative_label if derivative_order > 0 else 'Intensity'}\n(white = min, color = max)",
                 fontsize=11,
@@ -7422,14 +7463,21 @@ class CombinedTransectCube:
                 for roi_name, roi_pixels_list in rois_to_plot.items():
                     if roi_name in roi_pixel_counts and roi_pixel_counts[roi_name] > 0:
                         color = self._get_roi_color(roi_name, roi_colors, roi_color_map)
-                        # Check if roi_name already contains pixel count (e.g., "bombs (2369 px)")
+                        # Check if roi_name already contains pixel count (e.g., "bombs (2369 px)" or "bombs (2369)")
                         # If so, don't add it again to avoid duplication
-                        if " px)" in roi_name:
+                        if " px)" in roi_name or (
+                            roi_legend_show_counts
+                            and ")" in roi_name
+                            and "(" in roi_name
+                        ):
                             # Already has pixel count, use as-is
                             label = roi_name
-                        else:
-                            # Add pixel count
+                        elif roi_legend_show_counts:
+                            # Add pixel count if requested
                             label = f"{roi_name} ({roi_pixel_counts[roi_name]})"
+                        else:
+                            # Don't add pixel count
+                            label = roi_name
                         legend_handles.append(
                             Patch(
                                 facecolor=color,
@@ -7648,7 +7696,13 @@ class CombinedTransectCube:
             or (roi_pixels is not None and len(roi_pixels) > 0)
         )
         legend_outside = False
-        if has_overlays and roi_legend_loc is not None:
+        # BUGFIX: Skip this legend creation if using solid overlay mode
+        # (legend already created above in solid mode block with proper handles)
+        print(
+            f"🐛 DEBUG legend: has_overlays={has_overlays}, roi_legend_loc={roi_legend_loc}, roi_overlay_mode={roi_overlay_mode}"
+        )
+        if has_overlays and roi_legend_loc is not None and roi_overlay_mode != "solid":
+            print(f"🐛 DEBUG: Creating legend (should NOT happen in solid mode!)")
             if roi_legend_loc == "outside":
                 # Place legend outside the plot area on the right
                 legend = plt.legend(
@@ -8921,12 +8975,14 @@ class CombinedTransectCube:
 
             if roi_names == "all":
                 rois_to_plot = self.roi_collection.copy()
+                # Only sort when "all" is used (automatic sorting)
+                rois_to_plot = sort_rois_by_category(rois_to_plot)
             elif isinstance(roi_names, list):
+                # PRESERVE ORDER when list is provided - respect user's explicit ordering
                 for name in roi_names:
                     if name in self.roi_collection:
                         rois_to_plot[name] = self.roi_collection[name]
-            # Sort ROIs for consistent legend order
-            rois_to_plot = sort_rois_by_category(rois_to_plot)
+                # DON'T sort - user provided explicit order!
             is_roi_analysis = True
 
         elif roi_name is not None:
@@ -11559,8 +11615,11 @@ class CombinedTransectCube:
             n_pixels_to_remove = np.sum(pixels_to_remove)
 
             if n_pixels_to_remove > 0:
-                # Create filtered class name: classified_bombs → filtered_bombs
-                filtered_class_name = class_name.replace("classified_", "filtered_")
+                # Create filtered class name: classified_bombs → filtered_bombs OR dark_bomb → filtered_dark_bomb
+                if class_name.startswith("classified_"):
+                    filtered_class_name = class_name.replace("classified_", "filtered_")
+                else:
+                    filtered_class_name = f"filtered_{class_name}"
 
                 # Reclassify removed pixels with filtered_* name
                 cleaned_map[pixels_to_remove] = filtered_class_name
@@ -12319,7 +12378,10 @@ class CombinedTransectCube:
             pixels_removed[class_name] = original_counts[class_name] - final_count
 
             # Check if filtered version exists
-            filtered_class_name = class_name.replace("classified_", "filtered_")
+            if class_name.startswith("classified_"):
+                filtered_class_name = class_name.replace("classified_", "filtered_")
+            else:
+                filtered_class_name = f"filtered_{class_name}"
             if filtered_class_name in all_classes_after:
                 filtered_class_counts[filtered_class_name] = np.sum(
                     filtered_map == filtered_class_name
@@ -12339,7 +12401,12 @@ class CombinedTransectCube:
                     )
 
                     # Show filtered class count
-                    filtered_class_name = class_name.replace("classified_", "filtered_")
+                    if class_name.startswith("classified_"):
+                        filtered_class_name = class_name.replace(
+                            "classified_", "filtered_"
+                        )
+                    else:
+                        filtered_class_name = f"filtered_{class_name}"
                     if filtered_class_name in filtered_class_counts:
                         print(
                             f"      → Created {filtered_class_name}: {filtered_class_counts[filtered_class_name]} pixels"
@@ -14384,6 +14451,7 @@ def plot_classification_map(
         roi_legend_loc=roi_legend_loc,
         roi_marker_edgewidth=roi_marker_edgewidth,
         roi_legend_markersize=roi_legend_markersize,
+        roi_legend_show_counts=False,  # ✅ Don't add counts in plot_georef (already added by show_pixel_counts)
         roi_solid_pixel_size=roi_solid_pixel_size,
         roi_overlay_mode="solid",
         **plot_kwargs,
@@ -14515,3 +14583,314 @@ def plot_confusion_matrix(
             print()
 
     return fig, ax
+
+
+def compute_confusion_matrix_metrics(
+    confusion_matrix,
+    class_names,
+    validation_results=None,
+    class_name_mapping=None,
+    print_analysis=True,
+):
+    """
+    Compute comprehensive confusion matrix metrics and return structured data.
+
+    This function calculates all standard metrics from a confusion matrix:
+    - Raw confusion matrix (pixel counts)
+    - Row/column totals
+    - Producer's Accuracy (PA) = Recall per class
+    - User's Accuracy (UA) = Precision per class
+    - Normalized confusion matrix (percentages)
+    - Overall Accuracy (OA)
+    - Cohen's Kappa (κ)
+    - Summary statistics
+
+    Parameters
+    ----------
+    confusion_matrix : np.ndarray
+        2D confusion matrix (rows=true class, cols=predicted class)
+    class_names : list
+        List of class names corresponding to matrix rows/cols
+    validation_results : dict, optional
+        Validation results dict from validate_classification() containing
+        'f1_per_class' for F1 scores. If None, F1 scores won't be included.
+    class_name_mapping : dict, optional
+        Dictionary to rename classes for display, e.g.:
+        {"classified_bombs": "bombs", "classified_dark": "dark", "new_sediment": "sediment"}
+        If None, original names are used.
+    print_analysis : bool, optional
+        If True, print detailed analysis to console. Default True.
+
+    Returns
+    -------
+    dict
+        Dictionary containing all computed metrics:
+        {
+            'confusion_matrix': np.ndarray,  # Original confusion matrix
+            'class_names': list,  # Original class names
+            'display_names': list,  # Mapped class names (if mapping provided)
+            'row_totals': np.ndarray,  # Pixels per true class
+            'col_totals': np.ndarray,  # Pixels per predicted class
+            'total_pixels': int,  # Total pixels
+            'cm_normalized': np.ndarray,  # Normalized confusion matrix (percentages)
+            'producers_accuracy': dict,  # PA per class {class_name: value}
+            'users_accuracy': dict,  # UA per class {class_name: value}
+            'overall_accuracy': float,  # Overall accuracy
+            'cohens_kappa': float,  # Cohen's Kappa
+            'kappa_interpretation': str,  # Kappa interpretation string
+            'f1_per_class': dict,  # F1 scores per class (if validation_results provided)
+        }
+
+    Examples
+    --------
+    >>> # After running validation
+    >>> metrics = compute_confusion_matrix_metrics(
+    ...     confusion_matrix=validation_results["confusion_matrix"],
+    ...     class_names=merge_results["class_names"],
+    ...     validation_results=validation_results,
+    ...     class_name_mapping={"classified_bombs": "bombs", "classified_dark": "dark"},
+    ...     print_analysis=True
+    ... )
+    >>> # Access specific metrics
+    >>> print(f"Overall Accuracy: {metrics['overall_accuracy']:.3f}")
+    >>> print(f"Kappa: {metrics['cohens_kappa']:.3f}")
+    >>> for class_name in metrics['class_names']:
+    ...     print(f"{class_name}: PA={metrics['producers_accuracy'][class_name]:.1%}")
+    """
+    import numpy as np
+    from sklearn.metrics import cohen_kappa_score
+
+    cm = confusion_matrix
+
+    # Apply class name mapping if provided
+    display_names = []
+    for name in class_names:
+        if class_name_mapping and name in class_name_mapping:
+            display_names.append(class_name_mapping[name])
+        else:
+            display_names.append(name)
+
+    # Compute basic statistics
+    row_totals = cm.sum(axis=1)
+    col_totals = cm.sum(axis=0)
+    total_pixels = cm.sum()
+
+    # Compute normalized confusion matrix (percentages by row)
+    cm_normalized = cm.astype("float") / row_totals[:, np.newaxis] * 100
+
+    # Compute Producer's Accuracy (PA) = correctness from producer's perspective
+    # PA = diagonal / column total (predicted totals)
+    producers_accuracy = {}
+    for i, class_name in enumerate(class_names):
+        pa = cm[i, i] / col_totals[i] if col_totals[i] > 0 else 0
+        producers_accuracy[class_name] = pa
+
+    # Compute User's Accuracy (UA) = correctness from user's perspective
+    # UA = diagonal / row total (ground truth totals)
+    users_accuracy = {}
+    for i, class_name in enumerate(class_names):
+        ua = cm[i, i] / row_totals[i] if row_totals[i] > 0 else 0
+        users_accuracy[class_name] = ua
+
+    # Compute Overall Accuracy (OA)
+    correct_pixels = np.trace(cm)
+    overall_accuracy = correct_pixels / total_pixels
+
+    # Compute Cohen's Kappa (κ)
+    y_true = []
+    y_pred = []
+    for i in range(len(class_names)):
+        for j in range(len(class_names)):
+            count = cm[i, j]
+            y_true.extend([i] * int(count))
+            y_pred.extend([j] * int(count))
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    kappa = cohen_kappa_score(y_true, y_pred)
+
+    # Kappa interpretation
+    if kappa > 0.8:
+        kappa_interpretation = "Strong agreement"
+    elif kappa > 0.6:
+        kappa_interpretation = "Substantial agreement"
+    elif kappa > 0.4:
+        kappa_interpretation = "Moderate agreement"
+    elif kappa > 0.2:
+        kappa_interpretation = "Fair agreement"
+    else:
+        kappa_interpretation = "Slight agreement"
+
+    # Extract F1 scores if validation_results provided
+    f1_per_class = None
+    if validation_results and "f1_per_class" in validation_results:
+        f1_per_class = validation_results["f1_per_class"]
+
+    # Build results dictionary
+    results = {
+        "confusion_matrix": cm,
+        "class_names": class_names,
+        "display_names": display_names,
+        "row_totals": row_totals,
+        "col_totals": col_totals,
+        "total_pixels": int(total_pixels),
+        "cm_normalized": cm_normalized,
+        "producers_accuracy": producers_accuracy,
+        "users_accuracy": users_accuracy,
+        "overall_accuracy": overall_accuracy,
+        "cohens_kappa": kappa,
+        "kappa_interpretation": kappa_interpretation,
+        "f1_per_class": f1_per_class,
+    }
+
+    # Print analysis if requested
+    if print_analysis:
+        print("=" * 80)
+        print("📊 CONFUSION MATRIX ANALYSIS")
+        print("=" * 80)
+
+        # 1. Raw confusion matrix (pixel counts)
+        print("\n1️⃣ CONFUSION MATRIX - PIXEL COUNTS")
+        print("-" * 80)
+        print(f"{'':>15} | ", end="")
+        for dn in display_names:
+            print(f"{dn:>12} | ", end="")
+        print("Row Total")
+        print("-" * 80)
+
+        for i, true_class in enumerate(display_names):
+            print(f"{true_class:>15} | ", end="")
+            for j in range(len(display_names)):
+                print(f"{cm[i, j]:>12,} | ", end="")
+            print(f"{row_totals[i]:>12,}")
+
+        print("-" * 80)
+        print(f"{'Column Total':>15} | ", end="")
+        for ct in col_totals:
+            print(f"{ct:>12,} | ", end="")
+        print(f"{total_pixels:>12,}")
+        print("=" * 80)
+
+        # 2. Row totals (true pixels per class)
+        print("\n2️⃣ ROW TOTALS (True pixels per class)")
+        print("-" * 80)
+        for i, true_class in enumerate(display_names):
+            print(f"  {true_class:>15}: {row_totals[i]:>10,} pixels")
+        print(f"  {'TOTAL':>15}: {total_pixels:>10,} pixels")
+        print("=" * 80)
+
+        # 3. Column totals (predicted pixels per class)
+        print("\n3️⃣ COLUMN TOTALS (Predicted pixels per class)")
+        print("-" * 80)
+        for j, pred_class in enumerate(display_names):
+            print(f"  {pred_class:>15}: {col_totals[j]:>10,} pixels")
+        print(f"  {'TOTAL':>15}: {total_pixels:>10,} pixels")
+        print("=" * 80)
+
+        # 4. Total pixels N
+        print(f"\n4️⃣ TOTAL PIXELS (N)")
+        print("-" * 80)
+        print(f"  N = {total_pixels:,} pixels")
+        print("=" * 80)
+
+        # 5. Producer's Accuracy (PA) per class = Recall
+        print("\n5️⃣ PRODUCER'S ACCURACY (PA) per class")
+        print("-" * 80)
+        print("  PA = diagonal / row_total = recall")
+        print("  (How many true class pixels were correctly predicted)")
+        print()
+        for i, (class_name, true_class) in enumerate(zip(class_names, display_names)):
+            pa = producers_accuracy[class_name]
+            print(f"  {true_class:>15}: {pa:>6.1%}  ({cm[i, i]:,} / {row_totals[i]:,})")
+        print("=" * 80)
+
+        # 6. User's Accuracy (UA) per class = Precision
+        print("\n6️⃣ USER'S ACCURACY (UA) per class")
+        print("-" * 80)
+        print("  UA = diagonal / column_total = precision")
+        print("  (How many predicted class pixels were actually correct)")
+        print()
+        for j, (class_name, pred_class) in enumerate(zip(class_names, display_names)):
+            ua = users_accuracy[class_name]
+            print(f"  {pred_class:>15}: {ua:>6.1%}  ({cm[j, j]:,} / {col_totals[j]:,})")
+        print("=" * 80)
+
+        # 7. Normalized percentages (per cell)
+        print("\n7️⃣ NORMALIZED CONFUSION MATRIX (Percentages)")
+        print("-" * 80)
+        print(f"{'':>15} | ", end="")
+        for dn in display_names:
+            print(f"{dn:>12} | ", end="")
+        print()
+        print("-" * 80)
+
+        for i, true_class in enumerate(display_names):
+            print(f"{true_class:>15} | ", end="")
+            for j in range(len(display_names)):
+                print(f"{cm_normalized[i, j]:>11.1f}% | ", end="")
+            print()
+        print("=" * 80)
+
+        # 8. Overall Accuracy (OA)
+        print("\n8️⃣ OVERALL ACCURACY (OA)")
+        print("-" * 80)
+        print(
+            f"  OA = {overall_accuracy:>6.1%}  ({correct_pixels:,} / {total_pixels:,})"
+        )
+        print("  (Total correctly classified pixels / Total pixels)")
+        print("=" * 80)
+
+        # 9. Cohen's Kappa (κ)
+        print("\n9️⃣ COHEN'S KAPPA (κ)")
+        print("-" * 80)
+        print(f"  κ = {kappa:.3f}")
+        print()
+        print("  Interpretation:")
+        print(f"  → {kappa_interpretation}")
+        print()
+        print("  Scale:")
+        print("    κ > 0.8  : Strong agreement")
+        print("    0.6-0.8  : Substantial agreement")
+        print("    0.4-0.6  : Moderate agreement")
+        print("    0.2-0.4  : Fair agreement")
+        print("    κ < 0.2  : Slight agreement")
+        print("=" * 80)
+
+        # 10. Summary table
+        print("\n🔟 SUMMARY TABLE")
+        print("-" * 80)
+        if f1_per_class:
+            print(
+                f"{'Class':>15} | {'N pixels':>12} | {'PA (%)':>8} | {'UA (%)':>8} | {'F1':>8}"
+            )
+        else:
+            print(f"{'Class':>15} | {'N pixels':>12} | {'PA (%)':>8} | {'UA (%)':>8}")
+        print("-" * 80)
+
+        for i, (class_name, display_name) in enumerate(zip(class_names, display_names)):
+            pa = producers_accuracy[class_name] * 100
+            ua = users_accuracy[class_name] * 100
+            if f1_per_class:
+                f1 = f1_per_class[class_name]
+                print(
+                    f"{display_name:>15} | {row_totals[i]:>12,} | {pa:>7.1f}% | {ua:>7.1f}% | {f1:>7.3f}"
+                )
+            else:
+                print(
+                    f"{display_name:>15} | {row_totals[i]:>12,} | {pa:>7.1f}% | {ua:>7.1f}%"
+                )
+
+        print("-" * 80)
+        if f1_per_class:
+            print(
+                f"{'OVERALL':>15} | {total_pixels:>12,} | {'':>8} | {'':>8} | {overall_accuracy:>7.1%}"
+            )
+            print(f"{'':>15} | {'':>12} | {'':>8} | {'':>8} | κ={kappa:.3f}")
+        else:
+            print(
+                f"{'OVERALL':>15} | {total_pixels:>12,} | {'':>8} | {'':>8} | {overall_accuracy:>7.1%}"
+            )
+            print(f"{'':>15} | {'':>12} | {'':>8} | {'':>8} | κ={kappa:.3f}")
+        print("=" * 80)
+
+    return results

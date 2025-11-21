@@ -1,0 +1,13 @@
+notebook,model,region,class,pixels,percentage
+11_apply_057_model_to_028,057_on_028,Crop 1 (Bomb 2 - Rust),classified_dark,18095,15.075146627565982
+11_apply_057_model_to_028,057_on_028,Crop 1 (Bomb 2 - Rust),classified_sediment,101932,84.92068781658224
+11_apply_057_model_to_028,057_on_028,Crop 1 (Bomb 2 - Rust),classified_bombs,5,0.00416555585177286
+11_apply_057_model_to_028,057_on_028,Crop 2 (Bomb 3),classified_dark,5843,4.867868568381765
+11_apply_057_model_to_028,057_on_028,Crop 2 (Bomb 3),classified_sediment,114189,95.13213143161823
+11_apply_057_model_to_028,057_on_028,Crop 2 (Bomb 3),classified_bombs,0,0.0
+11_apply_057_model_to_028,057_on_028,Crop 3 (Bomb 1),classified_dark,13564,11.300319914689416
+11_apply_057_model_to_028,057_on_028,Crop 3 (Bomb 1),classified_sediment,106461,88.6938483071181
+11_apply_057_model_to_028,057_on_028,Crop 3 (Bomb 1),classified_bombs,7,0.005831778192482004
+11_apply_057_model_to_028,057_on_028,Crop 4 (Dark pits),classified_dark,1573,1.310483870967742
+11_apply_057_model_to_028,057_on_028,Crop 4 (Dark pits),classified_sediment,118453,98.68451746201013
+11_apply_057_model_to_028,057_on_028,Crop 4 (Dark pits),classified_bombs,6,0.004998667022127433

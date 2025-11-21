@@ -19,7 +19,7 @@ from pathlib import Path
 import datetime
 import time
 
-from mjosa_code.utils.common import config_utils
+from ..common import config_utils
 import pandas as pd
 import numpy as np
 from typing import List, Tuple, Optional
@@ -33,7 +33,7 @@ sys.path.insert(0, str(_external_libs))
 from Eelume import PyPost as pp
 
 # Import config
-from mjosa_code.utils.common import config
+from ..common import config
 
 
 # ==============================================================================

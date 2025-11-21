@@ -1,0 +1,21 @@
+notebook,model,region,class,pixels,percentage
+9_svm_028,028_on_028,Crop 1 (Bomb 2 - Rust),dark_bomb,4485,3.736503599040256
+9_svm_028,028_on_028,Crop 1 (Bomb 2 - Rust),dark_pit,21148,17.618635030658492
+9_svm_028,028_on_028,Crop 1 (Bomb 2 - Rust),halo,14643,12.199246867502
+9_svm_028,028_on_028,Crop 1 (Bomb 2 - Rust),rust,139,0.11580245267928553
+9_svm_028,028_on_028,Crop 1 (Bomb 2 - Rust),sediment,79617,66.32981205011997
+9_svm_028,028_on_028,Crop 2 (Bomb 3),dark_bomb,894,0.7448013862969874
+9_svm_028,028_on_028,Crop 2 (Bomb 3),dark_pit,11518,9.59577446014396
+9_svm_028,028_on_028,Crop 2 (Bomb 3),halo,5621,4.68291788856305
+9_svm_028,028_on_028,Crop 2 (Bomb 3),rust,25,0.020827779258864303
+9_svm_028,028_on_028,Crop 2 (Bomb 3),sediment,101974,84.95567848573714
+9_svm_028,028_on_028,Crop 3 (Bomb 1),dark_bomb,2811,2.341875499866702
+9_svm_028,028_on_028,Crop 3 (Bomb 1),dark_pit,16222,13.514729405491869
+9_svm_028,028_on_028,Crop 3 (Bomb 1),halo,13867,11.552752599306851
+9_svm_028,028_on_028,Crop 3 (Bomb 1),rust,3,0.0024993335110637164
+9_svm_028,028_on_028,Crop 3 (Bomb 1),sediment,87129,72.58814316182351
+9_svm_028,028_on_028,Crop 4 (Dark pits),dark_bomb,90,0.07498000533191149
+9_svm_028,028_on_028,Crop 4 (Dark pits),dark_pit,4034,3.3607704612103437
+9_svm_028,028_on_028,Crop 4 (Dark pits),halo,1630,1.3579712076779527
+9_svm_028,028_on_028,Crop 4 (Dark pits),rust,4,0.0033324446814182885
+9_svm_028,028_on_028,Crop 4 (Dark pits),sediment,114274,95.20294588109837

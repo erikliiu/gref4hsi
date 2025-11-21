@@ -724,3 +724,174 @@ def plot_highlighted_transects_2d(
     print(
         f"   Total DR transects: {len(dr_csv_paths)} ({len(orange_transects)} orange + {len(highlighted_transects)} highlighted)"
     )
+
+
+def plot_highlighted_transects_3d(
+    main_csv_path: str,
+    dr_csv_paths: List[str],
+    highlight_indices: List[int],
+    highlight_labels: List[str],
+    highlight_colors: List[str],
+    origin: Tuple[float, float],
+    figsize: Tuple[float, float] = (12, 10),
+    elev: float = 20,
+    azim: float = -60,
+) -> None:
+    """
+    Create a 3D trajectory plot (NED frame with depth) with highlighted transects.
+
+    Parameters:
+    -----------
+    main_csv_path : str
+        Path to main CSV (unfiltered GNSS data)
+    dr_csv_paths : list of str
+        List of paths to DR corrected CSVs (all transects)
+    highlight_indices : list of int
+        Indices of transects to highlight (0-based)
+    highlight_labels : list of str
+        Labels for highlighted transects (e.g., ["Transect A", "Transect B"])
+    highlight_colors : list of str
+        Colors for highlighted transects (e.g., ["red", "blue"])
+    origin : tuple(lat, lon)
+        Origin point for NED coordinate conversion
+    figsize : tuple(float, float)
+        Figure size in inches (default: (12, 10))
+    elev : float
+        Elevation viewing angle in degrees (default: 20)
+    azim : float
+        Azimuth viewing angle in degrees (default: -60)
+    """
+    print("\n📊 Creating 3D trajectory plot with highlighted transects...")
+    print(f"   Origin: ({origin[0]:.7f}°N, {origin[1]:.7f}°E)")
+    print(f"   Highlighting {len(highlight_indices)} transects")
+    print()
+
+    # Load main CSV (unfiltered baseline)
+    main_df = pd.read_csv(main_csv_path)
+    main_df = main_df.rename(
+        columns={
+            "latitude [deg]": "latitude",
+            "longitude [deg]": "longitude",
+            "depth [m]": "depth",
+        }
+    )
+
+    # Convert main data to NED (meters)
+    main_east, main_north = deg_to_meter_simple(
+        main_df["latitude"].values, main_df["longitude"].values, origin=origin
+    )
+    main_depth = main_df["depth"].values
+
+    # Create 3D figure
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Plot main baseline in grey (NO LABEL - exclude from legend)
+    ax.plot(
+        main_north,  # X-axis: North
+        main_east,  # Y-axis: East
+        main_depth,  # Z-axis: Depth
+        color="darkgray",
+        linewidth=1.5,
+        alpha=0.5,
+        zorder=1,
+    )
+
+    # Load and categorize DR transects
+    orange_transects = []  # Regular transects
+    highlighted_transects = {}  # {index: (north, east, depth, label, color)}
+
+    for i, dr_path in enumerate(dr_csv_paths):
+        if os.path.exists(dr_path):
+            df = pd.read_csv(dr_path)
+            df = df.rename(
+                columns={
+                    "latitude [deg]": "latitude",
+                    "longitude [deg]": "longitude",
+                    "depth [m]": "depth",
+                }
+            )
+
+            # Convert to NED
+            east, north = deg_to_meter_simple(
+                df["latitude"].values, df["longitude"].values, origin=origin
+            )
+            depth = df["depth"].values
+
+            # Check if this transect should be highlighted
+            if i in highlight_indices:
+                idx_in_highlight = highlight_indices.index(i)
+                highlighted_transects[i] = (
+                    north,
+                    east,
+                    depth,
+                    highlight_labels[idx_in_highlight],
+                    highlight_colors[idx_in_highlight],
+                )
+            else:
+                orange_transects.append((north, east, depth))
+        else:
+            print(f"   ⚠️  Warning: {os.path.basename(dr_path)} not found")
+
+    # Plot highlighted transects FIRST (so they appear first in legend)
+    for i, (north, east, depth, label, color) in highlighted_transects.items():
+        # Add "Transect" prefix if not already present
+        if not label.startswith("Transect"):
+            label = f"Transect {label}"
+        ax.plot(
+            north,
+            east,
+            depth,
+            color=color,
+            linewidth=4,
+            alpha=0.95,
+            label=label,
+            zorder=3,
+        )
+        print(f"   ✅ {label}: {len(north)} points, color={color}")
+
+    # Plot orange transects (non-highlighted) without labels
+    for north, east, depth in orange_transects:
+        ax.plot(
+            north,
+            east,
+            depth,
+            color="orange",
+            linewidth=3,
+            alpha=0.8,
+            zorder=2,
+        )
+
+    # Add single legend entry for orange transects LAST (bottom of legend)
+    if orange_transects:
+        ax.plot(
+            [],
+            [],
+            [],
+            color="orange",
+            linewidth=3,
+            alpha=0.8,
+            label="Other transects",
+        )
+
+    # Configure plot
+    ax.set_xlabel("North [m]", fontsize=11)
+    ax.set_ylabel("East [m]", fontsize=11)
+    ax.set_zlabel("Depth [m]", fontsize=11)
+    ax.set_title(
+        "3D Navigation Track - NED Frame", fontsize=14, fontweight="bold", pad=20
+    )
+    ax.invert_zaxis()  # Depth increases downward
+    ax.invert_yaxis()  # Standard NED convention
+    ax.legend(loc="upper left", fontsize=10, framealpha=0.9)
+    ax.view_init(elev=elev, azim=azim)
+    ax.grid(True, alpha=0.3, linestyle="--")
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\n✅ 3D Plot complete!")
+    print(
+        f"   Total DR transects: {len(dr_csv_paths)} ({len(orange_transects)} orange + {len(highlighted_transects)} highlighted)"
+    )
+    print(f"   View angles: elevation={elev}°, azimuth={azim}°")

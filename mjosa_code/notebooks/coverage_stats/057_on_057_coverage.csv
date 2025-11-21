@@ -1,0 +1,4 @@
+notebook,model,region,class,pixels,percentage
+6_svm_057_general,057_on_057,full_transect,classified_bombs,2369,0.24720343935219968
+6_svm_057_general,057_on_057,full_transect,classified_dark,85599,8.932193839218632
+6_svm_057_general,057_on_057,full_transect,new_sediment,870352,90.82060272142917
