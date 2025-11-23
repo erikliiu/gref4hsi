@@ -3508,50 +3508,37 @@ class CombinedTransectCube:
         return self.data_corrected
 
     @staticmethod
-    def _compute_ref_for_slit_band(args):
+    def _compute_ref_for_file(args):
         """
-        Helper function for parallel computation of reference values.
-        Computes reference for a single (slit, band) pair.
+        ULTRA OPTIMIZED: Process entire file at once (all slits, all bands).
+        Opens each file ONLY ONCE and keeps it open while processing all data.
 
         Args:
-            args: Tuple of (s, b, file_paths, dset_name, use_global, window_size)
+            args: Tuple of (file_path, dset_name, use_global, window_size, S, B, t_offset)
 
         Returns:
-            Tuple of (s, b, ref_value) where ref_value is either a scalar or array
+            Tuple of (file_path, slit_data_dict) where slit_data_dict[s] = data for slit s (shape: T_file, B)
         """
         import h5py
         import numpy as np
-        import pandas as pd
 
-        s, b, file_paths, dset_name, use_global, window_size = args
+        file_path, dset_name, use_global, window_size, S, B, t_offset = args
 
-        # Collect values across all files for this slit-band
-        values = []
-        for file_path in file_paths:
-            with h5py.File(file_path, "r") as f:
-                if dset_name not in f:
-                    raise ValueError(f"Dataset {dset_name} not found in {file_path}")
-                values.append(f[dset_name][:, s, b])
+        # Open file ONCE and read ALL data at once
+        with h5py.File(file_path, "r") as f:
+            if dset_name not in f:
+                raise ValueError(f"Dataset {dset_name} not found in {file_path}")
 
-        ts = np.concatenate(values)
+            # Read entire dataset: shape (T_file, S, B)
+            file_data = f[dset_name][:, :, :]
 
-        if use_global:
-            # Global: compute single median
-            ref = np.nanmedian(ts)
-            if not np.isfinite(ref) or ref == 0:
-                ref = 1.0
-            return (s, b, ref)
-        else:
-            # Rolling: compute rolling median
-            ref_vec = (
-                pd.Series(ts)
-                .rolling(window=int(window_size), center=True, min_periods=1)
-                .median()
-                .values
-            )
-            ref_vec[ref_vec == 0] = 1.0
-            ref_vec[~np.isfinite(ref_vec)] = 1.0
-            return (s, b, ref_vec.astype(np.float32))
+        # Return file data for each slit
+        # Dictionary: slit_index -> (T_file, B) array
+        slit_data_dict = {}
+        for s in range(S):
+            slit_data_dict[s] = file_data[:, s, :]  # Shape: (T_file, B)
+
+        return (file_path, slit_data_dict)
 
     def apply_illumination_correction_v2(
         self,
@@ -3602,6 +3589,7 @@ class CombinedTransectCube:
         import h5py
         import numpy as np
         import pandas as pd
+        from pathlib import Path
 
         # Build smooth_params dictionary for naming
         smooth_params = None
@@ -3721,7 +3709,8 @@ class CombinedTransectCube:
         try:
             from tqdm import tqdm
 
-            pbar = tqdm(total=S * B, desc="   Computing refs", unit="slit-band")
+            # OPTIMIZED: Progress bar now tracks slits instead of slit-bands (S instead of S×B)
+            pbar = tqdm(total=S, desc="   Computing refs", unit="slit")
             use_tqdm = True
         except Exception:
             use_tqdm = False
@@ -3747,53 +3736,95 @@ class CombinedTransectCube:
         if use_global:
             # Global: one value per (slit, band)
             ref_values = np.ones((S, B), dtype=np.float32)
-
-            # Prepare arguments for parallel processing
-            args_list = [
-                (s, b, file_paths, dset_name_to_use, True, None)
-                for s in range(S)
-                for b in range(B)
-            ]
-
-            # Process in parallel (using ThreadPool to avoid Windows file locking)
-            with ThreadPool(processes=n_workers) as pool:
-                if use_tqdm:
-                    results = []
-                    for result in pool.imap_unordered(
-                        self._compute_ref_for_slit_band, args_list
-                    ):
-                        results.append(result)
-                        pbar.update(1)
-                else:
-                    results = pool.map(self._compute_ref_for_slit_band, args_list)
-
-            # Fill in results
-            for s, b, ref in results:
-                ref_values[s, b] = ref
         else:
             # Rolling: one vector per (slit, band)
             ref_values = {}
 
-            # Prepare arguments for parallel processing
-            args_list = [
-                (s, b, file_paths, dset_name_to_use, False, window_size)
-                for s in range(S)
-                for b in range(B)
-            ]
+        # ULTRA OPTIMIZED: Process file-by-file (only N_files opens instead of S×N_files)
+        # Collect all slit data from each file, then compute references
+        mem_gb = (T_total * S * B * 4) / (1024**3)
+        print(f"   📂 Loading data from {len(file_paths)} files (one at a time)...")
+        print(f"   💾 Estimated memory: ~{mem_gb:.1f} GB")
 
-            # Process in parallel (using ThreadPool to avoid Windows file locking)
-            with ThreadPool(processes=n_workers) as pool:
-                if use_tqdm:
-                    for result in pool.imap_unordered(
-                        self._compute_ref_for_slit_band, args_list
-                    ):
-                        s, b, ref_vec = result
-                        ref_values[(s, b)] = ref_vec
-                        pbar.update(1)
+        # Dictionary to store data: slit_index -> list of (T_file, B) arrays from each file
+        all_slit_data = {s: [] for s in range(S)}
+
+        # Process each file sequentially (keep file open for entire processing)
+        for file_idx, file_path in enumerate(file_paths):
+            if use_tqdm:
+                pbar.set_description(f"   Loading file {file_idx+1}/{len(file_paths)}")
+
+            print(f"      Reading {Path(file_path).name}...")
+            with h5py.File(file_path, "r") as f:
+                if dset_name_to_use not in f:
+                    raise ValueError(
+                        f"Dataset {dset_name_to_use} not found in {file_path}"
+                    )
+
+                # Read ALL data from this file at once: (T_file, S, B)
+                file_data = f[dset_name_to_use][:, :, :]
+
+                # Distribute to each slit
+                for s in range(S):
+                    all_slit_data[s].append(file_data[:, s, :])  # Shape: (T_file, B)
+
+        print(f"   ✓ All files loaded, computing references...")
+
+        # Now compute references for each slit (parallel across slits)
+        if use_tqdm:
+            pbar.set_description("   Computing refs")
+
+        # Helper function for parallel reference computation
+        def compute_slit_refs(s):
+            import pandas as pd
+
+            # Concatenate data from all files for this slit
+            slit_data = np.concatenate(all_slit_data[s], axis=0)  # Shape: (T_total, B)
+
+            refs_dict = {}
+            for b in range(B):
+                ts = slit_data[:, b]
+
+                if use_global:
+                    ref = np.nanmedian(ts)
+                    if not np.isfinite(ref) or ref == 0:
+                        ref = 1.0
+                    refs_dict[b] = ref
                 else:
-                    results = pool.map(self._compute_ref_for_slit_band, args_list)
-                    for s, b, ref_vec in results:
-                        ref_values[(s, b)] = ref_vec
+                    ref_vec = (
+                        pd.Series(ts)
+                        .rolling(window=int(window_size), center=True, min_periods=1)
+                        .median()
+                        .values
+                    )
+                    ref_vec[ref_vec == 0] = 1.0
+                    ref_vec[~np.isfinite(ref_vec)] = 1.0
+                    refs_dict[b] = ref_vec.astype(np.float32)
+
+            return (s, refs_dict)
+
+        # Process slits in parallel
+        with ThreadPool(processes=n_workers) as pool:
+            if use_tqdm:
+                for result in pool.imap_unordered(compute_slit_refs, range(S)):
+                    s, refs_dict = result
+                    for b, ref_val in refs_dict.items():
+                        if use_global:
+                            ref_values[s, b] = ref_val
+                        else:
+                            ref_values[(s, b)] = ref_val
+                    pbar.update(1)
+            else:
+                results = pool.map(compute_slit_refs, range(S))
+                for s, refs_dict in results:
+                    for b, ref_val in refs_dict.items():
+                        if use_global:
+                            ref_values[s, b] = ref_val
+                        else:
+                            ref_values[(s, b)] = ref_val
+
+        # Clear memory
+        del all_slit_data
 
         if use_tqdm:
             pbar.close()
@@ -4175,6 +4206,578 @@ class CombinedTransectCube:
             t_offset += T_file
 
         print(f"✅ Illumination correction saved to disk")
+
+    def apply_illumination_correction_v3(
+        self,
+        window_size=500,
+        strength=1.0,
+        force_recompute=False,
+        strategy="memory",  # "memory", "twopass", or "streaming"
+        use_smoothed_input=False,
+        smooth_method="gaussian",
+        smooth_sigma=2,
+        smooth_window=10,
+        smooth_polyorder=2,
+        smooth_kernel=5,
+        smooth_lambda=1e4,
+        smooth_sigma_spatial=2,
+        smooth_sigma_intensity=0.1,
+    ):
+        """
+        V3: Optimized rolling-window illumination correction (NO GLOBAL MODE).
+
+        Major improvements over v2:
+        - Removed global mode (only rolling window supported)
+        - Three processing strategies to choose from based on memory availability
+        - Vectorized operations (no nested loops)
+        - Smart boundary handling across files
+        - Single file open per operation
+
+        Parameters:
+        -----------
+        window_size : int
+            Rolling median window size (in tracks). Required, no global mode.
+        strength : float
+            Correction strength in [0,1]: 0=no change, 1=full correction.
+        force_recompute : bool
+            If True, recompute even if saved correction exists.
+        strategy : str, default="memory"
+            Processing strategy:
+            - "memory": Load all data once, process in memory (fastest, high RAM)
+            - "twopass": Compute references first pass, apply second pass (moderate RAM)
+            - "streaming": Process chunks on-the-fly (lowest RAM, slower)
+        use_smoothed_input : bool, default=False
+            If True, uses smoothed raw data as input.
+        smooth_method : str
+            Smoothing method to look for.
+        smooth_* : various
+            Parameters for the smoothing method used.
+
+        Example:
+        --------
+        # Test different strategies:
+        >>> cube.apply_illumination_correction_v3(window_size=500, strategy="memory")
+        >>> cube.apply_illumination_correction_v3(window_size=500, strategy="twopass")
+        >>> cube.apply_illumination_correction_v3(window_size=500, strategy="streaming")
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+        from pathlib import Path
+
+        if window_size is None or window_size <= 1:
+            raise ValueError(
+                "❌ v3 does not support global mode. Use window_size > 1 (e.g., 500)"
+            )
+
+        if strategy not in ["memory", "twopass", "streaming"]:
+            raise ValueError(
+                f"❌ Invalid strategy '{strategy}'. Choose: 'memory', 'twopass', or 'streaming'"
+            )
+
+        # Build smooth_params dictionary for naming
+        smooth_params = None
+        if use_smoothed_input:
+            smooth_params = {
+                "gaussian_sigma": smooth_sigma,
+                "wavelength_smoothing": smooth_window,
+                "savgol_polyorder": smooth_polyorder,
+                "median_kernel_size": smooth_kernel,
+                "whittaker_lambda": smooth_lambda,
+                "bilateral_sigma_spatial": smooth_sigma_spatial,
+                "bilateral_sigma_intensity": smooth_sigma_intensity,
+            }
+
+        print(f"🔄 Using V3 algorithm (rolling window only, strategy={strategy})")
+        if use_smoothed_input:
+            print(f"   📊 Using smoothed raw data as input (method={smooth_method})")
+
+        # --- Check if already computed and saved ---
+        if not force_recompute and self.has_illumination_correction(
+            window_size, strength, use_smoothed_input, smooth_method, smooth_params
+        ):
+            print(
+                f"✅ Illumination correction already exists (window={window_size}, strength={strength})"
+            )
+            if use_smoothed_input:
+                print(f"   (with smoothed input: {smooth_method})")
+            print(f"   Loading from disk...")
+            return self.load_illumination_correction(
+                window_size, strength, use_smoothed_input, smooth_method, smooth_params
+            )
+
+        # Check if smoothed raw data exists when use_smoothed_input=True
+        if use_smoothed_input:
+            if not self.has_spectral_smoothing(
+                method=smooth_method,
+                wavelength_smoothing=smooth_window,
+                gaussian_sigma=smooth_sigma,
+                savgol_polyorder=smooth_polyorder,
+                median_kernel_size=smooth_kernel,
+                whittaker_lambda=smooth_lambda,
+                bilateral_sigma_spatial=smooth_sigma_spatial,
+                bilateral_sigma_intensity=smooth_sigma_intensity,
+                apply_to_raw=True,
+            ):
+                raise ValueError(
+                    f"❌ Smoothed raw data not found (method={smooth_method}).\n"
+                    f"   Run apply_spectral_smoothing(method='{smooth_method}', ..., apply_to_raw=True) first!"
+                )
+
+            smoothed_raw_dset = self._get_smoothing_dataset_name(
+                method=smooth_method,
+                wavelength_smoothing=smooth_window,
+                gaussian_sigma=smooth_sigma,
+                savgol_polyorder=smooth_polyorder,
+                median_kernel_size=smooth_kernel,
+                whittaker_lambda=smooth_lambda,
+                bilateral_sigma_spatial=smooth_sigma_spatial,
+                bilateral_sigma_intensity=smooth_sigma_intensity,
+                apply_to_raw=True,
+            )
+        else:
+            smoothed_raw_dset = None
+
+        # Determine dataset name to use for each file
+        def get_input_dset_name(gf, f):
+            if use_smoothed_input and smoothed_raw_dset:
+                if smoothed_raw_dset in f:
+                    return smoothed_raw_dset
+                else:
+                    raise ValueError(
+                        f"❌ Smoothed raw data not found in {gf.name}: {smoothed_raw_dset}"
+                    )
+            else:
+                dset_name = gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
+                if dset_name not in f:
+                    dset_name = gf.DSET_RGB_MAIN
+                return dset_name
+
+        # Get dimensions
+        with h5py.File(self.geofiles[0].path, "r") as f:
+            dset_name = get_input_dset_name(self.geofiles[0], f)
+            S, B = f[dset_name].shape[1], f[dset_name].shape[2]
+
+        T_total = sum(gf.shape[0] for gf in self.geofiles)
+
+        print(f"📐 Data shape: T={T_total}, S={S}, B={B}")
+        print(f"🔧 Window size: {window_size}, Strength: {strength}")
+
+        # Route to appropriate strategy
+        if strategy == "memory":
+            self._apply_correction_v3_memory(
+                window_size,
+                strength,
+                S,
+                B,
+                T_total,
+                get_input_dset_name,
+                smoothed_raw_dset,
+            )
+        elif strategy == "twopass":
+            self._apply_correction_v3_twopass(
+                window_size,
+                strength,
+                S,
+                B,
+                T_total,
+                get_input_dset_name,
+                smoothed_raw_dset,
+            )
+        else:  # streaming
+            self._apply_correction_v3_streaming(
+                window_size,
+                strength,
+                S,
+                B,
+                T_total,
+                get_input_dset_name,
+                smoothed_raw_dset,
+            )
+
+        print(f"✅ Illumination correction complete (v3, {strategy})")
+        print(f"   Loading corrected data into memory...")
+
+        return self.load_illumination_correction(
+            window_size, strength, use_smoothed_input, smooth_method, smooth_params
+        )
+
+    def _apply_correction_v3_memory(
+        self,
+        window_size,
+        strength,
+        S,
+        B,
+        T_total,
+        get_input_dset_name,
+        smoothed_raw_dset,
+    ):
+        """
+        Strategy 1: Load all data into memory, compute rolling median, apply correction.
+        Fastest but requires most RAM (~3x data size).
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+
+        print(f"💾 Strategy: MEMORY (load all data once)")
+        mem_gb = (T_total * S * B * 4) / (1024**3)
+        print(f"   Estimated RAM needed: ~{mem_gb:.2f} GB")
+
+        # Step 1: Load all data
+        print(f"📂 Loading data from {len(self.geofiles)} files...")
+        data = np.zeros((T_total, S, B), dtype=np.float32)
+
+        t_offset = 0
+        for gf in self.geofiles:
+            with h5py.File(gf.path, "r") as f:
+                dset_name = get_input_dset_name(gf, f)
+                T_file = f[dset_name].shape[0]
+                data[t_offset : t_offset + T_file, :, :] = f[dset_name][()]
+                print(f"   ✓ {gf.name}: loaded {T_file} tracks")
+                t_offset += T_file
+
+        # Step 2: Compute rolling median for each (slit, band) - VECTORIZED
+        print(f"📊 Computing rolling medians (window={window_size})...")
+
+        # Reshape for efficient processing: (T, S*B)
+        data_flat = data.reshape(T_total, S * B)
+        refs_flat = np.zeros_like(data_flat)
+
+        # Compute rolling median for each column (slit-band combination)
+        try:
+            from tqdm import tqdm
+
+            pbar = tqdm(total=S * B, desc="   Computing refs", unit="slit-band")
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+            pbar = None
+
+        for col in range(S * B):
+            refs_flat[:, col] = (
+                pd.Series(data_flat[:, col])
+                .rolling(window=int(window_size), center=True, min_periods=1)
+                .median()
+                .values
+            )
+            if use_tqdm:
+                pbar.update(1)
+
+        if use_tqdm:
+            pbar.close()
+
+        # Reshape back
+        refs = refs_flat.reshape(T_total, S, B)
+
+        # Handle zeros and non-finite values
+        refs[refs == 0] = 1.0
+        refs[~np.isfinite(refs)] = 1.0
+
+        print(f"✓ Rolling medians computed")
+
+        # Step 3: Apply correction - VECTORIZED
+        print(f"🔧 Applying correction (strength={strength})...")
+        corrected = data / refs
+        data_corrected = (1 - strength) * data + strength * corrected
+
+        del data, refs, corrected  # Free memory
+
+        # Step 4: Save to disk
+        print(f"💾 Saving to {len(self.geofiles)} files...")
+        dset_name_out = self._get_correction_dataset_name(window_size, strength)
+
+        t_offset = 0
+        for gf in self.geofiles:
+            T_file = gf.shape[0]
+            chunk_corrected = data_corrected[t_offset : t_offset + T_file, :, :]
+
+            with h5py.File(gf.path, "a") as f:
+                if dset_name_out in f:
+                    del f[dset_name_out]
+
+                dset = f.create_dataset(
+                    dset_name_out,
+                    data=chunk_corrected,
+                    dtype=np.float32,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+
+                dset.attrs["window_size"] = window_size
+                dset.attrs["strength"] = strength
+                dset.attrs["correction_method"] = "rolling_v3_memory"
+
+                print(f"   ✓ {gf.name}: saved")
+
+            t_offset += T_file
+
+    def _apply_correction_v3_twopass(
+        self,
+        window_size,
+        strength,
+        S,
+        B,
+        T_total,
+        get_input_dset_name,
+        smoothed_raw_dset,
+    ):
+        """
+        Strategy 2: Two-pass processing.
+        Pass 1: Load data, compute rolling medians, store references.
+        Pass 2: Load data again, apply correction using references.
+        Moderate RAM usage.
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+
+        print(f"💾 Strategy: TWO-PASS (compute refs, then apply)")
+
+        # Pass 1: Compute references
+        print(f"📊 Pass 1/2: Computing rolling median references...")
+
+        # Load all data to compute rolling median
+        data = np.zeros((T_total, S, B), dtype=np.float32)
+        t_offset = 0
+        for gf in self.geofiles:
+            with h5py.File(gf.path, "r") as f:
+                dset_name = get_input_dset_name(gf, f)
+                T_file = f[dset_name].shape[0]
+                data[t_offset : t_offset + T_file, :, :] = f[dset_name][()]
+                t_offset += T_file
+
+        # Compute rolling median (vectorized)
+        data_flat = data.reshape(T_total, S * B)
+        refs_flat = np.zeros_like(data_flat)
+
+        try:
+            from tqdm import tqdm
+
+            pbar = tqdm(total=S * B, desc="   Computing refs", unit="slit-band")
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+            pbar = None
+
+        for col in range(S * B):
+            refs_flat[:, col] = (
+                pd.Series(data_flat[:, col])
+                .rolling(window=int(window_size), center=True, min_periods=1)
+                .median()
+                .values
+            )
+            if use_tqdm:
+                pbar.update(1)
+
+        if use_tqdm:
+            pbar.close()
+
+        refs = refs_flat.reshape(T_total, S, B)
+        refs[refs == 0] = 1.0
+        refs[~np.isfinite(refs)] = 1.0
+
+        del data, data_flat, refs_flat  # Free some memory
+        print(f"   ✓ References computed")
+
+        # Pass 2: Apply correction file-by-file
+        print(f"🔧 Pass 2/2: Applying correction and saving...")
+        dset_name_out = self._get_correction_dataset_name(window_size, strength)
+
+        t_offset = 0
+        for gf in self.geofiles:
+            T_file = gf.shape[0]
+
+            # Load data for this file
+            with h5py.File(gf.path, "r") as f:
+                dset_name = get_input_dset_name(gf, f)
+                data_file = f[dset_name][()].astype(np.float32)
+
+            # Get corresponding references
+            refs_file = refs[t_offset : t_offset + T_file, :, :]
+
+            # Apply correction (vectorized)
+            corrected = data_file / refs_file
+            data_corrected = (1 - strength) * data_file + strength * corrected
+
+            # Save
+            with h5py.File(gf.path, "a") as f:
+                if dset_name_out in f:
+                    del f[dset_name_out]
+
+                dset = f.create_dataset(
+                    dset_name_out,
+                    data=data_corrected,
+                    dtype=np.float32,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+
+                dset.attrs["window_size"] = window_size
+                dset.attrs["strength"] = strength
+                dset.attrs["correction_method"] = "rolling_v3_twopass"
+
+                print(f"   ✓ {gf.name}: processed and saved")
+
+            t_offset += T_file
+
+    def _apply_correction_v3_streaming(
+        self,
+        window_size,
+        strength,
+        S,
+        B,
+        T_total,
+        get_input_dset_name,
+        smoothed_raw_dset,
+    ):
+        """
+        Strategy 3: Streaming/chunked processing.
+        Process data in chunks with boundary overlap for rolling median.
+        Minimal RAM but slower due to repeated file access.
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+
+        print(f"💾 Strategy: STREAMING (minimal memory, chunk-based)")
+        print(f"   ⚠️  Note: This is slower due to boundary handling")
+
+        # For streaming, we need to handle boundaries carefully
+        # We'll process each file with padding from adjacent files
+
+        half_window = window_size // 2
+        dset_name_out = self._get_correction_dataset_name(window_size, strength)
+
+        print(f"🔧 Processing {len(self.geofiles)} files with boundary padding...")
+
+        try:
+            from tqdm import tqdm
+
+            file_pbar = tqdm(
+                total=len(self.geofiles), desc="   Processing files", unit="file"
+            )
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+            file_pbar = None
+
+        for file_idx, gf in enumerate(self.geofiles):
+            if not use_tqdm:
+                print(f"   Processing {gf.name} ({file_idx+1}/{len(self.geofiles)})...")
+            else:
+                file_pbar.set_description(f"   Processing {gf.name}")
+
+            # Determine padding needs
+            need_prev = file_idx > 0
+            need_next = file_idx < len(self.geofiles) - 1
+
+            # Load current file
+            with h5py.File(gf.path, "r") as f:
+                dset_name = get_input_dset_name(gf, f)
+                data_curr = f[dset_name][()].astype(np.float32)
+                T_curr = data_curr.shape[0]
+
+            # Load padding from previous file
+            if need_prev:
+                gf_prev = self.geofiles[file_idx - 1]
+                with h5py.File(gf_prev.path, "r") as f:
+                    dset_name = get_input_dset_name(gf_prev, f)
+                    T_prev = f[dset_name].shape[0]
+                    start_idx = max(0, T_prev - half_window)
+                    data_prev = f[dset_name][start_idx:, :, :].astype(np.float32)
+            else:
+                data_prev = None
+
+            # Load padding from next file
+            if need_next:
+                gf_next = self.geofiles[file_idx + 1]
+                with h5py.File(gf_next.path, "r") as f:
+                    dset_name = get_input_dset_name(gf_next, f)
+                    end_idx = min(f[dset_name].shape[0], half_window)
+                    data_next = f[dset_name][:end_idx, :, :].astype(np.float32)
+            else:
+                data_next = None
+
+            # Concatenate with padding
+            if data_prev is not None and data_next is not None:
+                data_padded = np.concatenate([data_prev, data_curr, data_next], axis=0)
+                offset = data_prev.shape[0]
+            elif data_prev is not None:
+                data_padded = np.concatenate([data_prev, data_curr], axis=0)
+                offset = data_prev.shape[0]
+            elif data_next is not None:
+                data_padded = np.concatenate([data_curr, data_next], axis=0)
+                offset = 0
+            else:
+                data_padded = data_curr
+                offset = 0
+
+            # Compute rolling median on padded data
+            T_padded = data_padded.shape[0]
+            data_flat = data_padded.reshape(T_padded, S * B)
+            refs_flat = np.zeros_like(data_flat)
+
+            # Progress bar for slit-bands within this file
+            try:
+                from tqdm import tqdm
+
+                col_pbar = tqdm(
+                    total=S * B, desc="      Computing refs", unit="col", leave=False
+                )
+                use_col_tqdm = True
+            except ImportError:
+                use_col_tqdm = False
+                col_pbar = None
+
+            for col in range(S * B):
+                refs_flat[:, col] = (
+                    pd.Series(data_flat[:, col])
+                    .rolling(window=int(window_size), center=True, min_periods=1)
+                    .median()
+                    .values
+                )
+                if use_col_tqdm:
+                    col_pbar.update(1)
+
+            if use_col_tqdm:
+                col_pbar.close()
+
+            refs_padded = refs_flat.reshape(T_padded, S, B)
+            refs_padded[refs_padded == 0] = 1.0
+            refs_padded[~np.isfinite(refs_padded)] = 1.0
+
+            # Extract relevant portion (remove padding)
+            refs_curr = refs_padded[offset : offset + T_curr, :, :]
+
+            # Apply correction
+            corrected = data_curr / refs_curr
+            data_corrected = (1 - strength) * data_curr + strength * corrected
+
+            # Save
+            with h5py.File(gf.path, "a") as f:
+                if dset_name_out in f:
+                    del f[dset_name_out]
+
+                dset = f.create_dataset(
+                    dset_name_out,
+                    data=data_corrected,
+                    dtype=np.float32,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+
+                dset.attrs["window_size"] = window_size
+                dset.attrs["strength"] = strength
+                dset.attrs["correction_method"] = "rolling_v3_streaming"
+
+            if use_tqdm:
+                file_pbar.update(1)
+            else:
+                print(f"      ✓ Saved")
+
+        if use_tqdm:
+            file_pbar.close()
 
     def list_saved_corrections(self):
         """
@@ -6660,6 +7263,7 @@ class CombinedTransectCube:
         colorbar_orientation="vertical",  # NEW: Orientation: "vertical" or "horizontal"
         colorbar_pad=0.04,  # Padding between plot and colorbar
         colorbar_shrink=1.0,  # Shrink factor for colorbar length (1.0 = full length)
+        show_ticks=True,  # NEW: If False, hide axis tick marks (removes gridlines)
     ):
         """
         Enhanced RGB plot supporting multiple named ROIs with different colors.
@@ -7308,6 +7912,21 @@ class CombinedTransectCube:
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
 
+        # Hide axis ticks if requested (removes gridlines)
+        if not show_ticks:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            # Explicitly disable grid for both major and minor ticks
+            ax.grid(False, which="both", axis="both")
+            ax.tick_params(
+                which="both", length=0, width=0
+            )  # Hide tick marks completely
+            # Also ensure no grid lines appear on the axes themselves
+            ax.spines["top"].set_visible(True)
+            ax.spines["right"].set_visible(True)
+            ax.spines["bottom"].set_visible(True)
+            ax.spines["left"].set_visible(True)
+
         print(f"📊 Extent: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]")
         print(f"📐 Image shape after transformations: {display_image.shape}")
 
@@ -7315,7 +7934,8 @@ class CombinedTransectCube:
         # coordinates outside the cropped region which could be misleading
 
         # File boundaries (adjusted for axis flipping)
-        if show_file_boundaries and not crop_applied:
+        # Also disable if show_ticks=False (clean plot mode)
+        if show_file_boundaries and not crop_applied and show_ticks:
             for i, b in enumerate(self.file_boundaries):
                 # Draw boundary line (skip first one at track 0)
                 if i > 0:
@@ -7347,7 +7967,8 @@ class CombinedTransectCube:
                         )
 
         # Cross-hairs (adjusted for axis flipping)
-        if track_index is not None and not crop_applied:
+        # Also disable if show_ticks=False (clean plot mode)
+        if track_index is not None and not crop_applied and show_ticks:
             x_coord, _ = transform_coords(track_index, 0)
             if flip_axes:
                 # Tracks are now vertical (y-axis)
@@ -7356,7 +7977,7 @@ class CombinedTransectCube:
             else:
                 # Default: tracks are horizontal (x-axis)
                 plt.axvline(x_coord, color="cyan", linestyle="--", linewidth=2)
-        if slit_index is not None and not crop_applied:
+        if slit_index is not None and not crop_applied and show_ticks:
             if flip_axes:
                 # Slits are now horizontal (x-axis)
                 x_coord, _ = transform_coords(0, slit_index)
@@ -7367,7 +7988,8 @@ class CombinedTransectCube:
                 plt.axhline(y_coord, color="lime", linestyle="--", linewidth=2)
 
         # Perimeter lines (unchanged)
-        if perimeter_line is not None and not crop_applied:
+        # Also disable if show_ticks=False (clean plot mode)
+        if perimeter_line is not None and not crop_applied and show_ticks:
             if isinstance(perimeter_line[0], (int, float)):
                 lines_to_plot = [perimeter_line]
             else:
@@ -7634,8 +8256,8 @@ class CombinedTransectCube:
                     label=f"ROI Pixels ({len(valid_rois)})",
                 )
 
-        # Grid (adjusted for axis flipping) - disabled for cropped images
-        if not crop_applied:
+        # Grid (adjusted for axis flipping) - disabled for cropped images and when show_ticks=False
+        if not crop_applied and show_ticks:
             if flip_axes:
                 # Grid lines based on actual axis assignment
                 for x in np.arange(0, n_slits + 1, 50):
