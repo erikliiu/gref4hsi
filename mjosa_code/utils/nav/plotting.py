@@ -15,13 +15,17 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Tuple, Optional
 from datetime import datetime
+from pyproj import Transformer
 
 from .analyze_log_file import LogData
 
 
 def deg_to_meter_simple(latitudes, longitudes, origin=None):
     """
-    Convert lat/lon → metres using simple approximation.
+    Convert lat/lon → metres using simple equirectangular approximation.
+
+    WARNING: This is NOT a proper projection! Use deg_to_meter_utm() for accurate results.
+    This function is kept for backward compatibility only.
 
     Parameters:
     -----------
@@ -35,7 +39,7 @@ def deg_to_meter_simple(latitudes, longitudes, origin=None):
     Returns:
     --------
     east, north : tuple of arrays
-        Coordinates in meters
+        Coordinates in meters (approximate)
     """
     lat0, lon0 = (latitudes[0], longitudes[0]) if origin is None else origin
     R = 6_378_137.0  # WGS-84 equatorial radius [m]
@@ -47,6 +51,46 @@ def deg_to_meter_simple(latitudes, longitudes, origin=None):
 
     east = (lon_rad - lon0_rad) * R * np.cos(lat0_rad)
     north = (lat_rad - lat0_rad) * R
+    return east, north
+
+
+def deg_to_meter_utm(latitudes, longitudes, origin=None, epsg=32632):
+    """
+    Convert lat/lon → metres using proper UTM projection.
+
+    This uses pyproj for accurate coordinate transformation.
+
+    Parameters:
+    -----------
+    latitudes : array-like
+        Latitude values in degrees (WGS84)
+    longitudes : array-like
+        Longitude values in degrees (WGS84)
+    origin : tuple(lat, lon), optional
+        Reference point in lat/lon. If provided, coordinates are offset
+        so that origin = (0, 0) in the output coordinate system.
+        If None, uses absolute UTM coordinates.
+    epsg : int
+        EPSG code for UTM zone (default: 32632 = UTM Zone 32N for Lake Mjøsa)
+
+    Returns:
+    --------
+    east, north : tuple of arrays
+        Coordinates in meters (UTM)
+    """
+    # Create transformer from WGS84 (EPSG:4326) to UTM
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+
+    # Transform coordinates (pyproj expects lon, lat order!)
+    east, north = transformer.transform(longitudes, latitudes)
+
+    # If origin specified, convert to relative coordinates
+    if origin is not None:
+        lat0, lon0 = origin
+        east0, north0 = transformer.transform(lon0, lat0)
+        east = east - east0
+        north = north - north0
+
     return east, north
 
 
@@ -569,9 +613,11 @@ def plot_highlighted_transects_2d(
     aspect_ratio: str = "equal",
     xlim: Tuple[float, float] = None,
     ylim: Tuple[float, float] = None,
+    use_epsg: bool = True,
+    epsg: int = 32632,
 ) -> None:
     """
-    Create a 2D position plot (NED frame) with highlighted transects.
+    Create a 2D position plot (NED/UTM frame) with highlighted transects.
 
     Parameters:
     -----------
@@ -586,7 +632,7 @@ def plot_highlighted_transects_2d(
     highlight_colors : list of str
         Colors for highlighted transects (e.g., ["red", "blue"])
     origin : tuple(lat, lon)
-        Origin point for NED coordinate conversion
+        Origin point for coordinate conversion (from config.MJOSA_ORIGIN)
     figsize : tuple(float, float)
         Figure size in inches (default: (8, 8) for square plot)
     aspect_ratio : str or float
@@ -600,11 +646,28 @@ def plot_highlighted_transects_2d(
     ylim : tuple(float, float), optional
         North axis limits (min, max) in meters. If None, auto-scale.
         Example: ylim=(-150, 50) sets North axis from -150m to 50m
+    use_epsg : bool
+        If True (default), use proper UTM projection (EPSG code).
+        If False, use simple equirectangular approximation (backward compatibility).
+    epsg : int
+        EPSG code for projection (default: 32632 = UTM Zone 32N for Lake Mjøsa).
+        Only used if use_epsg=True.
     """
     print("\n📊 Creating 2D position plot with highlighted transects...")
     print(f"   Origin: ({origin[0]:.7f}°N, {origin[1]:.7f}°E)")
+    print(
+        f"   Projection: {'UTM (EPSG:' + str(epsg) + ')' if use_epsg else 'Simple approximation (equirectangular)'}"
+    )
     print(f"   Highlighting {len(highlight_indices)} transects")
     print()
+
+    # Select conversion function based on use_epsg flag
+    if use_epsg:
+        convert_func = lambda lat, lon: deg_to_meter_utm(
+            lat, lon, origin=origin, epsg=epsg
+        )
+    else:
+        convert_func = lambda lat, lon: deg_to_meter_simple(lat, lon, origin=origin)
 
     # Load main CSV (unfiltered baseline)
     main_df = pd.read_csv(main_csv_path)
@@ -615,9 +678,9 @@ def plot_highlighted_transects_2d(
         }
     )
 
-    # Convert main data to NED (meters)
-    main_east, main_north = deg_to_meter_simple(
-        main_df["latitude"].values, main_df["longitude"].values, origin=origin
+    # Convert main data to NED/UTM (meters)
+    main_east, main_north = convert_func(
+        main_df["latitude"].values, main_df["longitude"].values
     )
 
     # Create square figure
@@ -647,10 +710,8 @@ def plot_highlighted_transects_2d(
                 }
             )
 
-            # Convert to NED
-            east, north = deg_to_meter_simple(
-                df["latitude"].values, df["longitude"].values, origin=origin
-            )
+            # Convert to NED/UTM
+            east, north = convert_func(df["latitude"].values, df["longitude"].values)
 
             # Check if this transect should be highlighted
             if i in highlight_indices:
@@ -736,9 +797,11 @@ def plot_highlighted_transects_3d(
     figsize: Tuple[float, float] = (12, 10),
     elev: float = 20,
     azim: float = -60,
+    use_epsg: bool = True,
+    epsg: int = 32632,
 ) -> None:
     """
-    Create a 3D trajectory plot (NED frame with depth) with highlighted transects.
+    Create a 3D trajectory plot (NED/UTM frame with depth) with highlighted transects.
 
     Parameters:
     -----------
@@ -753,18 +816,35 @@ def plot_highlighted_transects_3d(
     highlight_colors : list of str
         Colors for highlighted transects (e.g., ["red", "blue"])
     origin : tuple(lat, lon)
-        Origin point for NED coordinate conversion
+        Origin point for coordinate conversion (from config.MJOSA_ORIGIN)
     figsize : tuple(float, float)
         Figure size in inches (default: (12, 10))
     elev : float
         Elevation viewing angle in degrees (default: 20)
     azim : float
         Azimuth viewing angle in degrees (default: -60)
+    use_epsg : bool
+        If True (default), use proper UTM projection (EPSG code).
+        If False, use simple equirectangular approximation (backward compatibility).
+    epsg : int
+        EPSG code for projection (default: 32632 = UTM Zone 32N for Lake Mjøsa).
+        Only used if use_epsg=True.
     """
     print("\n📊 Creating 3D trajectory plot with highlighted transects...")
     print(f"   Origin: ({origin[0]:.7f}°N, {origin[1]:.7f}°E)")
+    print(
+        f"   Projection: {'UTM (EPSG:' + str(epsg) + ')' if use_epsg else 'Simple approximation (equirectangular)'}"
+    )
     print(f"   Highlighting {len(highlight_indices)} transects")
     print()
+
+    # Select conversion function based on use_epsg flag
+    if use_epsg:
+        convert_func = lambda lat, lon: deg_to_meter_utm(
+            lat, lon, origin=origin, epsg=epsg
+        )
+    else:
+        convert_func = lambda lat, lon: deg_to_meter_simple(lat, lon, origin=origin)
 
     # Load main CSV (unfiltered baseline)
     main_df = pd.read_csv(main_csv_path)
@@ -776,9 +856,9 @@ def plot_highlighted_transects_3d(
         }
     )
 
-    # Convert main data to NED (meters)
-    main_east, main_north = deg_to_meter_simple(
-        main_df["latitude"].values, main_df["longitude"].values, origin=origin
+    # Convert main data to NED/UTM (meters)
+    main_east, main_north = convert_func(
+        main_df["latitude"].values, main_df["longitude"].values
     )
     main_depth = main_df["depth"].values
 
@@ -812,10 +892,8 @@ def plot_highlighted_transects_3d(
                 }
             )
 
-            # Convert to NED
-            east, north = deg_to_meter_simple(
-                df["latitude"].values, df["longitude"].values, origin=origin
-            )
+            # Convert to NED/UTM
+            east, north = convert_func(df["latitude"].values, df["longitude"].values)
             depth = df["depth"].values
 
             # Check if this transect should be highlighted

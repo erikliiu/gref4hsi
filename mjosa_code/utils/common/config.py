@@ -53,7 +53,7 @@ NAV_CSV = str(MERGED_CSV_FILE)  # Use the merged/corrected navigation data
 
 # MBES Bathymetry GeoTIFF Options:
 # Full MBES coverage from EIVA (recommended for most visualizations)
-MBES_GEOTIFF = _MJOSA_COMPLETE_ROOT / "data" / "anxilliary" / "EIVA_MBES" / "all.tif"
+MBES_GEOTIFF = _MJOSA_COMPLETE_ROOT / "data" / "anxilliary" / "EIVA" / "all.tif"
 
 # Transect-specific MBES (for detailed analysis of transect 057)
 MBES_GEOTIFF_057 = (

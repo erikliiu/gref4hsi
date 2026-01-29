@@ -287,3 +287,16 @@ coregistration.main(config_file_mission, mode='compare')
 coregistration.main(config_file_mission, mode='calibrate')
 ```
 
+## Third-Party Code Acknowledgments
+
+This project includes code from third-party sources:
+
+### Eelume PyPost
+The navigation data processing utilities in `mjosa_code/external_libs/eelume_pypost/` are proprietary code from:
+- **Copyright**: © 2022 Eelume AS - All Rights Reserved
+- **License**: Proprietary and confidential
+- **Usage**: Used with permission for processing ROS2 .db3 log files from the Eelume underwater robot
+- **Note**: Unauthorized copying or redistribution is strictly prohibited
+
+This code is used solely for parsing navigation data from the Eelume robot system and is not part of the core gref4hsi functionality.
+

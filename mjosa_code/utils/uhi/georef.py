@@ -578,9 +578,60 @@ class CombinedTransectCube:
             T, S = self.X_ecef.shape
             print(f"Tracks × Slits: {T} × {S}")
             print(
+                f"Spectral bands: {self.data.shape[2] if self.data is not None else 'N/A'}"
+            )
+            print(
                 f"RGB coverage: R/G/B finite ratios "
                 f"{np.isfinite(self.R).mean():.2f}/{np.isfinite(self.G).mean():.2f}/{np.isfinite(self.B).mean():.2f}"
             )
+
+            # Spectral information
+            if self.wavelengths is not None:
+                band_spacing = (self.wavelengths[-1] - self.wavelengths[0]) / len(
+                    self.wavelengths
+                )
+                print(f"\n📊 Spectral configuration:")
+                print(
+                    f"   Wavelength range: {self.wavelengths[0]:.1f} - {self.wavelengths[-1]:.1f} nm"
+                )
+                print(f"   Band spacing: ~{band_spacing:.2f} nm")
+                print(f"   Spectral resolution (FWHM): ~5.5 nm (manufacturer spec)")
+
+            # Try to get timing info from first file
+            if hasattr(self, "file_boundaries") and len(self.file_boundaries) > 0:
+                try:
+                    import h5py
+
+                    first_file = self.file_boundaries[0]["file"]
+                    h5_path = self.folder / f"{first_file}.h5"
+                    if h5_path.exists():
+                        with h5py.File(h5_path, "r") as f:
+                            timestamp_path = "processed/radiance/timestamp"
+                            if timestamp_path in f:
+                                timestamps = f[timestamp_path][:]
+                                time_diffs = np.diff(timestamps)
+                                valid_diffs = time_diffs[time_diffs > 0]
+                                if len(valid_diffs) > 0:
+                                    avg_time_diff = np.mean(valid_diffs)
+                                    frame_rate = 1.0 / avg_time_diff
+                                    print(f"\n⏱️  Acquisition timing:")
+                                    print(
+                                        f"   Frame rate: ~{frame_rate:.1f} Hz ({avg_time_diff*1000:.1f} ms/frame)"
+                                    )
+
+                            fov_path = (
+                                "processed/radiance/calibration/geometric/fieldOfView"
+                            )
+                            if fov_path in f:
+                                fov = f[fov_path][:]
+                                total_fov = fov[-1] - fov[0]
+                                print(f"\n📐 Optical configuration:")
+                                print(
+                                    f"   Field of View: {total_fov:.1f}° (±{total_fov/2:.1f}°)"
+                                )
+                except Exception:
+                    pass  # Silently skip if H5 file not accessible
+
             print("\n📋 File boundaries:")
             for b in self.file_boundaries:
                 print(
@@ -762,9 +813,9 @@ class CombinedTransectCube:
             "single bomb inside": "#00FFFF",  # neon cyan blue (lighter variant)
             "double bomb 1": "#FF8C00",  # dark orange
             "double bomb 2": "#FFD700",  # gold
-            "tripple bomb 1": "#800080",  # purple
-            "tripple bomb 2": "#8A2BE2",  # violet
-            "tripple bomb 3": "#FF00FF",  # bright magenta
+            "triple bomb 1": "#800080",  # purple
+            "triple bomb 2": "#8A2BE2",  # violet
+            "triple bomb 3": "#FF00FF",  # bright magenta
             "all bombs": COLOR_BOMBS,
             "dark bomb": COLOR_DARK,
             # Dark features
@@ -1892,19 +1943,31 @@ class CombinedTransectCube:
             # Helper function to sort ROIs in display order
             def sort_rois_by_category(roi_dict):
                 """Sort ROIs: single bombs → double → triple → dark features → sediment"""
+                # Preferred order matching roi_names list
                 order_keywords = [
-                    ["single bomb"],
-                    ["double bomb"],
-                    ["tripple bomb"],
-                    ["dark"],
-                    ["sediment"],
+                    ["single bomb ring"],  # 1. single bomb ring
+                    ["single bomb inside"],  # 2. single bomb inside
+                    ["double bomb 1"],  # 3. double bomb 1
+                    ["double bomb 2"],  # 4. double bomb 2
+                    ["triple bomb 1"],  # 5. triple bomb 1
+                    ["triple bomb 2"],  # 6. triple bomb 2
+                    ["triple bomb 3"],  # 7. triple bomb 3
+                    ["dark area near bomb"],  # 8. dark area near bomb
+                    ["isolated dark area"],  # 9. isolated dark area
+                    ["sediment"],  # 10. sediment
                 ]
 
                 def get_sort_key(roi_name):
                     roi_lower = roi_name.lower()
+                    # Try exact match first
+                    for idx, keywords in enumerate(order_keywords):
+                        if any(kw == roi_lower for kw in keywords):
+                            return (idx, roi_name)
+                    # Fallback: partial match for variations
                     for idx, keywords in enumerate(order_keywords):
                         if any(kw in roi_lower for kw in keywords):
                             return (idx, roi_name)
+                    # Unknown ROIs go to end, sorted alphabetically
                     return (len(order_keywords), roi_name)
 
                 sorted_items = sorted(
@@ -4292,12 +4355,44 @@ class CombinedTransectCube:
         if use_smoothed_input:
             print(f"   📊 Using smoothed raw data as input (method={smooth_method})")
 
-        # --- Check if already computed and saved ---
-        if not force_recompute and self.has_illumination_correction(
+        # --- Check which files need processing ---
+        dset_name_out = self._get_correction_dataset_name(
             window_size, strength, use_smoothed_input, smooth_method, smooth_params
-        ):
+        )
+
+        files_to_process = []
+        for i, gf in enumerate(self.geofiles):
+            needs_processing = force_recompute
+            if not force_recompute:
+                try:
+                    with h5py.File(gf.path, "r") as f:
+                        if dset_name_out not in f:
+                            needs_processing = True
+                        else:
+                            dset = f[dset_name_out]
+                            if (
+                                "window_size" not in dset.attrs
+                                or "strength" not in dset.attrs
+                            ):
+                                needs_processing = True
+                            else:
+                                saved_window = dset.attrs["window_size"]
+                                saved_strength = dset.attrs["strength"]
+                                if (
+                                    saved_window != window_size
+                                    or abs(saved_strength - strength) > 1e-6
+                                ):
+                                    needs_processing = True
+                except Exception as e:
+                    print(f"⚠️  Error checking {gf.name}: {e}")
+                    needs_processing = True
+
+            if needs_processing:
+                files_to_process.append(i)
+
+        if not files_to_process:
             print(
-                f"✅ Illumination correction already exists (window={window_size}, strength={strength})"
+                f"✅ All files already have illumination correction (window={window_size}, strength={strength})"
             )
             if use_smoothed_input:
                 print(f"   (with smoothed input: {smooth_method})")
@@ -4305,6 +4400,11 @@ class CombinedTransectCube:
             return self.load_illumination_correction(
                 window_size, strength, use_smoothed_input, smooth_method, smooth_params
             )
+
+        print(
+            f"📋 Found {len(files_to_process)} files to process: {[self.geofiles[i].name for i in files_to_process]}"
+        )
+        print(f"   (out of {len(self.geofiles)} total files)")
 
         # Check if smoothed raw data exists when use_smoothed_input=True
         if use_smoothed_input:
@@ -4348,54 +4448,63 @@ class CombinedTransectCube:
                         f"❌ Smoothed raw data not found in {gf.name}: {smoothed_raw_dset}"
                     )
             else:
-                dset_name = gf.DSET_RGB_CORR if gf.use_corrected else gf.DSET_RGB_MAIN
-                if dset_name not in f:
-                    dset_name = gf.DSET_RGB_MAIN
-                return dset_name
+                # ALWAYS use raw data (DSET_RGB_MAIN) for input
+                return gf.DSET_RGB_MAIN
 
-        # Get dimensions
+        # Get dimensions from first file
         with h5py.File(self.geofiles[0].path, "r") as f:
             dset_name = get_input_dset_name(self.geofiles[0], f)
             S, B = f[dset_name].shape[1], f[dset_name].shape[2]
 
-        T_total = sum(gf.shape[0] for gf in self.geofiles)
-
-        print(f"📐 Data shape: T={T_total}, S={S}, B={B}")
+        print(f"📐 Data dimensions: S={S}, B={B}")
         print(f"🔧 Window size: {window_size}, Strength: {strength}")
 
-        # Route to appropriate strategy
-        if strategy == "memory":
-            self._apply_correction_v3_memory(
-                window_size,
-                strength,
-                S,
-                B,
-                T_total,
-                get_input_dset_name,
-                smoothed_raw_dset,
+        # Process each unprocessed file individually with N-1, N, N+1 context
+        for file_idx in files_to_process:
+            gf_current = self.geofiles[file_idx]
+            print(f"\n{'='*60}")
+            print(
+                f"Processing file {file_idx+1}/{len(self.geofiles)}: {gf_current.name}"
             )
-        elif strategy == "twopass":
-            self._apply_correction_v3_twopass(
+            print(f"{'='*60}")
+
+            # Determine neighbor files for context
+            file_indices_to_load = [file_idx]  # Always load current file
+
+            if file_idx > 0:
+                file_indices_to_load.insert(0, file_idx - 1)  # Add N-1
+                print(
+                    f"   Including previous file for context: {self.geofiles[file_idx-1].name}"
+                )
+
+            if file_idx < len(self.geofiles) - 1:
+                file_indices_to_load.append(file_idx + 1)  # Add N+1
+                print(
+                    f"   Including next file for context: {self.geofiles[file_idx+1].name}"
+                )
+
+            # Load data from context files
+            files_for_context = [self.geofiles[i] for i in file_indices_to_load]
+            T_total = sum(gf.shape[0] for gf in files_for_context)
+            print(f"   Loading {len(files_for_context)} files, total tracks: {T_total}")
+
+            # Route to appropriate strategy (simplified to use memory strategy for file-by-file)
+            self._apply_correction_v3_single_file(
+                file_idx,
+                file_indices_to_load,
                 window_size,
                 strength,
                 S,
                 B,
-                T_total,
                 get_input_dset_name,
-                smoothed_raw_dset,
-            )
-        else:  # streaming
-            self._apply_correction_v3_streaming(
-                window_size,
-                strength,
-                S,
-                B,
-                T_total,
-                get_input_dset_name,
-                smoothed_raw_dset,
+                dset_name_out,
             )
 
-        print(f"✅ Illumination correction complete (v3, {strategy})")
+        print(f"\n{'='*60}")
+        print(
+            f"✅ Illumination correction complete for all {len(files_to_process)} files (v3)"
+        )
+        print(f"{'='*60}")
         print(f"   Loading corrected data into memory...")
 
         return self.load_illumination_correction(
@@ -4779,6 +4888,129 @@ class CombinedTransectCube:
         if use_tqdm:
             file_pbar.close()
 
+    def _apply_correction_v3_single_file(
+        self,
+        target_file_idx,
+        file_indices_to_load,
+        window_size,
+        strength,
+        S,
+        B,
+        get_input_dset_name,
+        dset_name_out,
+    ):
+        """
+        Process a single file with context from N-1 and N+1 neighbors.
+
+        Parameters:
+        -----------
+        target_file_idx : int
+            Index of the file to process in self.geofiles
+        file_indices_to_load : list of int
+            Indices of files to load (includes N-1, N, N+1 as available)
+        window_size : int
+            Rolling median window size
+        strength : float
+            Correction strength
+        S, B : int
+            Slit and band dimensions
+        get_input_dset_name : function
+            Function to determine input dataset name
+        dset_name_out : str
+            Output dataset name
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+
+        gf_target = self.geofiles[target_file_idx]
+
+        # Step 1: Load raw data from all context files
+        print(f"📂 Loading raw data from context files...")
+        data_chunks = []
+        T_offsets = [0]
+
+        for idx in file_indices_to_load:
+            gf = self.geofiles[idx]
+            with h5py.File(gf.path, "r") as f:
+                dset_name = get_input_dset_name(gf, f)
+                chunk = f[dset_name][()].astype(np.float32)
+                data_chunks.append(chunk)
+                T_offsets.append(T_offsets[-1] + chunk.shape[0])
+                print(f"   ✓ {gf.name}: {chunk.shape[0]} tracks")
+
+        # Concatenate all data
+        data_combined = np.concatenate(data_chunks, axis=0)
+        T_total = data_combined.shape[0]
+        print(f"   Combined shape: ({T_total}, {S}, {B})")
+
+        # Step 2: Compute rolling median across combined data
+        print(f"📊 Computing rolling medians (window={window_size})...")
+        data_flat = data_combined.reshape(T_total, S * B)
+        refs_flat = np.zeros_like(data_flat)
+
+        try:
+            from tqdm import tqdm
+
+            pbar = tqdm(total=S * B, desc="   Computing refs", unit="slit-band")
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+            pbar = None
+
+        for col in range(S * B):
+            refs_flat[:, col] = (
+                pd.Series(data_flat[:, col])
+                .rolling(window=int(window_size), center=True, min_periods=1)
+                .median()
+                .values
+            )
+            if use_tqdm:
+                pbar.update(1)
+
+        if use_tqdm:
+            pbar.close()
+
+        refs_combined = refs_flat.reshape(T_total, S, B)
+        refs_combined[refs_combined == 0] = 1.0
+        refs_combined[~np.isfinite(refs_combined)] = 1.0
+
+        print(f"✓ Rolling medians computed")
+
+        # Step 3: Extract data and refs for target file only
+        target_idx_in_list = file_indices_to_load.index(target_file_idx)
+        T_start = T_offsets[target_idx_in_list]
+        T_end = T_offsets[target_idx_in_list + 1]
+
+        data_target = data_combined[T_start:T_end, :, :]
+        refs_target = refs_combined[T_start:T_end, :, :]
+
+        print(f"🔧 Applying correction to target file (strength={strength})...")
+        corrected = data_target / refs_target
+        data_corrected = (1 - strength) * data_target + strength * corrected
+
+        del data_combined, refs_combined, data_chunks  # Free memory
+
+        # Step 4: Save corrected data for target file only
+        print(f"💾 Saving corrected data...")
+        with h5py.File(gf_target.path, "a") as f:
+            if dset_name_out in f:
+                del f[dset_name_out]
+
+            dset = f.create_dataset(
+                dset_name_out,
+                data=data_corrected,
+                dtype=np.float32,
+                compression="gzip",
+                compression_opts=1,
+            )
+
+            dset.attrs["window_size"] = window_size
+            dset.attrs["strength"] = strength
+            dset.attrs["correction_method"] = "rolling_v3_single_file"
+
+            print(f"   ✓ {gf_target.name}: saved {data_corrected.shape[0]} tracks")
+
     def list_saved_corrections(self):
         """
         Display all cached illumination correction versions across all files.
@@ -5058,6 +5290,9 @@ class CombinedTransectCube:
         track_end=None,
         window_size=500,
         wavelength_range=(500, 650),
+        interpolation_method="spline",
+        spline_degree=3,
+        spline_smoothing=0,
         quiet=False,
     ):
         """
@@ -5090,6 +5325,22 @@ class CombinedTransectCube:
         wavelength_range : tuple, default=(500, 650)
             Wavelength range (nm) for averaging depth maps. This "optical window"
             has stable attenuation and good signal. Default: (500, 650) nm.
+        interpolation_method : str, default="spline"
+            Method for interpolating attenuation coefficients:
+            - "linear": Piecewise linear interpolation (fast, sharp corners)
+            - "spline": Univariate spline interpolation (smooth, configurable degree)
+        spline_degree : int, default=3
+            Degree of spline polynomial (k parameter). Only used if interpolation_method="spline".
+            - 1: Linear spline (equivalent to piecewise linear)
+            - 2: Quadratic spline (C¹ continuous)
+            - 3: Cubic spline (C² continuous, default)
+            - 4: Quartic spline (C³ continuous)
+            - 5: Quintic spline (C⁴ continuous)
+        spline_smoothing : float, default=0
+            Smoothing factor (s parameter). Only used if interpolation_method="spline".
+            - 0: Exact interpolation (curve passes through all data points, default)
+            - > 0: Smoothing spline (allows deviation from data points)
+            Larger values = more smoothing. Try 0.001-0.01 for slight smoothing.
         quiet : bool, default=False
             If True, suppress progress messages.
 
@@ -5168,15 +5419,37 @@ class CombinedTransectCube:
         )
 
         # Interpolate attenuation coefficients to match data wavelengths
-        c_lambda = np.interp(
-            self.wavelengths, attenuation_wavelengths, attenuation_coefficients
-        )
+        if interpolation_method == "linear":
+            c_lambda = np.interp(
+                self.wavelengths, attenuation_wavelengths, attenuation_coefficients
+            )
+        elif interpolation_method == "spline":
+            from scipy.interpolate import UnivariateSpline
+
+            spline = UnivariateSpline(
+                attenuation_wavelengths,
+                attenuation_coefficients,
+                k=spline_degree,
+                s=spline_smoothing,
+            )
+            c_lambda = spline(self.wavelengths)
+        else:
+            raise ValueError(
+                f"Invalid interpolation_method '{interpolation_method}'. "
+                f"Choose 'linear' or 'spline'."
+            )
 
         if not quiet:
             print(f"\\nAttenuation coefficients c(λ):")
-            print(
-                f"   Interpolated from {len(attenuation_wavelengths)} reference points"
-            )
+            if interpolation_method == "spline":
+                print(
+                    f"   Interpolated from {len(attenuation_wavelengths)} reference points "
+                    f"({interpolation_method}, degree={spline_degree}, smoothing={spline_smoothing})"
+                )
+            else:
+                print(
+                    f"   Interpolated from {len(attenuation_wavelengths)} reference points ({interpolation_method})"
+                )
             print(f"   Range: {c_lambda.min():.3f} to {c_lambda.max():.3f} m⁻¹")
             print(
                 f"   Mean (500-650 nm): {c_lambda[(self.wavelengths >= 500) & (self.wavelengths <= 650)].mean():.3f} ± {c_lambda[(self.wavelengths >= 500) & (self.wavelengths <= 650)].std():.3f} m⁻¹"
@@ -5192,10 +5465,14 @@ class CombinedTransectCube:
                 attenuation_coefficients,
                 "ro",
                 markersize=10,
-                label="Reference data (Holbach 2025; Løvås 2023)",
+                label="Reference data",
             )
             ax_atten.plot(
-                self.wavelengths, c_lambda, "b-", linewidth=2, label="Interpolated c(λ)"
+                self.wavelengths,
+                c_lambda,
+                "b-",
+                linewidth=2,
+                label=f"{interpolation_method.capitalize()} interpolation",
             )
             ax_atten.axvspan(
                 wavelength_range[0],
@@ -5204,14 +5481,11 @@ class CombinedTransectCube:
                 color="green",
                 label="Analysis range",
             )
-            ax_atten.set_xlabel("Wavelength [nm]", fontsize=12, fontweight="bold")
-            ax_atten.set_ylabel(
-                "Attenuation coefficient c(λ) [m⁻¹]", fontsize=12, fontweight="bold"
-            )
+            ax_atten.set_xlabel("Wavelength (nm)", fontsize=12)
+            ax_atten.set_ylabel("Attenuation coefficient c(λ) (m⁻¹)", fontsize=12)
             ax_atten.set_title(
                 "Beer-Lambert Attenuation Coefficients (Coastal Case 2 Water)",
                 fontsize=13,
-                fontweight="bold",
             )
             ax_atten.legend(loc="best", fontsize=10)
             ax_atten.grid(alpha=0.3)
@@ -8382,6 +8656,10 @@ class CombinedTransectCube:
         line_labels=None,
         normalize_intensities=False,  # NEW: Normalize intensity values
         normalization_method="minmax",  # NEW: 'minmax', 'zscore', 'mean', or 'l2'
+        use_sparse_sampling=True,  # NEW: Use sparse sampling instead of oversampling
+        sparse_smoothing="before",  # NEW: 'before', 'after', or 'none' - when to apply smoothing with sparse sampling
+        sparse_normalize_x=True,  # NEW: Normalize X-axis so all lines end at same position
+        sparse_show_markers=True,  # NEW: Show dots at sampled points in sparse mode
     ):
         """
         Plot intensity profiles with optional smoothing and normalization.
@@ -8406,6 +8684,25 @@ class CombinedTransectCube:
         - normalization_method='zscore': Z-score normalization (mean=0, std=1)
         - normalization_method='mean': Divide by mean (relative to average)
         - normalization_method='l2': L2 normalization (unit vector, Euclidean norm=1)
+
+        SPARSE SAMPLING OPTIONS (NEW - DEFAULT):
+        - use_sparse_sampling=True (default): Sample only actual pixels, no duplication
+          * Avoids oversampling short lines (no repeated pixels)
+          * Preserves original data fidelity
+          * Lines maintain their true spatial resolution
+        - use_sparse_sampling=False: Legacy behavior (oversample all lines to max_length)
+          * Short lines get pixels duplicated to match longest line
+          * May create artificial plateaus in intensity profiles
+
+        - sparse_normalize_x=True (default): Scale X-axis so all lines end at same position
+        - sparse_normalize_x=False: Lines end at different X positions (actual length)
+
+        - sparse_smoothing='before' (default): Smooth original pixels before sparse placement
+        - sparse_smoothing='after': Apply smoothing after sparse X-positioning (experimental)
+        - sparse_smoothing='none': No smoothing, matplotlib draws straight lines between points
+
+        - sparse_show_markers=True (default): Show dots at each sampled point
+        - sparse_show_markers=False: Show only connecting lines (no dots)
         """
 
         # Handle single vs multiple lines
@@ -8428,14 +8725,8 @@ class CombinedTransectCube:
 
         max_length = max(line_lengths)
 
-        # Auto-calculate moving average window from percentage
-        if moving_average_percent is not None:
-            moving_average_window = max(
-                1, int(max_length * moving_average_percent / 100)
-            )
-            print(
-                f"📊 Auto-calculated moving average window: {moving_average_window} samples ({moving_average_percent}% of {max_length} samples)"
-            )
+        # NOTE: moving_average_percent will be calculated per-line inside the loop
+        # (each line gets smoothing window based on its own length)
 
         # Get data and wavelength setup
         cube_data = (
@@ -8528,9 +8819,36 @@ class CombinedTransectCube:
                         f"Line {line_idx+1}, Point {i}: track {t} out of range [0, {n_tracks-1}]"
                     )
 
-            # Generate consistent sampling points
-            track_indices = np.linspace(track1, track2, max_length, dtype=int)
-            slit_indices = np.linspace(slit1, slit2, max_length, dtype=int)
+            # Generate sampling points based on sampling method
+            current_line_length = line_lengths[line_idx]
+
+            # Auto-calculate moving average window from percentage (PER LINE)
+            if moving_average_percent is not None:
+                line_moving_average_window = max(
+                    1, int(current_line_length * moving_average_percent / 100)
+                )
+            else:
+                line_moving_average_window = moving_average_window
+
+            if use_sparse_sampling:
+                # NEW: Sparse sampling - only sample actual pixels, no duplication
+                track_indices = np.linspace(
+                    track1, track2, current_line_length, dtype=int
+                )
+                slit_indices = np.linspace(slit1, slit2, current_line_length, dtype=int)
+
+                # Calculate X positions for plotting
+                if sparse_normalize_x:
+                    # Scale to [0, max_length] so all lines end at same position
+                    x_positions = np.linspace(0, max_length, current_line_length)
+                else:
+                    # Use actual sample indices (lines end at different positions)
+                    x_positions = np.arange(current_line_length)
+            else:
+                # ORIGINAL: Oversample all lines to max_length (causes duplication for short lines)
+                track_indices = np.linspace(track1, track2, max_length, dtype=int)
+                slit_indices = np.linspace(slit1, slit2, max_length, dtype=int)
+                x_positions = np.arange(max_length)
 
             # Extract raw intensities
             intensities = []
@@ -8570,10 +8888,17 @@ class CombinedTransectCube:
                     if l2_norm != 0:
                         intensities = intensities / l2_norm
 
-            sample_indices = np.arange(len(intensities))
+            # Determine if smoothing should be applied based on sparse sampling settings
+            apply_smoothing = True
+            if use_sparse_sampling and sparse_smoothing == "none":
+                apply_smoothing = False
 
             # Apply smoothing
-            if smoothing_method == "gaussian" and gaussian_sigma > 0:
+            if (
+                apply_smoothing
+                and smoothing_method == "gaussian"
+                and gaussian_sigma > 0
+            ):
                 # Gaussian smoothing
                 from scipy.ndimage import gaussian_filter1d
 
@@ -8590,30 +8915,37 @@ class CombinedTransectCube:
                 std_devs = np.array(std_devs)
 
                 plot_intensities = smoothed
-                plot_sample_indices = sample_indices
+                plot_sample_indices = x_positions
                 has_std = True
 
-            elif moving_average_window > 1:
-                # Moving average smoothing (original method)
-                if moving_average_window > len(intensities):
-                    moving_average_window = len(intensities)
+            elif apply_smoothing and line_moving_average_window > 1:
+                # Moving average smoothing (using per-line window size)
+                current_window = line_moving_average_window
+                if current_window > len(intensities):
+                    current_window = len(intensities)
 
-                window = np.ones(moving_average_window) / moving_average_window
+                window = np.ones(current_window) / current_window
                 smoothed = np.convolve(intensities, window, mode="valid")
 
                 std_devs = []
                 for i in range(len(smoothed)):
-                    window_data = intensities[i : i + moving_average_window]
+                    window_data = intensities[i : i + current_window]
                     std_devs.append(np.std(window_data))
                 std_devs = np.array(std_devs)
 
-                half_window = moving_average_window // 2
+                half_window = current_window // 2
                 plot_intensities = smoothed
-                plot_sample_indices = np.arange(len(smoothed))
+                # Adjust x_positions for convolution mode='valid' which shortens the array
+                if len(x_positions) > len(smoothed):
+                    plot_sample_indices = x_positions[
+                        half_window : half_window + len(smoothed)
+                    ]
+                else:
+                    plot_sample_indices = x_positions
                 has_std = True
             else:
                 plot_intensities = intensities
-                plot_sample_indices = sample_indices
+                plot_sample_indices = x_positions
                 std_devs = None
                 has_std = False
 
@@ -8628,18 +8960,38 @@ class CombinedTransectCube:
                 label = "Smoothed" if has_std else "Raw intensity"
 
             # Plot the line
-            marker_style = "o" if show_markers else None
-            marker_size_actual = marker_size if show_markers else 0
-
-            plt.plot(
-                plot_sample_indices,
-                plot_intensities,
-                color=color,
-                linewidth=line_width,
-                marker=marker_style,
-                markersize=marker_size_actual,
-                label=label,
-            )
+            # For sparse sampling: show dots + connecting lines (matplotlib interpolates between sparse points)
+            # For oversampling (legacy): show connected line with optional markers
+            if use_sparse_sampling:
+                # Sparse mode: dots + lines (matplotlib interpolates between sparse points)
+                sparse_marker = "o" if sparse_show_markers else None
+                sparse_marker_size = (
+                    (marker_size if marker_size > 0 else 4)
+                    if sparse_show_markers
+                    else 0
+                )
+                plt.plot(
+                    plot_sample_indices,
+                    plot_intensities,
+                    color=color,
+                    linewidth=line_width,  # Keep line to connect dots
+                    marker=sparse_marker,
+                    markersize=sparse_marker_size,
+                    label=label,
+                )
+            else:
+                # Legacy mode: connected line with optional markers
+                marker_style = "o" if show_markers else None
+                marker_size_actual = marker_size if show_markers else 0
+                plt.plot(
+                    plot_sample_indices,
+                    plot_intensities,
+                    color=color,
+                    linewidth=line_width,
+                    marker=marker_style,
+                    markersize=marker_size_actual,
+                    label=label,
+                )
 
             # Add std dev bands
             if has_std:

@@ -1003,7 +1003,7 @@ def main():
     mbes_arr, mbes_tf = None, None
     try:
         mbes_arr, mbes_tf, used_epsg = _read_mbes_geotiff_as_target_epsg(
-            config.MBES_GEOTIFF, config.EPSG_MBES
+            config.MBES_GEOTIFF_057, config.EPSG_MBES
         )
         Xm, Ym, Zm = _surface_from_raster(
             mbes_arr, mbes_tf, step=max(1, int(args.mbes_step))
