@@ -1412,34 +1412,37 @@ class CombinedTransectCube:
 
                 # IMPORTANT: In wavelength mode, vmin/vmax might be RGB tuples from default parameters
                 # We need scalar values for single-wavelength normalization
+                # If they're tuples, IGNORE them and use auto range instead
                 vmin_for_wavelength = vmin
                 vmax_for_wavelength = vmax
 
                 if isinstance(vmin, (tuple, list)) and len(vmin) > 1:
-                    # Convert RGB tuple to scalar (use mean of the three channels)
-                    vmin_for_wavelength = np.mean(vmin)
+                    # RGB tuple - not applicable for single wavelength, use auto range
+                    vmin_for_wavelength = None
+                    vmax_for_wavelength = None
                     if not quiet:
                         print(
-                            f"⚠️  Converted vmin tuple {vmin} to scalar {vmin_for_wavelength:.4f}"
+                            f"ℹ️  Ignoring RGB tuple vmin/vmax, using auto range for wavelength mode"
                         )
 
                 if isinstance(vmax, (tuple, list)) and len(vmax) > 1:
-                    # Convert RGB tuple to scalar (use mean of the three channels)
-                    vmax_for_wavelength = np.mean(vmax)
-                    if not quiet:
-                        print(
-                            f"⚠️  Converted vmax tuple {vmax} to scalar {vmax_for_wavelength:.4f}"
-                        )
+                    # RGB tuple - not applicable for single wavelength, use auto range
+                    vmin_for_wavelength = None
+                    vmax_for_wavelength = None
 
                 # Normalize to [0, 1] range
                 if vmin_for_wavelength is not None and vmax_for_wavelength is not None:
-                    # User-specified range
+                    # User-specified range (scalar values)
                     intensity_normalized = np.clip(
                         (intensity_map - vmin_for_wavelength)
                         / (vmax_for_wavelength - vmin_for_wavelength),
                         0,
                         1,
                     )
+                    if not quiet:
+                        print(
+                            f"✨ Using user-specified normalization range: [{vmin_for_wavelength:.4f}, {vmax_for_wavelength:.4f}]"
+                        )
                 else:
                     # Auto range
                     intensity_min = np.nanmin(intensity_map)
@@ -1450,6 +1453,10 @@ class CombinedTransectCube:
                         )
                     else:
                         intensity_normalized = np.zeros_like(intensity_map)
+                    if not quiet:
+                        print(
+                            f"✨ Auto-normalization applied: [{intensity_min:.4f}, {intensity_max:.4f}] → [0, 1]"
+                        )
 
                 # Store normalized intensity for pcolormesh (don't convert to RGB yet!)
                 # pcolormesh will apply the colormap automatically, allowing colorbar to work
@@ -1836,37 +1843,16 @@ class CombinedTransectCube:
 
         # Create mesh object - use different approach for wavelength mode vs RGB mode
         if use_wavelength_colormap:
-            # Wavelength mode: pass raw intensity data with actual vmin/vmax
-            # This provides proper dynamic range control for visualization
+            # Wavelength mode: use NORMALIZED intensity data [0,1] (same as plot_rgb)
+            # The normalization was already done earlier in the wavelength processing block
 
-            # Use raw intensity values directly (not normalized)
-            display_data = wavelength_intensity_raw
+            # Use normalized intensity values (already in [0,1] range)
+            display_data = wavelength_intensity_normalized
 
-            # DEBUG: Show what type vmin/vmax are
-            print(f"🔍 DEBUG vmin type: {type(vmin)}, value: {vmin}")
-            print(f"🔍 DEBUG vmax type: {type(vmax)}, value: {vmax}")
-
-            # For wavelength mode, check if vmin/vmax are scalars (user-specified)
-            # If they're tuples, they're the RGB defaults - ignore them and use data range
-            if isinstance(vmin, (tuple, list)) or isinstance(vmax, (tuple, list)):
-                # RGB tuple defaults - not applicable for single wavelength
-                # Use actual data range instead
-                display_vmin = np.nanmin(display_data)
-                display_vmax = np.nanmax(display_data)
-                print(f"✨ Auto-computed vmin/vmax from wavelength data:")
-                print(f"   Intensity range: [{display_vmin:.6f}, {display_vmax:.6f}]")
-            elif vmin is not None and vmax is not None:
-                # User specified scalar vmin/vmax - use them
-                display_vmin = vmin
-                display_vmax = vmax
-                print(f"✨ Using user-specified vmin/vmax:")
-                print(f"   Intensity range: [{display_vmin:.6f}, {display_vmax:.6f}]")
-            else:
-                # No vmin/vmax specified at all - use data range
-                display_vmin = np.nanmin(display_data)
-                display_vmax = np.nanmax(display_data)
-                print(f"✨ Auto-computed vmin/vmax from wavelength data:")
-                print(f"   Intensity range: [{display_vmin:.6f}, {display_vmax:.6f}]")
+            # Always use vmin=0, vmax=1 for normalized data
+            # This matches plot_rgb behavior and makes colorbar naturally show [0,1]
+            display_vmin = 0.0
+            display_vmax = 1.0
 
             mesh = ax.pcolormesh(
                 Xc,
@@ -2575,7 +2561,7 @@ class CombinedTransectCube:
 
         # -------- Colorbar for wavelength mode --------
         if use_wavelength_colormap:
-            # Add colorbar with wavelength information (with size controls)
+            # Add colorbar (data is already normalized to [0,1])
             cbar = plt.colorbar(
                 mesh,
                 ax=ax,
@@ -2585,41 +2571,25 @@ class CombinedTransectCube:
                 orientation=colorbar_orientation,
             )
 
-            # Compute actual range - use the raw intensity values, not normalized [0,1]
-            if vmin is not None and vmax is not None:
-                # If vmin/vmax were tuples, they were already converted to scalars earlier
-                # Use the original vmin/vmax (not the normalized 0-1 range)
-                if isinstance(vmin, (tuple, list)):
-                    range_min = np.mean(vmin)
-                else:
-                    range_min = vmin
-                if isinstance(vmax, (tuple, list)):
-                    range_max = np.mean(vmax)
-                else:
-                    range_max = vmax
-            else:
-                range_min = np.nanmin(wavelength_intensity_raw)
-                range_max = np.nanmax(wavelength_intensity_raw)
-
             # Set colorbar label
             if derivative_order == 0:
                 cbar.set_label(
-                    f"Intensity at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                    f"Intensity at {actual_wl:.1f} nm (normalized)",
+                    rotation=270,
+                    labelpad=15,
                 )
             elif derivative_order == 1:
                 cbar.set_label(
-                    f"dI/dλ at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                    f"dI/dλ at {actual_wl:.1f} nm (normalized)",
+                    rotation=270,
+                    labelpad=15,
                 )
             elif derivative_order == 2:
                 cbar.set_label(
-                    f"d²I/dλ² at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                    f"d²I/dλ² at {actual_wl:.1f} nm (normalized)",
+                    rotation=270,
+                    labelpad=15,
                 )
-
-            # Update tick labels to show actual intensity values
-            cbar_ticks = cbar.get_ticks()
-            cbar.set_ticklabels(
-                [f"{range_min + t * (range_max - range_min):.3f}" for t in cbar_ticks]
-            )
 
         # -------- Colorbar for depth overlay mode --------
         if depth_overlay:
@@ -3089,7 +3059,7 @@ class CombinedTransectCube:
 
         # -------- Colorbar for wavelength mode --------
         if use_wavelength_colormap:
-            # Add colorbar with wavelength information (with size controls)
+            # Add colorbar (data is already normalized to [0,1])
             cbar = plt.colorbar(
                 mesh,
                 ax=ax,
@@ -3099,41 +3069,25 @@ class CombinedTransectCube:
                 orientation=colorbar_orientation,
             )
 
-            # Compute actual range - use the raw intensity values, not normalized [0,1]
-            if vmin is not None and vmax is not None:
-                # If vmin/vmax were tuples, they were already converted to scalars earlier
-                # Use the original vmin/vmax (not the normalized 0-1 range)
-                if isinstance(vmin, (tuple, list)):
-                    range_min = np.mean(vmin)
-                else:
-                    range_min = vmin
-                if isinstance(vmax, (tuple, list)):
-                    range_max = np.mean(vmax)
-                else:
-                    range_max = vmax
-            else:
-                range_min = np.nanmin(wavelength_intensity_raw)
-                range_max = np.nanmax(wavelength_intensity_raw)
-
             # Set colorbar label
             if derivative_order == 0:
                 cbar.set_label(
-                    f"Intensity at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                    f"Intensity at {actual_wl:.1f} nm (normalized)",
+                    rotation=270,
+                    labelpad=15,
                 )
             elif derivative_order == 1:
                 cbar.set_label(
-                    f"dI/dλ at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                    f"dI/dλ at {actual_wl:.1f} nm (normalized)",
+                    rotation=270,
+                    labelpad=15,
                 )
             elif derivative_order == 2:
                 cbar.set_label(
-                    f"d²I/dλ² at {actual_wl:.1f} nm", rotation=270, labelpad=15
+                    f"d²I/dλ² at {actual_wl:.1f} nm (normalized)",
+                    rotation=270,
+                    labelpad=15,
                 )
-
-            # Update tick labels to show actual intensity values
-            cbar_ticks = cbar.get_ticks()
-            cbar.set_ticklabels(
-                [f"{range_min + t * (range_max - range_min):.3f}" for t in cbar_ticks]
-            )
 
         if original_interactive:
             plt.ion()
@@ -8659,7 +8613,7 @@ class CombinedTransectCube:
         use_sparse_sampling=True,  # NEW: Use sparse sampling instead of oversampling
         sparse_smoothing="before",  # NEW: 'before', 'after', or 'none' - when to apply smoothing with sparse sampling
         sparse_normalize_x=True,  # NEW: Normalize X-axis so all lines end at same position
-        sparse_show_markers=True,  # NEW: Show dots at sampled points in sparse mode
+        sparse_show_markers=None,  # NEW: Show dots at sampled points in sparse mode (None=use show_markers value)
     ):
         """
         Plot intensity profiles with optional smoothing and normalization.
@@ -8964,10 +8918,16 @@ class CombinedTransectCube:
             # For oversampling (legacy): show connected line with optional markers
             if use_sparse_sampling:
                 # Sparse mode: dots + lines (matplotlib interpolates between sparse points)
-                sparse_marker = "o" if sparse_show_markers else None
+                # Use sparse_show_markers if explicitly set, otherwise fall back to show_markers
+                effective_show_markers = (
+                    sparse_show_markers
+                    if sparse_show_markers is not None
+                    else show_markers
+                )
+                sparse_marker = "o" if effective_show_markers else None
                 sparse_marker_size = (
                     (marker_size if marker_size > 0 else 4)
-                    if sparse_show_markers
+                    if effective_show_markers
                     else 0
                 )
                 plt.plot(
