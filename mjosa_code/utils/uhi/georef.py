@@ -1037,6 +1037,12 @@ class CombinedTransectCube:
         roi_legend_markersize=10,  # Size of color markers in legend (default=10)
         roi_legend_marker_border=True,  # Whether to show black border on legend markers
         roi_legend_show_counts=True,  # Whether to show pixel counts in legend labels (e.g., "bombs (2369)")
+        roi_legend_frameon=True,  # Whether to draw a frame around the legend (False = no border)
+        roi_legend_facecolor="white",  # Background color of legend box
+        roi_legend_framealpha=0.9,  # Transparency of legend frame (0=transparent, 1=solid)
+        display_legend_only=False,  # If True, create a separate figure with ONLY the legend (clean, no borders)
+        save_legend_separately=False,  # If True, save legend to a separate file
+        save_legend_file=None,  # Path to save legend file (if save_legend_separately=True)
         # Cartographic options (NEW - map-style features)
         rotation_deg=0,  # Rotate plot by yaw angle in degrees (counter-clockwise positive)
         add_scale_bar=False,  # Add scale bar to plot
@@ -1070,6 +1076,9 @@ class CombinedTransectCube:
         colorbar_pad=0.04,  # Padding between plot and colorbar
         colorbar_shrink=1.0,  # Shrink factor for colorbar length (1.0 = full length)
         colorbar_orientation="vertical",  # Orientation: "vertical" or "horizontal"
+        hide_axes=False,  # Hide axis borders and ticks (keeps scale bar and north arrow)
+        save_file=None,  # Path to save figure (supports .pdf, .png, .jpg, .svg)
+        save_dpi=300,  # DPI for saved figure
         return_fig=False,
         quiet=True,  # suppress non interactive prints and warnings
         **pcolor_kwargs,
@@ -1146,6 +1155,18 @@ class CombinedTransectCube:
         north_arrow_head_size : float, optional
             Size of the arrow head (mutation_scale parameter). Larger values create
             bigger arrow heads. Default: 40
+
+        hide_axes : bool, optional
+            Hide axis borders, ticks, and labels. Scale bar and north arrow remain visible.
+            Useful for creating clean publication figures. Default: False
+
+        save_file : str, optional
+            Path to save the figure (supports .pdf, .png, .jpg, .svg).
+            If None, only displays the plot. Default: None
+
+        save_dpi : int, optional
+            DPI (dots per inch) for saved figure. Higher values = better quality but larger file.
+            Common values: 150 (screen), 300 (publication), 600 (high-res). Default: 300
         """
         # Check if georef data is available
         if not self.has_georef:
@@ -1862,11 +1883,14 @@ class CombinedTransectCube:
                 cmap=wavelength_colormap_obj,
                 vmin=display_vmin,
                 vmax=display_vmax,
+                rasterized=True,
                 **pcolor_kwargs,
             )
         else:
             # RGB mode: pass 3D RGB array
-            mesh = ax.pcolormesh(Xc, Yc, RGB, shading="flat", **pcolor_kwargs)
+            mesh = ax.pcolormesh(
+                Xc, Yc, RGB, shading="flat", rasterized=True, **pcolor_kwargs
+            )
 
         # Store coordinate arrays for interactive tools (e.g., plot_georef_interactive_lines)
         ax._gref_coord_arrays = (Xp, Yp, start_idx)
@@ -2030,19 +2054,23 @@ class CombinedTransectCube:
                 # Add legend if we have entries
                 if legend_handles and roi_legend_loc is not None:
                     if roi_legend_loc == "outside":
-                        ax.legend(
+                        legend = ax.legend(
                             handles=legend_handles,
                             loc="center left",
                             bbox_to_anchor=(1.02, 0.5),
                             fontsize=9,
-                            framealpha=0.9,
+                            frameon=roi_legend_frameon,
+                            facecolor=roi_legend_facecolor,
+                            framealpha=roi_legend_framealpha,
                         )
                     else:
-                        ax.legend(
+                        legend = ax.legend(
                             handles=legend_handles,
                             loc=roi_legend_loc,
                             fontsize=9,
-                            framealpha=0.9,
+                            frameon=roi_legend_frameon,
+                            facecolor=roi_legend_facecolor,
+                            framealpha=roi_legend_framealpha,
                         )
             else:
                 # Marker mode: Plot each ROI with scatter (original behavior)
@@ -2329,14 +2357,18 @@ class CombinedTransectCube:
                     loc="center left",
                     bbox_to_anchor=(1.02, 0.5),
                     fontsize=9,
-                    framealpha=0.9,
+                    frameon=roi_legend_frameon,
+                    facecolor=roi_legend_facecolor,
+                    framealpha=roi_legend_framealpha,
                     markerscale=roi_legend_markersize / 6,
                 )
             else:
                 legend = ax.legend(
                     loc=roi_legend_loc,
                     fontsize=9,
-                    framealpha=0.9,
+                    frameon=roi_legend_frameon,
+                    facecolor=roi_legend_facecolor,
+                    framealpha=roi_legend_framealpha,
                     markerscale=roi_legend_markersize / 6,
                 )
 
@@ -2617,7 +2649,74 @@ class CombinedTransectCube:
                 fontweight="bold",
             )
 
+        # -------- Hide axes if requested --------
+        if hide_axes:
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+            ax.set_title("")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["bottom"].set_visible(False)
+            ax.spines["left"].set_visible(False)
+
         fig.tight_layout()
+
+        # -------- Save figure if requested --------
+        if save_file:
+            plt.savefig(save_file, dpi=save_dpi, bbox_inches="tight", facecolor="white")
+            if not quiet:
+                print(f"✅ Saved: {save_file}")
+
+        # -------- Create separate legend figure if requested --------
+        if (display_legend_only or save_legend_separately) and ax.get_legend():
+            # Get the legend from the main plot
+            main_legend = ax.get_legend()
+            
+            if main_legend:
+                # Create a new figure for the legend only
+                fig_legend = plt.figure(figsize=(3, len(main_legend.get_texts()) * 0.4 + 0.5))
+                ax_legend = fig_legend.add_subplot(111)
+                
+                # Hide the axes
+                ax_legend.axis('off')
+                
+                # Get legend handles and labels
+                handles, labels = ax.get_legend_handles_labels()
+                
+                # Create a clean legend in the new figure
+                legend_only = ax_legend.legend(
+                    handles,
+                    labels,
+                    loc='center',
+                    frameon=False,  # No frame for clean look
+                    facecolor='white',
+                    framealpha=1.0,  # Solid background
+                    fontsize=9,
+                    markerscale=roi_legend_markersize / 6 if roi_collection else 1.0,
+                )
+                
+                # Remove marker borders if requested
+                if not roi_legend_marker_border:
+                    for handle in legend_only.legend_handles:
+                        if hasattr(handle, 'set_edgecolor'):
+                            handle.set_edgecolor('none')
+                            handle.set_linewidth(0)
+                
+                fig_legend.tight_layout()
+                
+                # Save legend figure if requested
+                if save_legend_separately and save_legend_file:
+                    fig_legend.savefig(save_legend_file, dpi=save_dpi, bbox_inches='tight', facecolor='white')
+                    if not quiet:
+                        print(f"✅ Saved legend: {save_legend_file}")
+                
+                # Display legend figure if requested
+                if display_legend_only:
+                    plt.figure(fig_legend.number)  # Bring legend figure to front
+                    plt.show()
+
         plt.show()
         return (fig, ax) if return_fig else None
 
@@ -7467,6 +7566,12 @@ class CombinedTransectCube:
         roi_legend_markersize=10,  # Size of color markers in legend (default=10)
         roi_legend_marker_border=True,  # Whether to show black border on legend markers
         roi_legend_show_counts=True,  # Whether to show pixel counts in legend labels (e.g., "bombs (2369)")
+        roi_legend_frameon=True,  # Whether to draw a frame around the legend (False = no border)
+        roi_legend_facecolor="white",  # Background color of legend box
+        roi_legend_framealpha=0.9,  # Transparency of legend frame (0=transparent, 1=solid)
+        display_legend_only=False,  # If True, create a separate figure with ONLY the legend (clean, no borders)
+        save_legend_separately=False,  # If True, save legend to a separate file
+        save_legend_file=None,  # Path to save legend file (if save_legend_separately=True)
         line_colors=["red", "blue", "orange", "magenta"],
         line_width=2,
         line_style="-",
@@ -7492,6 +7597,9 @@ class CombinedTransectCube:
         colorbar_pad=0.04,  # Padding between plot and colorbar
         colorbar_shrink=1.0,  # Shrink factor for colorbar length (1.0 = full length)
         show_ticks=True,  # NEW: If False, hide axis tick marks (removes gridlines)
+        hide_axes=False,  # NEW: If True, hide all axis borders and labels (keeps scale bar/north arrow)
+        save_file=None,  # NEW: If provided, save figure to this path (PDF, PNG, JPG, SVG)
+        save_dpi=300,  # NEW: DPI for saved figure (default 300 for publication quality)
     ):
         """
         Enhanced RGB plot supporting multiple named ROIs with different colors.
@@ -8087,6 +8195,9 @@ class CombinedTransectCube:
             else:
                 figsize = (12 * spacing, 6)
 
+        # Determine interpolation: 'none' when saving (exact pixels), default otherwise
+        interp = "none" if save_file else "antialiased"
+
         fig, ax = plt.subplots(figsize=figsize)
 
         # For cropped images, use aspect='auto' but with square figsize
@@ -8101,6 +8212,7 @@ class CombinedTransectCube:
                 cmap=wavelength_cmap,
                 vmin=0,
                 vmax=1,
+                interpolation=interp,
             )
             # Add colorbar for wavelength mode
             if colorbar_fraction is None:
@@ -8133,6 +8245,7 @@ class CombinedTransectCube:
                 aspect="auto",
                 origin=origin,
                 extent=[x_min, x_max, y_min, y_max],
+                interpolation=interp,
             )
 
         # Force the axis limits to match the extent exactly when cropping
@@ -8144,6 +8257,25 @@ class CombinedTransectCube:
         if not show_ticks:
             ax.set_xticks([])
             ax.set_yticks([])
+
+        # Hide axes completely if requested (keeps north arrow and scale bar)
+        if hide_axes:
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            # Remove all spines (borders)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+
+        # Save figure if requested
+        if save_file:
+            # Set DPI at figure level for consistent embedding
+            fig.set_dpi(save_dpi)
+            print(f"💾 Saving figure to: {save_file}")
+            print(f"   Resolution: {save_dpi} DPI")
+            plt.savefig(save_file, dpi=save_dpi, bbox_inches="tight", format=None)
+            print(f"✅ Figure saved successfully")
             # Explicitly disable grid for both major and minor ticks
             ax.grid(False, which="both", axis="both")
             ax.tick_params(
@@ -8338,19 +8470,23 @@ class CombinedTransectCube:
                 # Add legend if we have entries
                 if legend_handles and roi_legend_loc is not None:
                     if roi_legend_loc == "outside":
-                        ax.legend(
+                        legend = ax.legend(
                             handles=legend_handles,
                             loc="center left",
                             bbox_to_anchor=(1.02, 0.5),
                             fontsize=9,
-                            framealpha=0.9,
+                            frameon=roi_legend_frameon,
+                            facecolor=roi_legend_facecolor,
+                            framealpha=roi_legend_framealpha,
                         )
                     else:
-                        ax.legend(
+                        legend = ax.legend(
                             handles=legend_handles,
                             loc=roi_legend_loc,
                             fontsize=9,
-                            framealpha=0.9,
+                            frameon=roi_legend_frameon,
+                            facecolor=roi_legend_facecolor,
+                            framealpha=roi_legend_framealpha,
                         )
             else:
                 # Marker mode: Plot each ROI with scatter (original behavior)

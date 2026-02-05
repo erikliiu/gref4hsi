@@ -615,6 +615,8 @@ def plot_highlighted_transects_2d(
     ylim: Tuple[float, float] = None,
     use_epsg: bool = True,
     epsg: int = 32632,
+    show_gridlines: bool = True,
+    save_file: str = None,
 ) -> None:
     """
     Create a 2D position plot (NED/UTM frame) with highlighted transects.
@@ -652,6 +654,10 @@ def plot_highlighted_transects_2d(
     epsg : int
         EPSG code for projection (default: 32632 = UTM Zone 32N for Lake Mjøsa).
         Only used if use_epsg=True.
+    show_gridlines : bool
+        Whether to show gridlines (default: True)
+    save_file : str, optional
+        Path to save figure (supports .pdf, .png, .jpg, .svg). If None, only display.
     """
     print("\n📊 Creating 2D position plot with highlighted transects...")
     print(f"   Origin: ({origin[0]:.7f}°N, {origin[1]:.7f}°E)")
@@ -686,15 +692,9 @@ def plot_highlighted_transects_2d(
     # Create square figure
     fig, ax = plt.subplots(figsize=figsize)
 
-    # Plot main baseline in grey (NO LABEL - exclude from legend)
-    ax.plot(
-        main_east,
-        main_north,
-        color="darkgray",
-        linewidth=1.5,
-        alpha=1,
-        zorder=1,
-    )
+    # Store plot handles for legend ordering
+    legend_handles = []
+    legend_labels = []
 
     # Load and categorize DR transects
     orange_transects = []  # Regular transects
@@ -727,15 +727,18 @@ def plot_highlighted_transects_2d(
         else:
             print(f"   ⚠️  Warning: {os.path.basename(dr_path)} not found")
 
-    # Plot highlighted transects FIRST (so they appear first in legend)
-    for i, (east, north, label, color) in highlighted_transects.items():
+    # Plot highlighted transects FIRST (in order - A, then B)
+    for i in sorted(highlighted_transects.keys()):
+        east, north, label, color = highlighted_transects[i]
         # Add "Transect" prefix if not already present
         if not label.startswith("Transect"):
             label = f"Transect {label}"
-        ax.plot(east, north, color=color, linewidth=3, alpha=0.9, label=label, zorder=3)
+        line = ax.plot(east, north, color=color, linewidth=3, alpha=0.9, zorder=3)[0]
+        legend_handles.append(line)
+        legend_labels.append(label)
         print(f"   ✅ {label}: {len(east)} points, color={color}")
 
-    # Plot orange transects (non-highlighted) without labels
+    # Plot orange transects (non-highlighted)
     for east, north in orange_transects:
         ax.plot(
             east,
@@ -746,23 +749,41 @@ def plot_highlighted_transects_2d(
             zorder=2,
         )
 
-    # Add single legend entry for orange transects LAST (bottom of legend)
+    # Add legend entry for orange transects
     if orange_transects:
-        ax.plot(
+        line = ax.plot(
             [],
             [],
             color="orange",
             linewidth=2.5,
             alpha=0.8,
-            label="Other transects",
-        )
+        )[0]
+        legend_handles.append(line)
+        legend_labels.append("Other transects")
+
+    # Plot main baseline in grey (raw trajectory - below all others, LAST in legend)
+    line = ax.plot(
+        main_east,
+        main_north,
+        color="darkgray",
+        linewidth=1.5,
+        alpha=1,
+        zorder=0,
+    )[0]
+    legend_handles.append(line)
+    legend_labels.append("Raw trajectory")
 
     # Configure plot
     ax.set_xlabel("East [m]", fontsize=12)
     ax.set_ylabel("North [m]", fontsize=12)
     ax.set_title("Navigation Track - NED Frame", fontsize=14, fontweight="bold")
-    ax.grid(True, alpha=0.3, linestyle="--")
-    ax.legend(loc="best", fontsize=10, framealpha=0.9)
+
+    # Gridlines (optional)
+    if show_gridlines:
+        ax.grid(True, alpha=0.3, linestyle="--")
+
+    # Legend with no border or background - use ordered handles
+    ax.legend(legend_handles, legend_labels, loc="best", fontsize=10, frameon=False)
 
     # Set axis limits if specified
     if xlim is not None:
@@ -779,6 +800,12 @@ def plot_highlighted_transects_2d(
         ax.set_aspect(aspect_ratio, adjustable="datalim")
 
     plt.tight_layout()
+
+    # Save if requested
+    if save_file:
+        plt.savefig(save_file, dpi=300, bbox_inches="tight", facecolor="white")
+        print(f"\n✅ Saved: {save_file}")
+
     plt.show()
 
     print("\n✅ Plot complete!")
