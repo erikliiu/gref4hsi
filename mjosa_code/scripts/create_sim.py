@@ -35,6 +35,7 @@ for _backend in ("Qt5Agg", "TkAgg"):
         pass
 
 # Import local project modules
+
 # These scripts still use gref4hsi utils but with mjosa_code config
 # Add both gref4hsi and mjosa_code to path
 gref4hsi_root = Path(__file__).parent.parent.parent  # Up to gref4hsi root
@@ -1010,7 +1011,7 @@ def main():
         )
         mbes_surface = (Xm, Ym, Zm)
         print(
-            f"MBES: loaded GeoTIFF '{config.MBES_GEOTIFF}' (EPSG:{used_epsg}), surface size {Xm.shape} after decimation"
+            f"MBES: loaded GeoTIFF '{config.MBES_GEOTIFF_057}' (EPSG:{used_epsg}), surface size {Xm.shape} after decimation"
         )
     except Exception as e:
         print(f"MBES load failed: {e}")
